@@ -1,0 +1,55 @@
+{
+  "name": "@cloudsforge/pool",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stratum v1 mining pool for the Bitcoin-family chains the estate runs its own nodes for: getblocktemplate, vardiff, share validation and PPLNS accounting.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node --import tsx src/index.ts",
+    "migrate": "node --import tsx src/migrator.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-concurrency=1 src/*.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "_runtimeDependencies": [
+    "The @cloudsforge/* runtime packages and @cloudsforge/contracts-chain are consumed as file:",
+    "paths because they are not published yet. Once AD-02 lands they become registry versions and",
+    "these paths — plus the two named build contexts in the Dockerfile and the extra checkouts in",
+    "CI — are deleted. Nothing else in this repository changes.",
+    "contracts-chain takes an EXACT pin on publish ('1.0.0'), never a caret, for the reason its own",
+    "header gives: wallet, settlement, custody, indexer and now this service must agree byte for",
+    "byte on decimals. A pool that disagrees with the wallet about what a satoshi is credits a",
+    "miner the wrong number.",
+    "There is deliberately NO @cloudsforge/contracts-events dependency and no outbox in this",
+    "release: nothing here publishes an event yet, and rule 9 says a repository declares what it",
+    "needs and nothing else. The first event this service has to emit is the payout, which is not",
+    "implemented — see the README.",
+    "tsx is a runtime dependency because the unpublished packages resolve to their TypeScript",
+    "sources. On publish their publishConfig points at dist/, tsx moves to devDependencies, and",
+    "the image runs 'node dist/index.js'.",
+    "@cloudsforge/auth and @cloudsforge/secrets are deliberately absent, and both absences are",
+    "load-bearing rather than oversights. The HTTP surface is entirely public — see the header of",
+    "src/server.ts, which explains why a miner's share history cannot be behind an estate login —",
+    "so there is no token to verify and no scope to require. And nothing here signs anything, so",
+    "there is no secret to fetch; the first signature this service will need is on a payout, which",
+    "is not implemented. Rule 9: a repository declares what it needs and nothing else."
+  ],
+  "dependencies": {
+    "@cloudsforge/contracts-chain": "file:../contracts/packages/chain",
+    "@cloudsforge/db": "file:../runtime/packages/db",
+    "@cloudsforge/http": "file:../runtime/packages/http",
+    "@cloudsforge/jobs": "file:../runtime/packages/jobs",
+    "@cloudsforge/lifecycle": "file:../runtime/packages/lifecycle",
+    "@cloudsforge/telemetry": "file:../runtime/packages/telemetry",
+    "postgres": "^3.4.5",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
