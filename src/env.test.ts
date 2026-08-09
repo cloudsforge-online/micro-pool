@@ -637,3 +637,157 @@ test('no payout refusal ever prints the credential', () => {
     )
   }
 })
+
+/* ---------------------------------------------------------- the aux chains, and every half of one */
+
+const DOGE: Record<string, string> = {
+  POOL_DOGE_NODE_URL: 'http://rpcuser:rpcpassword@dogecoin:22555/',
+  POOL_DOGE_PAYOUT_ADDRESS: 'DExampleDogecoinAddressExampleAddr12',
+}
+
+test('an aux chain is configured under its parent, and carries its own node and its own address', () => {
+  const loaded = loadEnv({ ...BASE, ...LTC, ...DOGE, POOL_CHAINS: 'ltc', POOL_LTC_AUX_CHAINS: 'doge' })
+  const ltc = loaded.chains.find((chain) => chain.chain === 'ltc')
+  assert.equal(ltc?.aux.length, 1)
+  assert.equal(ltc?.aux[0]?.chain, 'doge')
+  assert.equal(ltc?.aux[0]?.nodeUrl, DOGE['POOL_DOGE_NODE_URL'])
+  assert.equal(ltc?.aux[0]?.payoutAddress, DOGE['POOL_DOGE_PAYOUT_ADDRESS'])
+  // The payout address is the AUX chain's own. If these two were ever the same string, the pool
+  // would be asking dogecoind to pay a Litecoin address and dogecoind would refuse the template.
+  assert.notEqual(ltc?.aux[0]?.payoutAddress, ltc?.payoutAddress)
+})
+
+test('a chain with no aux list has an empty one, not undefined', () => {
+  // `chain.aux` is read unconditionally by everything that builds a coinbase. An absent list and an
+  // empty one must not be two states, or every reader grows a `?? []`.
+  const loaded = loadEnv(BASE)
+  assert.deepEqual(loaded.chains[0]?.aux, [])
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * EVERY HALF-CONFIGURATION IS A REFUSAL, BECAUSE ITS SYMPTOM IS AN ABSENCE.
+ *
+ * A pool that is told to merge-mine Dogecoin and is missing one of the two variables it takes does
+ * not fail: it mines Litecoin exactly as before and wins no Dogecoin blocks at all. Nobody notices
+ * for as long as no aux block would have been won anyway, which on a small pool is weeks.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('an aux chain named without a node URL refuses, naming the variable', () => {
+  assert.throws(
+    () =>
+      loadEnv({
+        ...BASE,
+        ...LTC,
+        POOL_CHAINS: 'ltc',
+        POOL_LTC_AUX_CHAINS: 'doge',
+        POOL_DOGE_PAYOUT_ADDRESS: DOGE['POOL_DOGE_PAYOUT_ADDRESS'] ?? '',
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /POOL_DOGE_NODE_URL/)
+      return true
+    },
+  )
+})
+
+test('an aux chain named without a payout address refuses, naming the variable', () => {
+  assert.throws(
+    () =>
+      loadEnv({
+        ...BASE,
+        ...LTC,
+        POOL_CHAINS: 'ltc',
+        POOL_LTC_AUX_CHAINS: 'doge',
+        POOL_DOGE_NODE_URL: DOGE['POOL_DOGE_NODE_URL'] ?? '',
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /POOL_DOGE_PAYOUT_ADDRESS/)
+      return true
+    },
+  )
+})
+
+test('a node configured for an aux chain nobody merged refuses, rather than never being called', () => {
+  // The likelier half: the deploy stands a dogecoind up, wires it, and forgets the one variable
+  // that makes anything call it. Silence is the failure mode this refusal exists to break.
+  assert.throws(
+    () => loadEnv({ ...BASE, ...LTC, ...DOGE, POOL_CHAINS: 'ltc' }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /POOL_LTC_AUX_CHAINS=doge/)
+      assert.match((err as Error).message, /never call that node/)
+      return true
+    },
+  )
+})
+
+test('an aux chain merged into the wrong parent refuses at load, not at run time', () => {
+  // AUX_PARENT is tighter than Dogecoin's own consensus on purpose. A doge merged into btc produces
+  // no aux blocks and no errors: a SHA-256d share meets a scrypt target never.
+  assert.throws(
+    () => loadEnv({ ...BASE, ...DOGE, POOL_CHAINS: 'btc', POOL_BTC_AUX_CHAINS: 'doge' }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /merge-mined into ltc/)
+      assert.match((err as Error).message, /AUX_PARENT/)
+      return true
+    },
+  )
+})
+
+test('a parent in its own aux list is refused as a chain this pool does not merge-mine', () => {
+  assert.throws(
+    () => loadEnv({ ...BASE, ...LTC, POOL_CHAINS: 'ltc', POOL_LTC_AUX_CHAINS: 'ltc' }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /does not merge-mine/)
+      assert.match((err as Error).message, /POOL_CHAINS/)
+      return true
+    },
+  )
+})
+
+test('an aux chain listed twice refuses', () => {
+  assert.throws(
+    () => loadEnv({ ...BASE, ...LTC, ...DOGE, POOL_CHAINS: 'ltc', POOL_LTC_AUX_CHAINS: 'doge,doge' }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /twice/)
+      return true
+    },
+  )
+})
+
+test('the aux list is trimmed and case-insensitive, like POOL_CHAINS', () => {
+  const loaded = loadEnv({ ...BASE, ...LTC, ...DOGE, POOL_CHAINS: 'ltc', POOL_LTC_AUX_CHAINS: ' DOGE ' })
+  assert.equal(loaded.chains[0]?.aux[0]?.chain, 'doge')
+})
+
+test('an empty aux list is the same as no aux list', () => {
+  const loaded = loadEnv({ ...BASE, ...LTC, POOL_CHAINS: 'ltc', POOL_LTC_AUX_CHAINS: ' , ' })
+  assert.deepEqual(loaded.chains[0]?.aux, [])
+})
+
+test('a payout minimum for an aux chain is refused while nothing can credit it', () => {
+  // Temporary and deliberately loud: a share does not yet record which chain it was credited for,
+  // so a minimum accepted here would be read, stored, logged as configured, and paid to nobody.
+  // The refusal goes away in the commit that adds `share_chain`.
+  assert.throws(
+    () =>
+      loadEnv({
+        ...BASE,
+        ...LTC,
+        ...DOGE,
+        POOL_CHAINS: 'ltc',
+        POOL_LTC_AUX_CHAINS: 'doge',
+        POOL_DOGE_MINIMUM_PAYOUT: '100000',
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /does not\n?\s*yet pay out|does not yet pay out/)
+      return true
+    },
+  )
+})

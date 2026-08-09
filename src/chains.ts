@@ -212,6 +212,24 @@ export function isAuxChainId(value: string): value is AuxChainId {
   return (AUX_CHAIN_IDS as readonly string[]).includes(value)
 }
 
+/**
+ * Any chain this pool can win a block on, however it won it.
+ *
+ * The union exists for exactly the places where the distinction stops mattering: a miner is owed
+ * DOGE and LTC in the same units-and-minimums vocabulary, and a payout sink does not care that one
+ * of the two arrived by commitment rather than by nonce. Everywhere the distinction DOES matter —
+ * stratum, templates, vardiff, share accounting — the narrower `PoolChainId` is still the type, and
+ * that is what keeps an aux chain from acquiring a listener by type inference.
+ */
+export type MinedChainId = PoolChainId | AuxChainId
+
+export function isMinedChainId(value: string): value is MinedChainId {
+  return isPoolChainId(value) || isAuxChainId(value)
+}
+
+/** Every chain a block could be won on, parents first. Stable order, for logs and for tests. */
+export const MINED_CHAIN_IDS: readonly MinedChainId[] = Object.freeze([...POOL_CHAIN_IDS, ...AUX_CHAIN_IDS])
+
 /** The asset an aux chain pays in. Read from contracts-chain like every other one. */
 export function auxAssetFor(chain: AuxChainId): AssetCode {
   // Uppercased rather than tabled: an aux chain has no `PoolChain` row to read an asset out of, and
