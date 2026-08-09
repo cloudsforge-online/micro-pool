@@ -11,26 +11,46 @@ Implements §5 of
 
 ---
 
-## READ THIS FIRST: payouts are not implemented
+## READ THIS FIRST: payouts are still switched off
 
-**This service records a debt. It does not pay one.** Nothing here credits a ledger, moves a
-balance, or touches the wallet. When this pool finds a block it computes the PPLNS allocation, writes
-the block row with the window bounds it was decided against, and stops.
+**This service records a debt. It does not pay one.** When this pool finds a block it computes the
+PPLNS allocation, writes the block row with the window bounds it was decided against, re-checks that
+block until it has matured or been orphaned, and stops. Nothing moves a balance.
 
-`src/payouts.ts` is a **named, typed seam and nothing more**: the types every crediting
-implementation will need, the `credit_key` idempotency shape borrowed verbatim from
-`wallet/src/deposits.ts` so the eventual implementation cannot invent a second one, and a function
-that throws. There is no payouts table in the schema either, deliberately — an empty
-`pool_payout_credits` would read to the next person as a feature that exists and is not firing.
+micro-org#302 changed what is *behind* that statement without changing the statement. The path is
+now complete end to end: `src/maturity.ts` decides whether a reward exists, `src/rewards.ts` walks
+the matured blocks and turns each one into per-worker claims through the existing PPLNS allocation
+(the leased job `pool.credit-blocks`), and `src/payouts.ts` holds a real sink — `LedgerPayoutSink`,
+which posts a double-entry credit to micro-ledger under the `credit_key` idempotency shape borrowed
+verbatim from `wallet/src/deposits.ts`. `pool_payout_credits` exists in the schema, introduced by
+the same migration as the code that writes to it. **Two independent gates stand in front of the
+whole path, and both are shut:**
 
-There is nothing here that will half-pay somebody. That was the point of leaving it out rather than
-stubbing it.
+1. **The payout configuration is unset.** `POOL_<CHAIN>_MINIMUM_PAYOUT` has no default anywhere.
+   With no minimum, no sink is constructed, neither payout job is registered, and `GET /v1/pool` reports
+   `payoutsImplemented: false`. See `.env.example` for why this block is optional when the fee is
+   required: `src/env.ts` is eager, and a newly required variable is a container that will not boot.
+2. **`CUSTODY_BACKING_CLOSED` is `false`, in the source rather than in the environment.** The pool's
+   coinbase pays into a custody-held address that **nothing registers with the indexer** and that
+   `INDEXER_CUSTODY_LABEL_PREFIXES` (`"deposit:,treasury:"` on the estate) would not match if it
+   did. A credit would therefore raise micro-ledger's custody total while the observed total did not
+   move — positive drift, against a **zero** tolerance for LTC — and the reconciliation sweep would
+   **freeze LTC withdrawals estate-wide** and keep re-freezing them, because only an exactly-clean
+   run clears the freeze. That is micro-org#247/#248 with the sign reversed. The constant's comment
+   in `src/payouts.ts` carries the full finding and the three things that must be true before it can
+   be opened; two of the three are not in this repository's gift.
+
+So there is still nothing here that will half-pay somebody, and turning payouts on is a code change
+somebody reviews rather than an environment variable somebody sets.
 
 The other named holes, in one place:
 
 | Not implemented | What happens instead |
 | --- | --- |
-| Paying miners | `src/payouts.ts` throws. No ledger call exists anywhere in this repository. |
+| Paying miners | The mechanism exists and is exercised by tests; two gates refuse every credit in this release: no payout configuration, and `CUSTODY_BACKING_CLOSED` is false. |
+| Accrual across blocks | The minimum is a per-claim floor, not a running balance. A claim under it records nothing, so it stays payable later. |
+| Paying external miners | A miner with a payout address and no estate account is counted `skipped_no_account` and paid nothing. This service credits a ledger; it does not send a transaction. |
+| Reversing an orphaned credit | Nothing here reverses a credit. A block cannot reach `matured` and then `orphaned` through this service, and a correction is a new opposite ledger entry posted by a person — see the header of `src/rewards.ts`. |
 | Dogecoin | **Refused by name at boot.** `POOL_CHAINS=doge` will not start the service — see below. |
 | Stratum v2 | Not implemented and not planned for this pass. v1 is what deployed hardware speaks. |
 | TLS on the stratum port | Not implemented. Stratum v1 as deployed is plain TCP; the HTTP port is separate. |
@@ -337,7 +357,9 @@ Blocks this pool found, newest first. `limit` defaults to 50 and is clamped at 2
       "reward": "625000000",
       "networkDifficulty": 41234567.89,
       "submitStatus": "accepted",
-      "submitDetail": null
+      "submitDetail": null,
+      "maturityStatus": "pending",
+      "confirmations": 37
     }
   ]
 }
@@ -352,9 +374,33 @@ this service has and a pool that showed only its accepted blocks would be concea
 miners must know about. `submitDetail` is the node's own words, and is **null when there is nothing
 to say** — an accepted block, ordinarily.
 
-**Nothing re-checks the verdict afterwards.** A coinbase is unspendable for 100 blocks and a block
-can be orphaned well inside that window, so `submitStatus: "accepted"` means the node took it, not
-that it survived. That gap is micro-org#302 and it is not fixed here.
+`maturityStatus` is the **second, later verdict, and it is the one that says whether the reward
+exists.** `submitStatus: "accepted"` only ever meant the node took the block onto its tip; a coinbase
+is unspendable for 100 blocks on both these chains and a block can be orphaned well inside that
+window. So a leased job (`pool.check-maturity`, every ten minutes) re-reads each recorded block by
+hash against the same node the templater uses, and moves the row to one of three states:
+
+| `maturityStatus` | Meaning |
+| --- | --- |
+| `pending` | On the chain but not 100 deep yet — **or** the node could not be asked. Not payable. |
+| `matured` | On the active chain at 100 confirmations or more. The only payable state. |
+| `orphaned` | The node holds this block and it is not on the active chain. Terminal. |
+
+Every block starts `pending` and only a positive answer from the node moves it, so an unreachable
+node delays a payment rather than inventing or destroying one. `confirmations` is the node's own
+count — **negative** for a block off the active chain, and `null` before the watcher has managed to
+ask. `submitStatus` is never rewritten: the two facts sit beside each other, because the submission
+verdict is the only thing separating "the coinbase was built wrongly" from "we lost a race".
+
+An orphan is logged at `error` and counted in `pool_block_maturity_total{status="orphaned"}`.
+
+`matured` is also the only state the allocation job will touch: `pool.credit-blocks` (every ten
+minutes, per chain, and **only for a chain with a payout minimum configured**) reads matured,
+accepted, not-yet-allocated blocks, re-summs the PPLNS window each one recorded when it was found,
+takes the fee, and offers every worker's share to the sink under `poolPayoutCreditKey`. Outcomes are
+counted in `pool_payout_claim_total{outcome=…}`, where the skips are the interesting values —
+`skipped_no_account` is every miner who has an address here and no estate account. In this release
+the sink refuses all of them at the first claim and the sweep stops, loudly, having written nothing.
 
 ### `GET /v1/pool/workers?chain=<chain>&account=<account>`
 
@@ -512,7 +558,10 @@ and nothing else, and the handshake timeout closes it.
 | `src/validate.ts` | Rebuilding the header from a submission and judging it against the share target and the block target. |
 | `src/blocks.ts` | What happens when a share is a block, in the order it has to happen in. |
 | `src/pplns.ts` | The sliding window, and the integer allocation that makes the parts sum to the whole. |
-| `src/payouts.ts` | The seam. Not implemented — see the top of this file. |
+| `src/maturity.ts` | Re-reading a found block against the node: still on the chain, and 100 deep? |
+| `src/rewards.ts` | The walk from a matured block to per-worker claims: the window it was found against, the fee, and the remainder. |
+| `src/payouts.ts` | The credit key, the sink that posts it, and the two gates that refuse it — see the top of this file. |
+| `src/ledgerclient.ts` | One route of micro-ledger's API: `POST /entries`. Amounts are strings on the wire in both directions. |
 | `src/store.ts` | Every SQL statement, each scoped to one chain. |
 | `src/server.ts` | `node:http`. `/livez`, `/readyz`, `/metrics`, and the public read API. |
 

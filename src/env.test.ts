@@ -484,3 +484,156 @@ test('websocketEndpointOf publishes a whole URL or nothing at all', () => {
   // The chain is IN the path, so a page reads one field and connects — it never assembles anything.
   assert.equal(websocketEndpointOf('wss://pool.example.com', 'btc'), 'wss://pool.example.com/v1/pool/stratum/btc')
 })
+
+/* ------------------------------------------------ payouts, which are OFF unless asked for (#302) */
+
+/**
+ * A credential of the shape identity actually mints, hyphen included.
+ *
+ * The hyphen is deliberate and is not decoration: `assertServiceCredential` records that the estate's
+ * mainnet credential is alphanumeric while the TESTNET one contains a hyphen, and that a "no
+ * hyphens" rule — which reads as obviously right in review — passes mainnet and kills testnet. A
+ * fixture without one would let that regression through here too.
+ */
+const CREDENTIAL = 'cfsc_' + 'qN8xKvR2mT7bY4wL9pF3hJ6dS1gZ5cA0eU8i-2nQ7rV'
+
+const PAYOUTS: Record<string, string> = {
+  ...IDENTITY,
+  LEDGER_URL: 'http://ledger:4000',
+  POOL_IDENTITY_CREDENTIAL: CREDENTIAL,
+  POOL_BTC_MINIMUM_PAYOUT: '5000000',
+}
+
+test('PAYOUTS ARE OFF WHEN NO MINIMUM IS SET, AND OFF IS THE MODE THE ESTATE RUNS IN', () => {
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // The constraint the whole block was designed around. `env.ts` is eager and exits the process on
+  // a refusal, so a newly-REQUIRED variable is a container that will not boot — and on 2026-08-09
+  // `cloudsforge-estate-pool-1` is healthy on release 2.5.8, mining LTC, with none of these
+  // variables set. Requiring one would have failed the next deploy at boot and taken its `--wait`
+  // down with it, which is not hypothetical: that happened on 2026-08-07 with `pool-migrate` and a
+  // missing database.
+  //
+  // So unset is a supported, TESTED mode, and this is the test.
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  assert.equal(loadEnv(BASE).payouts, null)
+  // Including with identity fully configured — browser mining and payouts are unrelated decisions.
+  assert.equal(loadEnv({ ...BASE, ...IDENTITY }).payouts, null)
+})
+
+test('THE MINIMUM HAS NO DEFAULT, AND A VALUE THAT CANNOT BE READ EXACTLY IS A REFUSAL', () => {
+  // The discipline `POOL_FEE_BASIS_POINTS` uses, transposed onto a value that must also be optional.
+  // Digits only, and emphatically not `Number()`: `"0.05"` is the mistake an operator will actually
+  // make — five hundredths of a Litecoin is what they mean, five million litoshi is what they have
+  // to type — and a parser that read it as 0 would set the minimum to "always pay", invisibly.
+  for (const bad of ['0.05', '1e8', '0x10', ' ', '-1', 'lots', '1_000', '5000000.0', 'Infinity']) {
+    assert.throws(
+      () => loadEnv({ ...BASE, ...PAYOUTS, POOL_BTC_MINIMUM_PAYOUT: bad }),
+      EnvError,
+      `${bad} was accepted as a payout minimum`,
+    )
+  }
+  // Zero is refused separately, and the message must not read as "no minimum": zero would mean
+  // paying every dust claim, which is the opposite of what somebody typing 0 intends.
+  assert.throws(() => loadEnv({ ...BASE, ...PAYOUTS, POOL_BTC_MINIMUM_PAYOUT: '0' }), /greater than zero/)
+
+  const loaded = loadEnv({ ...BASE, ...PAYOUTS })
+  assert.equal(loaded.payouts?.minimums.get('btc'), 5_000_000n)
+})
+
+test('the minimum is a bigint, because a litoshi amount does not survive a double', () => {
+  // 2^53 is 9007199254740992. A minimum above it read through `Number` comes back subtly wrong and
+  // does not fail, which is the whole reason money is not a double anywhere in this estate.
+  const huge = '9007199254740993'
+  const loaded = loadEnv({ ...BASE, ...PAYOUTS, POOL_BTC_MINIMUM_PAYOUT: huge })
+  assert.equal(loaded.payouts?.minimums.get('btc'), BigInt(huge))
+  assert.equal(loaded.payouts?.minimums.get('btc')?.toString(), huge)
+})
+
+test('THE PAYOUT BLOCK IS ALL OF IT OR NONE OF IT', () => {
+  // Each of these is a state somebody started and did not finish, and each produces a pool that pays
+  // nobody while its operator believes it pays everybody. The same all-or-nothing treatment the
+  // stratum endpoint and the identity trio already get.
+  const halves: Array<[string, RegExp]> = [
+    ['LEDGER_URL', /LEDGER_URL is not/],
+    ['POOL_IDENTITY_CREDENTIAL', /POOL_IDENTITY_CREDENTIAL is not/],
+    ['IDENTITY_ISSUER', /IDENTITY_ISSUER is not/],
+  ]
+  for (const [name, message] of halves) {
+    const source: Record<string, string> = { ...BASE, ...PAYOUTS }
+    delete source[name]
+    assert.throws(() => loadEnv(source), message, `${name} was optional inside the payout block`)
+  }
+  // And the other direction: a ledger configured with no minimum would post nothing for ever.
+  const { POOL_BTC_MINIMUM_PAYOUT: _omitted, ...withoutMinimum } = PAYOUTS
+  assert.throws(() => loadEnv({ ...BASE, ...withoutMinimum }), /no chain has a POOL_<CHAIN>_MINIMUM_PAYOUT/)
+})
+
+test('a minimum for a chain this pool does not mine is refused, not ignored', () => {
+  // A variable that does nothing, typed by somebody who believes that chain is being paid. Checked
+  // against POOL_CHAINS rather than against the two chains this software implements, because the
+  // mistake being caught is "I set it for the wrong deployment".
+  assert.throws(
+    () => loadEnv({ ...BASE, ...PAYOUTS, POOL_LTC_MINIMUM_PAYOUT: '5000000' }),
+    /POOL_CHAINS does not list ltc/,
+  )
+})
+
+test('one chain may be paid while another is not', () => {
+  // An estate that pays Litecoin miners while it decides what to do about Bitcoin is a
+  // configuration, not a half-made decision — the same per-chain treatment `stratumPublicPort` gets.
+  const loaded = loadEnv({
+    ...BASE,
+    ...LTC,
+    ...PAYOUTS,
+    POOL_CHAINS: 'btc,ltc',
+    POOL_LTC_MINIMUM_PAYOUT: '2500000',
+  })
+  assert.deepEqual([...(loaded.payouts?.minimums.entries() ?? [])], [
+    ['btc', 5_000_000n],
+    ['ltc', 2_500_000n],
+  ])
+})
+
+test('a credential that is really a token is refused at boot, not an hour later', () => {
+  // micro-org#197/#222: a JWT pasted where the long-lived credential belongs works for exactly ten
+  // minutes and then fails in a way that reads as "identity rejected pool". The shape check is
+  // `@cloudsforge/secrets`' rather than a local regex — see `requiredCredential` for why every
+  // obvious local rule refuses one of the estate's two real credentials.
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwb29sIn0.c2lnbmF0dXJl'
+  assert.throws(() => loadEnv({ ...BASE, ...PAYOUTS, POOL_IDENTITY_CREDENTIAL: jwt }), EnvError)
+  assert.throws(() => loadEnv({ ...BASE, ...PAYOUTS, POOL_IDENTITY_CREDENTIAL: 'changeme' }), EnvError)
+  assert.throws(
+    () => loadEnv({ ...BASE, ...PAYOUTS, POOL_IDENTITY_CREDENTIAL: 'cfsc_' + 'a'.repeat(43) }),
+    EnvError,
+  )
+})
+
+test('the identity URL falls back to the issuer, which is the live path on this estate', () => {
+  // Measured 2026-08-09 against the running containers: no service sets `IDENTITY_URL`, and
+  // `IDENTITY_ISSUER` is the identity service's own base URL. Kept overridable anyway, because an
+  // issuer is an identifier and a URL is a route.
+  assert.equal(loadEnv({ ...BASE, ...PAYOUTS }).payouts?.identityUrl, IDENTITY['IDENTITY_ISSUER'])
+  assert.equal(
+    loadEnv({ ...BASE, ...PAYOUTS, IDENTITY_URL: 'http://identity:4000' }).payouts?.identityUrl,
+    'http://identity:4000',
+  )
+})
+
+test('no payout refusal ever prints the credential', () => {
+  // An `EnvError` message is the single most reliably logged string in a process that fails to
+  // start, and this one is reached with a credential in hand.
+  for (const source of [
+    { ...BASE, ...PAYOUTS, POOL_BTC_MINIMUM_PAYOUT: 'nonsense' },
+    { ...BASE, ...PAYOUTS, LEDGER_URL: 'not a url' },
+    { ...BASE, ...PAYOUTS, POOL_IDENTITY_CREDENTIAL: CREDENTIAL.slice(0, 12) },
+  ]) {
+    assert.throws(
+      () => loadEnv(source),
+      (err: unknown) => {
+        assert.ok(err instanceof EnvError)
+        assert.ok(!(err as Error).message.includes(CREDENTIAL.slice(5, 20)), 'a credential leaked')
+        return true
+      },
+    )
+  }
+})

@@ -99,6 +99,26 @@ export async function findAccountLink(exec: Exec, userId: string): Promise<strin
 }
 
 /**
+ * The estate user behind a pool account label, if there is one.
+ *
+ * The reverse of `findAccountLink`, and the two are not symmetric in importance. That one answers
+ * "what label do I mint work under"; this one answers "**is there anybody in this estate to credit**",
+ * which is the question a payout cannot proceed without. Most pool accounts are not labels at all —
+ * they are the payout address a miner typed into their own firmware — and those have no estate user,
+ * no liability account, and no way to be paid except on chain. `payouts.ts` refuses them by name
+ * rather than crediting them to something plausible.
+ *
+ * A plain `select`, unlike `findAccountLink`: nothing about answering this question means the account
+ * was used, and stamping `last_used_at` from a payout path would make the column mean two things.
+ */
+export async function userForAccount(exec: Exec, account: string): Promise<string | null> {
+  const rows = await exec<{ user_id: string }[]>`
+    select user_id from pool_account_links where account = ${account}
+  `
+  return rows[0]?.user_id ?? null
+}
+
+/**
  * Claim a pool account label for a user, or lose the race and return null.
  *
  * `on conflict do nothing` on the primary key means a caller that loses gets no row back, which is
@@ -212,6 +232,359 @@ export async function recordBlock(exec: Exec, block: BlockInput): Promise<number
   const row = existing[0]
   if (!row) throw new Error(`block ${block.hash} neither inserted nor found on ${block.chain}`)
   return Number(row.id)
+}
+
+export interface MaturityCandidate {
+  readonly hash: string
+  readonly height: number
+}
+
+/**
+ * The blocks on one chain whose fate is still unknown, oldest first.
+ *
+ * **`submit_status = 'accepted'` is in the predicate and is not decoration.** A block the node
+ * refused was never on the chain and asking the node about it once every ten minutes for ever would
+ * be asking a question that has already been answered — migration 4 back-fills those rows to
+ * `orphaned` for the same reason. Oldest first because the oldest pending block is the one closest
+ * to maturing, so a capped sweep makes progress from the end that is about to move.
+ */
+export async function blocksAwaitingMaturity(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<MaturityCandidate[]> {
+  const rows = await exec<{ hash: string; height: number }[]>`
+    select hash, height
+    from pool_blocks
+    where chain = ${args.chain}
+      and maturity_status = 'pending'
+      and submit_status = 'accepted'
+    order by found_at
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({ hash: row.hash, height: row.height }))
+}
+
+/**
+ * Record where a block stands, without ever touching what the node said at submission.
+ *
+ * `submit_status` is not in the update list and must never be: it is the node's verbatim verdict at
+ * the one moment it could be observed, and a row rewritten to say `orphaned` would have thrown away
+ * the only evidence distinguishing a coinbase built wrongly from bad luck. The two facts sit beside
+ * each other.
+ *
+ * The predicate carries `maturity_status = 'pending'` so an `orphaned` row cannot be walked back to
+ * `matured` by a later sweep — `maturity.ts` explains why orphaned is terminal — and so two replicas
+ * racing on the same block settle rather than flapping. `matured_at` is set only on the transition,
+ * which is what makes it the time the block matured rather than the time it was last looked at.
+ */
+export async function setBlockMaturity(
+  exec: Exec,
+  args: {
+    chain: PoolChainId
+    hash: string
+    status: 'pending' | 'matured' | 'orphaned'
+    confirmations: number | null
+    detail: string | null
+  },
+): Promise<void> {
+  await exec`
+    update pool_blocks
+       set maturity_status     = ${args.status},
+           confirmations       = ${args.confirmations},
+           maturity_detail     = ${args.detail},
+           maturity_checked_at = now(),
+           matured_at          = case when ${args.status} = 'matured' then now() else matured_at end
+     where chain = ${args.chain}
+       and hash = ${args.hash}
+       and maturity_status = 'pending'
+  `
+}
+
+/**
+ * The blocks on one chain whose rewards actually exist: accepted, re-read, and buried past maturity.
+ *
+ * **This is the one definition of "payable" in this service, and it is deliberately a query rather
+ * than a rule written down in prose.** Before micro-org#302 the only status a block carried was
+ * `submit_status`, and the obvious mistake an eventual payout path was going to make was to treat
+ * `accepted` as the eligibility test — which is a claim about what one node said once, not about
+ * what is in the chain. Anything that pays must read this and nothing else, so that adding a new
+ * disqualifying condition later is one edit here rather than a search for every place that
+ * remembered to check.
+ *
+ * `matured` is the only status that qualifies, and the asymmetry is the point: `pending` covers both
+ * a young block and a node that could not be reached, and both of those are "we do not know yet".
+ *
+ * Its consumers are `blocksAwaitingCredit` below — which is this predicate plus "and not offered to
+ * the sink yet" — and the tests that assert a re-organised block leaves it empty. The two are kept
+ * as separate statements rather than one with a flag because this one is the DEFINITION and that one
+ * is a work queue, and `store.test.ts` asserts they agree on every state a block can be in.
+ */
+export async function payableBlocks(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<MaturityCandidate[]> {
+  const rows = await exec<{ hash: string; height: number }[]>`
+    select hash, height
+    from pool_blocks
+    where chain = ${args.chain}
+      and maturity_status = 'matured'
+      and submit_status = 'accepted'
+    order by height
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({ hash: row.hash, height: row.height }))
+}
+
+/**
+ * A matured block, with everything the allocation needs to be recomputed from it.
+ *
+ * The window bounds come back rather than being re-derived, because they were snapshotted at the
+ * moment the block was found and re-deriving them a hundred confirmations later would answer a
+ * different question — `blocks.ts` and migration 2 both say so where they are written.
+ */
+export interface PayableBlockRow {
+  readonly hash: string
+  readonly height: number
+  /** The whole coinbase value, fees included, in the chain's smallest unit. The pool fee comes out of it. */
+  readonly reward: bigint
+  readonly windowFirstShareId: bigint | null
+  readonly windowLastShareId: bigint | null
+}
+
+/**
+ * The matured blocks whose PPLNS allocation has not been offered to the payout sink yet.
+ *
+ * The credit job's work queue, and the predicate is `payableBlocks` above plus `payout_credited_at
+ * is null`. Two statements rather than one with a flag: that one is the single definition of "this
+ * reward exists" and is read by anything that needs to know, this one is a queue that drains, and a
+ * boolean argument would have made every caller of the definition also a caller of the queue.
+ * `store.test.ts` pins that they agree — a pending block is in neither, a matured block is in both,
+ * and a credited block is in the definition and not in the queue.
+ *
+ * Oldest first, so a backlog is paid in the order it was earned.
+ *
+ * The marker being an optimisation rather than the safety is worth restating at the read site:
+ * `credit_key` is what makes a re-offer a no-op, so a run that crashes after crediting half a block
+ * and never marks it simply re-offers the whole block next time and credits the other half. See
+ * migration 6.
+ */
+export async function blocksAwaitingCredit(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<PayableBlockRow[]> {
+  const rows = await exec<
+    { hash: string; height: number; reward: string; first_id: string | null; last_id: string | null }[]
+  >`
+    select hash, height, reward::text,
+           window_first_share_id::text as first_id,
+           window_last_share_id::text  as last_id
+    from pool_blocks
+    where chain = ${args.chain}
+      and maturity_status = 'matured'
+      and submit_status = 'accepted'
+      and payout_credited_at is null
+    order by height
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({
+    hash: row.hash,
+    height: row.height,
+    reward: BigInt(row.reward),
+    windowFirstShareId: row.first_id === null ? null : BigInt(row.first_id),
+    windowLastShareId: row.last_id === null ? null : BigInt(row.last_id),
+  }))
+}
+
+/**
+ * Record that a block's allocation has been offered to the sink. True when this call was the one
+ * that marked it.
+ *
+ * `payout_credited_at is null` is in the predicate for the same reason it is in
+ * `markPayoutCredited`: two replicas can reach the same block, and the second must not restamp a
+ * time the first already wrote. The boolean is what keeps the job's log line honest about which run
+ * did the work.
+ *
+ * **What this does not mean.** Not "every worker was paid" — a claim under the configured minimum
+ * and a miner with no estate account are both skipped and both counted. Migration 6 says why the
+ * column is still worth having and why it is not a receipt.
+ */
+export async function markBlockPayoutsCredited(
+  exec: Exec,
+  args: { chain: PoolChainId; hash: string },
+): Promise<boolean> {
+  const rows = await exec<{ id: string }[]>`
+    update pool_blocks
+       set payout_credited_at = now()
+     where chain = ${args.chain}
+       and hash = ${args.hash}
+       and payout_credited_at is null
+    returning id
+  `
+  return rows.length > 0
+}
+
+/**
+ * The shares of one recorded window, summed per worker.
+ *
+ * **Why an id RANGE reproduces the window exactly.** `pplnsWindow` walks backwards from a share id
+ * and stops when the running difficulty crosses the window size, so the set it includes is
+ * contiguous in `id` by construction — every share between the smallest and largest id it took is
+ * also one it took. `blocks.ts` records those two ids on the block at the moment it was found, so
+ * re-reading `first <= id <= last` a hundred confirmations later returns the same rows, in the same
+ * groups, with the same weights, however much the share table has grown since. Recomputing the
+ * window from the multiplier instead would not: `POOL_PPLNS_WINDOW` is configuration and the network
+ * difficulty moves, so a block found in March would be allocated against April's rule.
+ *
+ * Those rows are also still there to be read, which is not luck — `pruneShares` takes its floor from
+ * the oldest `window_first_share_id` of any recorded block precisely so that a block's allocation
+ * stays reproducible for as long as the block is on file.
+ */
+export async function windowShares(
+  exec: Exec,
+  args: { chain: PoolChainId; firstShareId: bigint; lastShareId: bigint },
+): Promise<WindowRow[]> {
+  const rows = await exec<{ worker_id: string; account: string; worker: string; units: string }[]>`
+    select s.worker_id, w.account, w.worker, sum(s.difficulty_units)::text as units
+    from pool_shares s
+    join pool_workers w on w.id = s.worker_id
+    where s.chain = ${args.chain}
+      and s.id >= ${param(args.firstShareId)}
+      and s.id <= ${param(args.lastShareId)}
+    group by s.worker_id, w.account, w.worker
+    order by s.worker_id
+  `
+  return rows.map((row) => ({
+    workerId: Number(row.worker_id),
+    account: row.account,
+    worker: row.worker,
+    units: BigInt(row.units),
+  }))
+}
+
+export interface PayoutCreditInput {
+  readonly chain: PoolChainId
+  readonly network: string
+  readonly blockHash: string
+  readonly blockHeight: number
+  readonly workerId: number
+  readonly account: string
+  readonly assetCode: string
+  readonly amount: bigint
+  readonly creditKey: string
+}
+
+/**
+ * Claim one payout credit locally, before anything is said to the ledger.
+ *
+ * Returns the row id when this call is the one that claimed it, and **null when the movement was
+ * already on file**. Null is not an error and is the case this function exists for: a retried sink
+ * call, a second replica reaching the same block, a job re-run after a lost response. `credit_key`
+ * carries the unique constraint and the database settles the race, which is the only arbiter that
+ * two processes both believing they are first cannot argue with.
+ *
+ * This commits BEFORE the ledger is called, which is the ordering `wallet/src/deposits.ts` argues
+ * for at length and is not the obvious one. The failure it leaves possible is a local row with no
+ * ledger entry — visible, queryable and retriable, and safe to retry because the ledger dedupes on
+ * this same key. The failure it makes impossible is a ledger entry this service does not know it
+ * made, which the next attempt would credit again.
+ */
+export async function claimPayoutCredit(exec: Exec, credit: PayoutCreditInput): Promise<number | null> {
+  const rows = await exec<{ id: string }[]>`
+    insert into pool_payout_credits (
+      chain, network, block_hash, block_height, worker_id, account, asset_code, amount, credit_key
+    )
+    values (
+      ${credit.chain}, ${credit.network}, ${credit.blockHash}, ${credit.blockHeight},
+      ${credit.workerId}, ${credit.account}, ${credit.assetCode},
+      ${param(credit.amount)}::numeric(78,0), ${credit.creditKey}
+    )
+    on conflict (credit_key) do nothing
+    returning id
+  `
+  const inserted = rows[0]
+  return inserted ? Number(inserted.id) : null
+}
+
+/**
+ * Record the ledger entry a claim produced.
+ *
+ * `ledger_entry_id is null` is in the predicate so a replica that finished first is not overwritten
+ * by a slower one carrying the ledger's replayed answer for the same key. The return says whether
+ * this call was the one that closed the claim, which is what a caller needs in order not to announce
+ * the same payment twice.
+ */
+export async function markPayoutCredited(
+  exec: Exec,
+  args: { chain: PoolChainId; id: number; ledgerEntryId: string },
+): Promise<boolean> {
+  const rows = await exec<{ id: string }[]>`
+    update pool_payout_credits
+       set ledger_entry_id = ${args.ledgerEntryId},
+           credited_at     = now()
+     where chain = ${args.chain}
+       and id = ${args.id}
+       and ledger_entry_id is null
+    returning id
+  `
+  return rows.length > 0
+}
+
+export interface PendingPayoutCredit {
+  readonly id: number
+  readonly network: string
+  readonly blockHash: string
+  readonly blockHeight: number
+  readonly workerId: number
+  readonly account: string
+  readonly assetCode: string
+  readonly amount: bigint
+  readonly creditKey: string
+}
+
+/**
+ * Claims whose ledger posting has not landed. A retry's whole input.
+ *
+ * Oldest first by id, so a backlog drains in the order it accumulated rather than starving its own
+ * head. There is no time filter: a claim that has been unposted for a week is more urgent than one
+ * from a minute ago, not less, and a `where created_at < now() - …` here would hide exactly the rows
+ * an operator needs to see.
+ */
+export async function pendingPayoutCredits(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<PendingPayoutCredit[]> {
+  const rows = await exec<
+    {
+      id: string
+      network: string
+      block_hash: string
+      block_height: number
+      worker_id: string
+      account: string
+      asset_code: string
+      amount: string
+      credit_key: string
+    }[]
+  >`
+    select id, network, block_hash, block_height, worker_id, account, asset_code,
+           amount::text, credit_key
+    from pool_payout_credits
+    where chain = ${args.chain}
+      and ledger_entry_id is null
+    order by id
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({
+    id: Number(row.id),
+    network: row.network,
+    blockHash: row.block_hash,
+    blockHeight: row.block_height,
+    workerId: Number(row.worker_id),
+    account: row.account,
+    assetCode: row.asset_code,
+    amount: BigInt(row.amount),
+    creditKey: row.credit_key,
+  }))
 }
 
 export interface WindowRow {
@@ -479,6 +852,12 @@ export interface BlockRecord {
   readonly networkDifficultyUnits: bigint
   readonly submitStatus: string
   readonly submitDetail: string | null
+  /**
+   * Whether the block survived, as `maturity.ts` last measured it — a different fact from
+   * `submitStatus`, which is what the node said once at submission and is never revised.
+   */
+  readonly maturityStatus: string
+  readonly confirmations: number | null
 }
 
 export async function recentBlocks(
@@ -494,9 +873,12 @@ export async function recentBlocks(
       network_difficulty_units: string
       submit_status: string
       submit_detail: string | null
+      maturity_status: string
+      confirmations: number | null
     }[]
   >`
-    select height, hash, found_at, reward::text, network_difficulty_units::text, submit_status, submit_detail
+    select height, hash, found_at, reward::text, network_difficulty_units::text, submit_status,
+           submit_detail, maturity_status, confirmations
     from pool_blocks
     where chain = ${args.chain}
     order by found_at desc
@@ -510,6 +892,8 @@ export async function recentBlocks(
     networkDifficultyUnits: BigInt(row.network_difficulty_units),
     submitStatus: row.submit_status,
     submitDetail: row.submit_detail,
+    maturityStatus: row.maturity_status,
+    confirmations: row.confirmations,
   }))
 }
 

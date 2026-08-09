@@ -6,9 +6,10 @@
  * tests are worth having: they are cheap now and they are the only warning available before a
  * changed migration reaches an environment that has already run it.
  *
- * The other assertion here is a negative one. There is no payouts table, and there must not be one
- * until payouts are actually implemented — a schema that looks ready to credit miners is the same
- * kind of lie as a function that returns without doing anything.
+ * The other assertions here are negative ones, and the negative that matters is 04-domain-model §11:
+ * this schema holds no balance. `pool_payout_credits` arrived with micro-org#302 and records the
+ * movements this service asked the ledger to make; what a miner is owed is the ledger's answer and
+ * must never be recomputed here.
  */
 
 import test from 'node:test'
@@ -68,25 +69,59 @@ test('every pool table is scoped by chain', () => {
   }
 })
 
-test('there is no payouts table', () => {
-  // Payouts are not implemented. A table named for them would be read by the next person as a
-  // half-finished feature rather than as an unstarted one, and the difference matters when the
-  // question is "has anybody been paid?".
-  //
-  // Checked against the DDL with SQL comments stripped, because the prose in this file discusses
-  // payouts at length — including a comment whose whole purpose is to record that the table is
-  // absent on purpose. A grep that could not tell those apart would fail on the explanation for why
-  // it should pass.
-  const ddl = MIGRATIONS.map((m) => m.up)
+/**
+ * The DDL of the whole set, with SQL comments stripped.
+ *
+ * Stripped because the prose in `migrations.ts` discusses payouts and balances at length — including
+ * comments whose whole purpose is to record what the schema deliberately does NOT hold. A grep that
+ * could not tell a comment from a column would fail on the explanation for why it should pass.
+ */
+function ddl(): string {
+  return MIGRATIONS.map((m) => m.up)
     .join('\n')
     .replace(/--[^\n]*/g, '')
     .toLowerCase()
-  for (const forbidden of ['payout', 'credit_key', 'balance']) {
+}
+
+test('THE SCHEMA HOLDS NO BALANCE, AND THE PAYOUT TABLE IS A LOG OF MOVEMENTS RATHER THAN ONE', () => {
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // This test used to assert that the words "payout" and "credit_key" appeared nowhere in the
+  // schema, because no table existed for them. micro-org#302 introduced `pool_payout_credits`, so
+  // that spelling of the property is now false — and it is RE-POINTED rather than deleted, because
+  // the property underneath it was never really about the word "payout".
+  //
+  // The property is 04-domain-model §11: **no user balance column anywhere outside the ledger's
+  // projection.** `pool_payout_credits` is a record of movements this service asked the ledger to
+  // make; the number a miner is owed is the ledger's answer. A `balance` column here would be a
+  // second, divergent copy of it, and the first thing a support query would read.
+  //
+  // `owed` and `total` are refused alongside it because they are what a balance gets called by
+  // somebody who has read the rule and wants to keep the column anyway.
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  for (const forbidden of ['balance', 'owed', ' total ']) {
     assert.ok(
-      !ddl.includes(forbidden),
-      `the schema itself names "${forbidden}", but nothing in this release credits anybody`,
+      !ddl().includes(forbidden),
+      `the schema names "${forbidden}", but every balance in this platform belongs to micro-ledger`,
     )
   }
+})
+
+test('the payout table arrives in the same migration that starts writing to it, and nowhere earlier', () => {
+  // micro-org#302 asked for exactly this ordering: the table is introduced by the change that
+  // credits the ledger, not staged ahead of it. A schema that looks ready to credit miners while
+  // nothing does is the same kind of lie as a function that returns without doing anything, which is
+  // the sentence the test above used to enforce by banning the table outright.
+  const creating = MIGRATIONS.filter((m) => m.up.toLowerCase().includes('create table if not exists pool_payout_credits'))
+  assert.equal(creating.length, 1, 'the payout table is created by more or less than one migration')
+  assert.equal(creating[0]?.version, 5)
+  assert.ok(POOL_CHAIN_TABLES.includes('pool_payout_credits'), 'the payout table is not declared chain-scoped')
+
+  // The local half of at-most-once. `poolPayoutCreditKey` is the value behind it and the same string
+  // is the ledger's `idempotencyKey`; a table without this constraint would let a retried sweep
+  // claim one movement twice and rely entirely on the peer to notice.
+  const body = creating[0]?.up ?? ''
+  assert.match(body, /unique \(credit_key\)/, 'credit_key is not unique, so a movement could be claimed twice')
+  assert.match(body, /amount > 0/, 'a payout row may hold a non-positive amount')
 })
 
 test('migrations are idempotent in shape', () => {
@@ -149,4 +184,43 @@ test('the account link stores no estate identity beyond the id, and no ticket', 
   for (const forbidden of ['email', 'handle', 'ticket', 'token', 'secret']) {
     assert.ok(!link.includes(forbidden), `the account link stores "${forbidden}"`)
   }
+})
+
+/* ------------------------------------------------ block maturity (micro-org#302) */
+
+test('MATURITY IS A NEW COLUMN SET, AND `submit_status` WAS NOT REPURPOSED', () => {
+  // The tempting shape was to widen `submit_status` with `matured` and `orphaned` values, and it is
+  // wrong: they answer different questions at different times. `submit_status` is the node's verbatim
+  // reply at the one moment it could be observed, and it is the only thing that separates "we built
+  // the coinbase wrongly" from "we lost a race". A status rewritten in place would have destroyed
+  // that evidence in exactly the case somebody needed it.
+  const maturity = MIGRATIONS.find((m) => m.version === 4)
+  assert.equal(maturity?.name, 'block-maturity')
+  const up = maturity?.up ?? ''
+  for (const column of ['maturity_status', 'confirmations', 'maturity_detail', 'maturity_checked_at', 'matured_at']) {
+    assert.match(up, new RegExp(`add column if not exists\\s+${column}\\b`), `${column} is missing`)
+  }
+  assert.ok(!/drop column/i.test(up), 'the maturity migration drops a column')
+  assert.ok(!/alter column\s+submit_status/i.test(up), 'the maturity migration rewrites the submission verdict')
+})
+
+test('A BLOCK NOBODY HAS CHECKED DEFAULTS TO PENDING, NOT TO MATURED', () => {
+  // The direction that costs nothing to be wrong about. `pending` is not payable, so the failure mode
+  // of a column defaulting the other way — every block already recorded silently becoming eligible
+  // the moment the column appeared — is not available.
+  const up = MIGRATIONS.find((m) => m.version === 4)?.up ?? ''
+  assert.match(up, /maturity_status\s+text not null default 'pending'/)
+  assert.match(up, /check \(maturity_status in \('pending', 'matured', 'orphaned'\)\)/)
+})
+
+test('THE BACK-FILL ONLY TOUCHES BLOCKS THE NODE ALREADY REFUSED', () => {
+  // A rejected block was never on the chain, so `orphaned` is a fact about it rather than a guess,
+  // and it is the one class of existing row a migration may settle without asking a node. Every
+  // accepted block stays `pending` until the watcher has actually re-read it — including the ones
+  // this pool found before the watcher existed.
+  const up = MIGRATIONS.find((m) => m.version === 4)?.up ?? ''
+  const update = up.slice(up.indexOf('update pool_blocks'))
+  assert.match(update, /set maturity_status = 'orphaned'/)
+  assert.match(update, /where submit_status <> 'accepted'/)
+  assert.ok(!/set maturity_status = 'matured'/.test(up), 'a migration declared a block matured')
 })

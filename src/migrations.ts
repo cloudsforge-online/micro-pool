@@ -158,6 +158,173 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 4,
+    name: 'block-maturity',
+    /*
+     * ═══ `submit_status` IS WHAT THE NODE SAID ONCE. THIS IS WHETHER IT STAYED TRUE ═════════════
+     *
+     * Migration 2 above records `submit_status` and says what it is for: "What the node said when
+     * the block was submitted". Nothing re-read it afterwards, and micro-org#302 is the defect that
+     * follows from that — a coinbase is unspendable for 100 blocks on both chains and a block can be
+     * orphaned well inside that window, so `accepted` means the node took the block, not that the
+     * block is in the chain. Paying against `accepted` alone pays money that does not exist.
+     *
+     * The columns below are a SECOND fact beside the first rather than a correction of it. Nothing
+     * overwrites `submit_status`, because the node's verbatim verdict at submission time is the most
+     * useful diagnostic this service produces and a row that had been edited to say `orphaned` would
+     * have lost it. `maturity_status` answers a different question — is this block on the active
+     * chain at spendable depth — and `maturity.ts` is the only thing that writes it.
+     *
+     * ## Why the default is `pending` and why that is the safe direction
+     *
+     * Every block already on file becomes `pending` and is therefore NOT payable, including blocks
+     * the pool found months ago that have been buried since. The watcher re-reads each one against
+     * the node and promotes it. The reverse default — assuming an old accepted block matured —
+     * would have made the back-fill itself the payment decision, which is exactly the conflation
+     * this migration exists to undo.
+     *
+     * ## Blocks the node REFUSED are back-filled `orphaned`, not left `pending`
+     *
+     * A block `submitblock` rejected never entered the chain and never will, so it is not waiting
+     * for anything; leaving it `pending` would put a permanent row in the watcher's queue and in
+     * every "still maturing" count an operator reads. `orphaned` is literally accurate for it — not
+     * on the active chain — and the reason it is not on the active chain is preserved unchanged in
+     * `submit_status` and `submit_detail` beside it.
+     */
+    up: `
+      alter table pool_blocks
+        add column if not exists maturity_status      text not null default 'pending',
+        add column if not exists confirmations        integer,
+        add column if not exists maturity_detail      text,
+        add column if not exists maturity_checked_at  timestamptz,
+        add column if not exists matured_at           timestamptz;
+
+      -- Three values and no more. A payout path reads 'matured' and nothing else, so a fourth
+      -- spelling introduced later by a typo would be a block that is silently never paid; the
+      -- constraint turns that into a failed write at the moment it is made.
+      alter table pool_blocks
+        drop constraint if exists pool_blocks_maturity_ck;
+      alter table pool_blocks
+        add constraint pool_blocks_maturity_ck
+        check (maturity_status in ('pending', 'matured', 'orphaned'));
+
+      update pool_blocks
+         set maturity_status = 'orphaned',
+             maturity_detail = 'the node refused this block at submission; it was never on the chain'
+       where submit_status <> 'accepted' and maturity_status = 'pending';
+
+      -- The watcher's access path: the pending blocks of one chain, oldest first. Partial, because
+      -- the rows it excludes are the overwhelming majority once a pool has been running a while and
+      -- they are never selected by this query again.
+      create index if not exists pool_blocks_pending_maturity_idx
+        on pool_blocks (chain, found_at)
+        where maturity_status = 'pending';
+    `,
+  },
+  {
+    version: 5,
+    name: 'payout-credits',
+    /*
+     * The table `migrations.ts` spent four versions saying should not exist yet.
+     *
+     * It exists now because the change that creates it is the change that writes to it — that was
+     * always the condition, and the reason was that an empty `pool_payout_credits` reads to the next
+     * person as a feature that exists and is not firing. That is still true of a table nobody
+     * inserts into, so if the sink is ever removed this table must go with it.
+     *
+     * ## `credit_key` is the whole design
+     *
+     * `wallet/src/deposits.ts` established the estate's shape for crediting a ledger from an
+     * external event, and the entirety of its safety is ONE key doing two jobs: the unique
+     * constraint on the local row AND the `idempotencyKey` sent to the ledger, "so the two services
+     * cannot disagree about whether this movement has been credited". `poolPayoutCreditKey` is that
+     * key here — `(chain, network, blockHash, workerId)` — and it is written into this column
+     * verbatim. A payout that deduped locally on one key and called the ledger with another would
+     * pay twice the first time a response was lost, and a lost response on a call that succeeded is
+     * the ordinary case rather than an exotic one.
+     *
+     * ## Why `ledger_entry_id` is nullable, and why that is not laziness
+     *
+     * The claim commits before the ledger call, so a crash between the two leaves a row here with no
+     * entry id. That state is deliberate: it is visible, queryable and retriable, and the retry is
+     * safe because the ledger dedupes on the same key. The reverse ordering would produce a ledger
+     * entry this service does not know it made, and the next attempt would credit again.
+     *
+     * `block_hash` and `chain` are stored beside the key rather than only inside it, because the
+     * question an operator asks is "what did we pay for this block" and parsing a delimited string
+     * in a `where` clause is not an answer.
+     */
+    up: `
+      create table if not exists pool_payout_credits (
+        id              bigserial   primary key,
+        chain           text        not null,
+        network         text        not null,
+        block_hash      text        not null,
+        block_height    integer     not null,
+        worker_id       bigint      not null references pool_workers (id),
+        account         text        not null,
+        asset_code      text        not null,
+        -- Smallest units, as an exact integer. Never a float, for the reason the header of this
+        -- file gives about difficulty and the estate gives everywhere about money.
+        amount          numeric(78,0) not null,
+        credit_key      text        not null,
+        ledger_entry_id text,
+        created_at      timestamptz not null default now(),
+        credited_at     timestamptz,
+        constraint pool_payout_credits_key_uniq unique (credit_key),
+        constraint pool_payout_credits_amount_ck check (amount > 0)
+      );
+
+      -- The retry job's whole input: the claims whose ledger posting has not landed. Partial,
+      -- because in a healthy estate the rows it excludes are all of them.
+      create index if not exists pool_payout_credits_pending_idx
+        on pool_payout_credits (id)
+        where ledger_entry_id is null;
+
+      -- "What did this block pay, and to whom." The operator's question and the sink's own
+      -- already-paid check.
+      create index if not exists pool_payout_credits_block_idx
+        on pool_payout_credits (chain, block_hash);
+    `,
+  },
+  {
+    version: 6,
+    name: 'block-credit-marker',
+    /*
+     * ═══ ONE COLUMN, AND IT IS AN OPTIMISATION RATHER THAN A SAFETY PROPERTY ═════════════════════
+     *
+     * Migration 5 made `credit_key` the thing that stops a miner being paid twice, and it is enough
+     * on its own: `rewards.ts` may walk the same matured block on every sweep for ever and the
+     * unique constraint turns every re-offer into a no-op. What it is NOT is cheap. Without a marker
+     * the credit job re-reads the PPLNS window of every matured block this pool has ever found,
+     * re-runs the allocation, and hands every worker back to the sink, on a ten-minute timer,
+     * growing without bound for the life of the pool.
+     *
+     * So this column answers "has this block's allocation been offered to the sink" and nothing
+     * else. It deliberately does not say "every worker in this block was paid", because that is not
+     * true and a column named as though it were would be read as a receipt: a claim under
+     * `POOL_<CHAIN>_MINIMUM_PAYOUT` and a miner with no estate account are both skipped, both
+     * counted, and both still derivable in full from `window_first_share_id`/`window_last_share_id`
+     * and `pool_shares` — which `pruneShares` already refuses to delete under a recorded block.
+     *
+     * It is on `pool_blocks` rather than in a new table because it is one fact about one block, and
+     * `pool_payout_credits` cannot carry it: the honest state of a block whose every worker was
+     * below the minimum is "offered, credited nothing", which in a credits table is no rows at all
+     * and is indistinguishable from a block nobody has looked at.
+     */
+    up: `
+      alter table pool_blocks
+        add column if not exists payout_credited_at timestamptz;
+
+      -- The credit job's access path: the matured blocks of one chain that have not been offered
+      -- yet, oldest first. Partial and narrow, because once a pool has been running a while the rows
+      -- it excludes are all of them, and this query then reads an empty index rather than a table.
+      create index if not exists pool_blocks_uncredited_idx
+        on pool_blocks (chain, height)
+        where maturity_status = 'matured' and payout_credited_at is null;
+    `,
+  },
 ]
 
 /**
@@ -173,7 +340,12 @@ export const MIGRATIONS: readonly Migration[] = [
  * `pool_account_links` is deliberately NOT here. It maps an estate user to their pool account label
  * and a person is not per chain; migration 3 says so where the table is created.
  */
-export const POOL_CHAIN_TABLES: readonly string[] = Object.freeze(['pool_shares', 'pool_blocks', 'pool_workers'])
+export const POOL_CHAIN_TABLES: readonly string[] = Object.freeze([
+  'pool_shares',
+  'pool_blocks',
+  'pool_workers',
+  'pool_payout_credits',
+])
 
 /**
  * Every table this service owns, chain-scoped or not.
@@ -189,11 +361,15 @@ export const POOL_TABLES: readonly string[] = Object.freeze([...POOL_CHAIN_TABLE
  * which is what stops a replica of the new code answering requests against the old schema when a
  * deploy runs ahead of its migrator.
  *
- * **There is deliberately no payouts table here.** Payout crediting is not implemented in this
- * release — `payouts.ts` says so in detail and the README says so in the first screen. A table
- * called `pool_payout_credits` sitting empty in the schema would read, to the next person, as a
- * feature that exists and is not firing. The migration that creates it belongs to the change that
- * writes to it.
+ * Versions 1 through 4 carried a note here saying there was deliberately no payouts table, on the
+ * condition that the migration creating it would belong to the change that writes to it. Migration
+ * 5 is that change: `payouts.ts` now has a sink that inserts into `pool_payout_credits`, so the
+ * table is no longer a promise sitting in a schema. **The condition still binds in the other
+ * direction** — a release that removed the sink would have to remove the table with it.
+ *
+ * A table is not a running feature, and the two are still separate here: nothing constructs the sink
+ * unless the payout configuration block is set, which it is not on the estate. `env.ts` explains
+ * that at the read site and `payouts.ts` explains what has to become true first.
  */
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)
 

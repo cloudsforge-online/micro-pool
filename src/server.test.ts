@@ -421,6 +421,8 @@ test('A REWARD CROSSES THE WIRE AS A STRING, BECAUSE JSON HAS NO INTEGER WIDE EN
       network_difficulty_units: '3451211950000000',
       submit_status: 'accepted',
       submit_detail: null,
+      maturity_status: 'pending',
+      confirmations: 7,
     },
     {
       height: 2_912_003,
@@ -430,6 +432,10 @@ test('A REWARD CROSSES THE WIRE AS A STRING, BECAUSE JSON HAS NO INTEGER WIDE EN
       network_difficulty_units: '3451211950000000',
       submit_status: 'rejected',
       submit_detail: 'inconclusive',
+      // Migration 4 back-fills every non-accepted block to `orphaned`: the node refused it, so it
+      // was never on the chain and there is nothing for the watcher to go and confirm.
+      maturity_status: 'orphaned',
+      confirmations: null,
     },
   ]
   await withServer({ rows }, async (h) => {
@@ -455,9 +461,11 @@ test('A REWARD CROSSES THE WIRE AS A STRING, BECAUSE JSON HAS NO INTEGER WIDE EN
     assert.equal(body.payoutsImplemented, false)
 
     assert.deepEqual(Object.keys(body.blocks[0] ?? {}).sort(), [
+      'confirmations',
       'foundAt',
       'hash',
       'height',
+      'maturityStatus',
       'networkDifficulty',
       'reward',
       'submitDetail',
@@ -471,6 +479,16 @@ test('A REWARD CROSSES THE WIRE AS A STRING, BECAUSE JSON HAS NO INTEGER WIDE EN
     assert.equal(body.blocks[0]?.submitDetail, null)
     assert.equal(body.blocks[1]?.submitStatus, 'rejected')
     assert.equal(body.blocks[1]?.submitDetail, 'inconclusive')
+
+    // The submission verdict and the maturity verdict are two different claims and the response
+    // carries both. An accepted block is NOT yet a block whose reward exists — micro-org#302 — and a
+    // reader that only had `submitStatus` would have no way to tell an accepted-and-buried block
+    // from an accepted-then-reorged-away one.
+    assert.equal(body.blocks[0]?.submitStatus, 'accepted')
+    assert.equal(body.blocks[0]?.maturityStatus, 'pending')
+    assert.equal(body.blocks[0]?.confirmations, 7)
+    assert.equal(body.blocks[1]?.maturityStatus, 'orphaned')
+    assert.equal(body.blocks[1]?.confirmations, null)
   })
 })
 

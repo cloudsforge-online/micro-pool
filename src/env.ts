@@ -15,17 +15,24 @@
  *      reads as a typo and invites the reader to add a row to a table; that row would produce a pool
  *      that mines Dogecoin blocks the network rejects.
  *
- * ## Two things this file deliberately does NOT have
+ * ## What this file deliberately does NOT have
  *
- * **No signing secret, and no `@cloudsforge/secrets`.** The template carries `OUTBOX_SIGNING_SECRET`
- * because a service that publishes events must sign them. This one publishes none — there is no
- * outbox, no event and no subscriber, and the first event it will have to emit is the payout, which
- * is not implemented (`payouts.ts`). Declaring a secret it does not use would be a variable the
- * deploy has to provide for nothing, which is what rule 9 exists to stop.
+ * **No signing secret.** The template carries `OUTBOX_SIGNING_SECRET` because a service that
+ * publishes events must sign them. This one publishes none — there is no outbox, no event and no
+ * subscriber. The mining ticket added by micro-org#289 is a random opaque value matched by equality,
+ * not a MAC, so there is no key to fetch there either. Declaring a secret it does not use would be a
+ * variable the deploy has to provide for nothing, which is what rule 9 exists to stop.
  *
- * **No signing secret and no `@cloudsforge/secrets`, still.** The mining ticket added by
- * micro-org#289 is a random opaque value matched by equality, not a MAC, so there is no key to
- * fetch. Nothing in this service signs anything until payouts exist.
+ * `@cloudsforge/secrets` is nonetheless a dependency as of micro-org#302, for one narrow job:
+ * `assertServiceCredential` checks the shape of `POOL_IDENTITY_CREDENTIAL`. That is validation, not
+ * signing — see `requiredCredential` for why the check may not be a local regex.
+ *
+ * ## Payouts are configuration this file makes OPTIONAL on purpose
+ *
+ * `env.payouts` is null unless an operator has typed a per-chain minimum, and null is the tested,
+ * supported and currently universal state. `optionalUnits` carries the reasoning in full: this file
+ * is eager, a required variable is a container that will not boot, and the pool is mining Litecoin
+ * on the estate right now with none of these variables set.
  *
  * ## `IDENTITY_JWKS_URL` arrived, and it did NOT make the read API private
  *
@@ -45,7 +52,8 @@
 
 import { hostname } from 'node:os'
 import type { Network } from '@cloudsforge/contracts-chain'
-import { isPoolChainId, REFUSED_CHAINS, type PoolChainId } from './chains.ts'
+import { assertServiceCredential, SecretError } from '@cloudsforge/secrets'
+import { isPoolChainId, POOL_CHAIN_IDS, REFUSED_CHAINS, type PoolChainId } from './chains.ts'
 import { STRATUM_WS_PATH } from './wsstratum.ts'
 
 /**
@@ -74,6 +82,37 @@ function required(source: Source, name: string): string {
 function optional(source: Source, name: string, fallback: string): string {
   const value = source[name]?.trim()
   return value && value.length > 0 ? value : fallback
+}
+
+/**
+ * A SERVICE CREDENTIAL that must be present and must be real.
+ *
+ * Required rather than optional — the inverse of `wallet`'s `optionalCredential` — because the two
+ * services are in opposite positions. The wallet must boot without one: it holds user balances, and
+ * turning an ungranted credential into `exit(1)` there converts a gap into an outage. Here there is
+ * nothing to keep running, because the caller only reaches this function once a minimum payout has
+ * been typed, and a pool that has been told to pay miners and cannot authenticate to the ledger has
+ * no useful degraded mode — it would accrue credits it can never post.
+ *
+ * The shape check is `@cloudsforge/secrets`' and not a local rule, deliberately. A credential is
+ * `cfsc_` + base64url, which is neither wholly base64 nor wholly hex and which (measured live on
+ * 2026-08-09) contains a hyphen on testnet and none on mainnet, so every "obvious" local rule an
+ * author would write here refuses one of the estate's two real credentials. `assertServiceCredential`
+ * also rejects a JWT pasted in place of the long-lived credential, which is the mistake that
+ * otherwise surfaces as a 401 an hour after deploy.
+ */
+function requiredCredential(source: Source, name: string): string {
+  const value = required(source, name)
+  try {
+    assertServiceCredential(name, value)
+  } catch (err) {
+    // Re-typed, not re-worded: `fatalConfig` reports whatever message arrives, and a `SecretError`
+    // already names the variable and the property it failed. What matters is that a caller can tell
+    // configuration from every other failure, which is what `EnvError` is for.
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
+  }
+  return value
 }
 
 function integer(source: Source, name: string, fallback: number, min: number, max: number): number {
@@ -118,6 +157,65 @@ function requiredInteger(source: Source, name: string, min: number, max: number)
   const value = Number(raw)
   if (!Number.isInteger(value) || value < min || value > max) {
     throw new EnvError(`${name} must be a whole number between ${min} and ${max} (got ${raw})`)
+  }
+  return value
+}
+
+/**
+ * A whole number of SMALLEST UNITS, parsed strictly, with **no default and no fallback**.
+ *
+ * `null` when unset — never a number. This is the discipline `POOL_FEE_BASIS_POINTS` is read with
+ * (`requiredInteger`, and see `feeBasisPoints` for why the absence of a default is the entire
+ * point), transposed onto a value that must additionally be optional. `POOL_<CHAIN>_MINIMUM_PAYOUT`
+ * is the only caller.
+ *
+ * ── WHY THIS IS OPTIONAL WHEN `POOL_FEE_BASIS_POINTS` IS REQUIRED ───────────────────────────────
+ *
+ * The fee had to be required, because a service that ships a default fee has answered an open
+ * product question by omission. The same reasoning would make a minimum payout required — and doing
+ * that would have taken the estate's pool down.
+ *
+ * `env.ts` is eager: it runs at import, and `fatalConfig` exits the process on any refusal. So a
+ * newly-required variable is a container that will not boot until somebody sets it, and on
+ * 2026-08-09 `cloudsforge-estate-pool-1` is healthy, on release 2.5.8, mining LTC against a fully
+ * synced litecoind, and its environment — read from the running container, not from a compose file
+ * — contains `POOL_CHAINS=ltc`, `POOL_FEE_BASIS_POINTS=100`, a payout address and no payout
+ * configuration of any kind. A required variable added here lands as a boot failure on the next
+ * deploy, and it takes that deploy's `--wait` down with it. That is not hypothetical: it happened on
+ * 2026-08-07 with `pool-migrate` and a missing database.
+ *
+ * So the shape is: **unset means payouts are off**, and off is a supported, tested state — no sink
+ * is constructed, no job is registered, and `payoutsImplemented` stays false. There is no middle
+ * ground where a default silently decides what a miner must earn before being paid.
+ *
+ * ── WHAT "STRICTLY" MEANS, AND WHY A MALFORMED VALUE IS A REFUSAL ───────────────────────────────
+ *
+ * Digits only. Not `Number()`, which accepts `0x10`, `1e8`, ` 12 `, `Infinity` and `1.5` and turns
+ * the last of those into a silent truncation; not a float at any point, because this is money in
+ * the smallest unit and the value is compared against `bigint` amounts. `"0.05"` is the mistake an
+ * operator will actually make — five hundredths of a Litecoin is what they mean, five million
+ * litoshi is what they have to type — and a parser that read it as 0 would set the minimum to
+ * "always pay", which is the opposite of what was intended and would be invisible.
+ *
+ * Refusing rather than falling back, for the reason the whole block exists: a fallback here is a
+ * number nobody chose being applied to somebody else's money.
+ */
+function optionalUnits(source: Source, name: string): bigint | null {
+  const raw = source[name]?.trim()
+  if (!raw) return null
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new EnvError(
+      `${name} must be a whole number of the smallest unit, digits only (got ${raw}). ` +
+        'A Litecoin amount goes here as litoshi: 0.05 LTC is 5000000. There is no default and a ' +
+        'value that cannot be read exactly is refused rather than rounded.',
+    )
+  }
+  const value = BigInt(raw)
+  if (value <= 0n) {
+    throw new EnvError(
+      `${name} must be greater than zero (got ${raw}). A minimum of zero is not "no minimum" — ` +
+        `leave ${name} unset for that, which turns payouts off entirely.`,
+    )
   }
   return value
 }
@@ -239,6 +337,47 @@ function publicWebsocketOrigin(source: Source, name: string): string | null {
 export interface IdentityConfig {
   readonly jwksUrl: string
   readonly issuer: string
+}
+
+/**
+ * Everything needed to credit a miner in the ledger, or — far more usually — `null`.
+ *
+ * All of it or none of it, held as one object rather than as four independent fields, because that
+ * is what makes "payouts are off" a state the type checker can see. A caller holding
+ * `env.payouts === null` cannot reach a ledger URL, and `index.ts` constructs no sink, registers no
+ * job and leaves `payoutsImplemented` false. Four nullable fields would have made every one of those
+ * a runtime question asked in four places.
+ *
+ * See `optionalUnits` for why this whole block is optional on a service whose fee is required, and
+ * `CUSTODY_BACKING_CLOSED` in `payouts.ts` for the SECOND, independent gate that refuses the payout
+ * path even when this block is fully configured. Setting these variables is necessary to pay a miner
+ * and it is not sufficient.
+ */
+export interface PayoutConfig {
+  /** The ledger's base URL. Not this service's database — the ledger owns every balance. */
+  readonly ledgerUrl: string
+  /**
+   * Where the long-lived credential is exchanged for a short service token.
+   *
+   * `IDENTITY_URL` when set, and `IDENTITY_ISSUER` when it is not — the same fallback wallet uses,
+   * and measured against the running estate on 2026-08-09 the fallback is the live path: no
+   * container sets `IDENTITY_URL`, and `IDENTITY_ISSUER` is the identity service's own base URL.
+   * Kept overridable anyway because an issuer is an identifier and a URL is a route, and a
+   * deployment that puts identity behind a different address is entitled to say so.
+   */
+  readonly identityUrl: string
+  /** Long-lived, exchanged for short service tokens. Never logged, never rendered. */
+  readonly identityCredential: string
+  readonly deadlineMs: number
+  /**
+   * Smallest units a miner must be owed before this pool posts an entry, per chain.
+   *
+   * A `Map` of the chains that have one rather than a record over every chain, because a chain with
+   * no minimum is not paid at all and that is a supported configuration: an estate that pays
+   * Litecoin miners and has not decided what to do about Bitcoin is a decision, not a half-made one.
+   * `bigint` because these are compared against amounts that do not fit a double.
+   */
+  readonly minimums: ReadonlyMap<PoolChainId, bigint>
 }
 
 export interface ChainConfig {
@@ -373,6 +512,17 @@ export interface Env {
    * behaviour: somebody has to type the number.
    */
   readonly feeBasisPoints: number
+  /**
+   * How to pay a miner, or `null` — which is what it is on every deployment that exists today.
+   *
+   * **Unset is a supported, tested mode and it is the default one**, exactly like `identity` above.
+   * Null means no `PayoutSink` is constructed, no payout job is registered, `GET /v1/pool` keeps
+   * reporting `payoutsImplemented: false`, and a matured block sits in `pool_blocks` as a record of
+   * work done and money not yet moved. See `optionalUnits` for why a required variable here would
+   * have taken the estate's running pool down on its next deploy, and `PayoutConfig` for what the
+   * fields are.
+   */
+  readonly payouts: PayoutConfig | null
   readonly pplnsMultiplier: number
   readonly shareRetentionDays: number
   readonly templatePollMs: number
@@ -531,6 +681,88 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     )
   }
 
+  /*
+   * Payouts, which are OFF unless somebody has typed a minimum.
+   *
+   * ── WHY THE MINIMUM IS THE SWITCH ───────────────────────────────────────────────────────────────
+   *
+   * Because it is the variable nobody can default on an operator's behalf. A ledger URL has an
+   * obvious value on this estate and a credential is issued by a process; the number of litoshi a
+   * miner must accrue before the pool moves money is a policy decision about somebody else's
+   * earnings, and `optionalUnits` records at length why it therefore has no default and why the
+   * whole block had to be optional rather than required like `POOL_FEE_BASIS_POINTS`.
+   *
+   * Per chain, and a chain with no minimum is simply not paid — the same per-chain treatment
+   * `stratumPublicPort` gets, and for the same reason: an estate that pays Litecoin miners while it
+   * decides what to do about Bitcoin is a configuration rather than a mistake.
+   *
+   * ── THE THREE REFUSALS ──────────────────────────────────────────────────────────────────────────
+   *
+   * Each is a state somebody started and did not finish, and each would otherwise produce a pool
+   * that pays nobody while its operator believes it pays everybody. Nothing here falls back.
+   */
+  const minimums = new Map<PoolChainId, bigint>()
+  for (const chain of chains) {
+    const minimum = optionalUnits(source, `POOL_${chain.chain.toUpperCase()}_MINIMUM_PAYOUT`)
+    if (minimum !== null) minimums.set(chain.chain, minimum)
+  }
+  // A minimum for a chain this pool does not mine is a variable that does nothing, typed by somebody
+  // who believes that chain is being paid. Checked against POOL_CHAINS rather than against the two
+  // chains this software implements, because the mistake being caught is "I set it for the wrong
+  // deployment", not "I invented a chain".
+  for (const name of POOL_CHAIN_IDS) {
+    const variable = `POOL_${name.toUpperCase()}_MINIMUM_PAYOUT`
+    if (source[variable]?.trim() && !seen.has(name)) {
+      throw new EnvError(
+        `${variable} sets a payout minimum for ${name} and POOL_CHAINS does not list ${name}, so it ` +
+          'would pay nobody. Either mine that chain or remove the variable.',
+      )
+    }
+  }
+  const ledgerUrl = source['LEDGER_URL']?.trim()
+  const credential = source['POOL_IDENTITY_CREDENTIAL']?.trim()
+  if (minimums.size > 0 && !ledgerUrl) {
+    throw new EnvError(
+      'a POOL_<CHAIN>_MINIMUM_PAYOUT is set and LEDGER_URL is not. A miner is paid by an entry in ' +
+        'the ledger, which owns every balance in this platform; this service holds none and cannot ' +
+        'credit anybody on its own.',
+    )
+  }
+  if (minimums.size > 0 && !credential) {
+    throw new EnvError(
+      'a POOL_<CHAIN>_MINIMUM_PAYOUT is set and POOL_IDENTITY_CREDENTIAL is not, so there is no ' +
+        'service token to post an entry with and every credit would be refused 401.',
+    )
+  }
+  if (minimums.size > 0 && identity === null) {
+    throw new EnvError(
+      'a POOL_<CHAIN>_MINIMUM_PAYOUT is set and IDENTITY_ISSUER is not. The credential above is ' +
+        'exchanged for a short service token at the identity service, and a pool with no estate ' +
+        'behind it has nobody to exchange with — and no linked accounts to pay either.',
+    )
+  }
+  if (minimums.size === 0 && (ledgerUrl || credential)) {
+    throw new EnvError(
+      'LEDGER_URL or POOL_IDENTITY_CREDENTIAL is set and no chain has a POOL_<CHAIN>_MINIMUM_PAYOUT, ' +
+        'so no payout would ever be posted. The minimum is not defaulted: it is the number of ' +
+        'smallest units a miner must be owed before this pool moves money, and nobody may choose ' +
+        "that on the operator's behalf. State it per chain, in litoshi or satoshi.",
+    )
+  }
+  const payouts: PayoutConfig | null =
+    minimums.size > 0 && identity !== null
+      ? {
+          ledgerUrl: httpUrl(source, 'LEDGER_URL'),
+          identityUrl: optional(source, 'IDENTITY_URL', identity.issuer),
+          identityCredential: requiredCredential(source, 'POOL_IDENTITY_CREDENTIAL'),
+          // A timeout, not a policy, so it defaults — the thing that must not be guessed is the
+          // money. Bounded well under the payout job's interval so a hung ledger cannot pile
+          // requests up behind a lease.
+          deadlineMs: integer(source, 'POOL_LEDGER_DEADLINE_MS', 8_000, 250, 60_000),
+          minimums,
+        }
+      : null
+
   const coinbaseTag = optional(source, 'POOL_COINBASE_TAG', '/cloudsforge/')
   if (Buffer.byteLength(coinbaseTag, 'utf8') > 32) {
     throw new EnvError('POOL_COINBASE_TAG must be at most 32 bytes — the coinbase scriptSig it shares is capped at 100')
@@ -560,6 +792,9 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     identity,
     coinbaseTag,
     feeBasisPoints: requiredInteger(source, 'POOL_FEE_BASIS_POINTS', 0, 10_000),
+    // Null on every deployment that exists on 2026-08-09, and null is the tested path. See the
+    // field's note and `optionalUnits`.
+    payouts,
     pplnsMultiplier: decimal(source, 'POOL_PPLNS_WINDOW_MULTIPLIER', 2, 0.1, 100),
     shareRetentionDays: integer(source, 'POOL_SHARE_RETENTION_DAYS', 30, 1, 3650),
     templatePollMs: integer(source, 'POOL_TEMPLATE_POLL_MS', 10_000, 1_000, 120_000),
