@@ -49,7 +49,7 @@
 
 import { createServer, type Server, type Socket } from 'node:net'
 import { randomBytes } from 'node:crypto'
-import { Session, type AcceptedShare, type FoundBlock } from './session.ts'
+import { Session, type AcceptedShare, type FoundAuxBlock, type FoundBlock, type SpoiledAuxBlock } from './session.ts'
 import type { JobRegistry, Job } from './work.ts'
 import type { VardiffOptions } from './vardiff.ts'
 import type { RedeemedTicket } from './tickets.ts'
@@ -141,6 +141,16 @@ export interface StratumServerOptions {
   readonly persistShares: (shares: readonly AcceptedShare[]) => Promise<void>
   /** Called synchronously on a block, before the miner is told anything. Must not throw. */
   readonly onBlock: (block: FoundBlock) => void
+  /**
+   * The same, for the merged chain. Both required — see `SessionDeps`.
+   *
+   * Passed through unconditionally rather than only for chains with an aux chain configured. Whether
+   * merged mining is on is a property of the JOB, decided in `work.ts` from what the registry holds,
+   * and a listener that also decided it would be a second copy of that decision in a file that has
+   * no business having an opinion about Dogecoin.
+   */
+  readonly onAuxBlock: (block: FoundAuxBlock) => void
+  readonly onAuxSpoiled: (spoiled: SpoiledAuxBlock) => void
   /** Every submission's outcome, for counters. Rejections are counted and never stored. */
   readonly onOutcome?: (outcome: 'accepted' | 'rejected', code: number | null) => void
   readonly log: (level: 'debug' | 'info' | 'warn' | 'error', message: string, fields?: Record<string, unknown>) => void
@@ -359,6 +369,8 @@ export class StratumServer {
         send: (message) => wire.write(`${JSON.stringify(message)}\n`),
         onAcceptedShare: (share) => this.#pending.push(share),
         onBlock: (block) => this.#options.onBlock(block),
+        onAuxBlock: (block) => this.#options.onAuxBlock(block),
+        onAuxSpoiled: (spoiled) => this.#options.onAuxSpoiled(spoiled),
         onOutcome: this.#options.onOutcome,
         // Undefined on raw TCP, which is what keeps that path byte-for-byte what it was: a session
         // with no redeemer reads the username and ignores the password, exactly as before.

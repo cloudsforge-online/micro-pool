@@ -5,7 +5,7 @@
  *
  * `pool_blocks.submit_status` records what the node said at the moment of submission and nothing
  * re-read it afterwards (micro-org#302). That is not a small gap. A coinbase output is unspendable
- * for 100 blocks on both chains this pool mines, a block can be orphaned well inside that window,
+ * for at least 100 blocks on every chain this pool mines, a block can be orphaned well inside that window,
  * and `submitblock` answering `null` tells you the node accepted the block onto ITS tip — not that
  * the tip it was accepted onto is the one that survived. So `accepted` is evidence, not a fact
  * about the chain, and a payout written against it pays out money that does not exist.
@@ -28,16 +28,31 @@
  * verdict taken from a node other than the one that issued the template and took the submission
  * would be a verdict about a different chain of blocks than the one this pool mined on.
  *
- * ## Why 100 is not `chainSpec().confirmations`
+ * ## A merge-mined block is asked about on ITS OWN chain, and nothing else here changes
+ *
+ * A Dogecoin block won under Litecoin work is a Dogecoin block: it is in Dogecoin's chain, it is
+ * orphaned by a Dogecoin reorg, and its coinbase matures on Dogecoin's schedule. So `chain` here is
+ * a `MinedChainId` and the sweep for `doge` puts its `getblock` to **dogecoind** — the node that
+ * answered the `submitauxblock`, by the same identity argument as above. The parent's node knows
+ * nothing about that hash and would answer `-5`, which this file reads as "not the node that took
+ * the submission" and leaves pending for ever.
+ *
+ * The two chains' fates are genuinely independent and that is not a complication to handle, it is
+ * simply the truth: the Litecoin block from the same share can mature while the Dogecoin one is
+ * orphaned, or the reverse, and each row is swept against its own node with no reference to the
+ * other. Nothing in this file needs to know that a block was merge-mined at all.
+ *
+ * ## Why these numbers are not `chainSpec().confirmations`
  *
  * `contracts-chain` gives LTC `confirmations: 12` and BTC `6`, and reaching for those here would be
  * the obvious move and wrong by an order of magnitude. Those are the estate's DEPOSIT credit depths
  * — how deep an incoming payment must be before the wallet will credit it — and they are a risk
  * judgement the estate makes. Coinbase maturity is not a judgement at all: it is `COINBASE_MATURITY`
- * in Bitcoin Core's `consensus/consensus.h`, inherited unchanged by Litecoin, and a transaction
- * spending a coinbase output before it is refused by every node on the network. The number lives
- * here because it belongs to the consensus rules of the chain rather than to this estate's policy,
- * and `maturity.test.ts` pins it against being "tidied up" into the pinned package later.
+ * in Bitcoin Core's `consensus/consensus.h`, inherited unchanged by Litecoin and replaced outright
+ * by Dogecoin, and a transaction spending a coinbase output before it is refused by every node on
+ * the network. The numbers live here because they belong to the consensus rules of each chain rather
+ * than to this estate's policy, and `maturity.test.ts` pins them against being "tidied up" into the
+ * pinned package later.
  *
  * ## Everything unknown stays PENDING, and that asymmetry is the whole safety property
  *
@@ -51,25 +66,39 @@
 
 import { NodeRpcError, NodeUnavailableError, type NodeRpc } from './rpc.ts'
 import { blocksAwaitingMaturity, setBlockMaturity, type Exec } from './store.ts'
-import type { PoolChainId } from './chains.ts'
+import type { MinedChainId } from './chains.ts'
 
 /**
  * How many confirmations a block needs before its coinbase can be spent.
  *
- * 100 on both chains, and the arithmetic of the comparison is worth writing down once because it is
- * the sort of thing that is silently off by one for ever. Core refuses a spend when
+ * The arithmetic of the comparison is worth writing down once because it is the sort of thing that
+ * is silently off by one for ever. Core refuses a spend when
  * `spendHeight - coinbaseHeight < COINBASE_MATURITY`, so a coinbase mined at height H is first
  * spendable in the block at height H+100. For that block to be mined the tip must be at H+99, and
  * `getblock` reports `confirmations = tip - height + 1` — which is 100. So `confirmations >= 100` is
- * exactly "spendable in the next block", with no margin either way.
+ * exactly "spendable in the next block", with no margin either way. The same reading holds for
+ * Dogecoin with its own number substituted.
  *
- * There is deliberately no extra safety margin on top. A margin would be this file inventing a
- * second, private confirmation policy beside the consensus rule, and the number it invented would
- * then be the real one while the consensus rule sat beside it looking authoritative.
+ * **Dogecoin is 240, not 100, and it is not a typo.** Bitcoin's `COINBASE_MATURITY` is 100 in
+ * `consensus/consensus.h` and Litecoin inherits it unchanged. Dogecoin does not: it carries the
+ * maturity in its consensus params and changes it by height. Read from `src/chainparams.cpp` at tag
+ * v1.14.9 on 2026-08-09 — `consensus.nCoinbaseMaturity = 30` at `nHeightEffective = 0`, then
+ * `digishieldConsensus.nCoinbaseMaturity = 240` at `nHeightEffective = 145000`, and the AuxPoW
+ * parameter set at 371337 is copy-initialised from the Digishield one and never reassigns the field.
+ * Every block this pool could possibly merge-mine is far past 145000 — the estate's node is at
+ * height 5,015,467 — so 240 is the only value this table can ever need, and the 30 is recorded here
+ * rather than in the table because a lookup by height would be a branch that can never be taken.
+ * 240 blocks at Dogecoin's one-minute target is four hours, which is by design about the same wall
+ * time as Litecoin's 100 at two and a half minutes.
+ *
+ * There is deliberately no extra safety margin on top of any of them. A margin would be this file
+ * inventing a second, private confirmation policy beside the consensus rule, and the number it
+ * invented would then be the real one while the consensus rule sat beside it looking authoritative.
  */
-export const COINBASE_MATURITY: Readonly<Record<PoolChainId, number>> = Object.freeze({
+export const COINBASE_MATURITY: Readonly<Record<MinedChainId, number>> = Object.freeze({
   btc: 100,
   ltc: 100,
+  doge: 240,
 })
 
 /**
@@ -120,7 +149,7 @@ interface BlockHeaderReply {
  */
 export async function inspectBlock(
   rpc: Pick<NodeRpc, 'call'>,
-  args: { readonly chain: PoolChainId; readonly hash: string; readonly height: number },
+  args: { readonly chain: MinedChainId; readonly hash: string; readonly height: number },
 ): Promise<MaturityVerdict> {
   const required = COINBASE_MATURITY[args.chain]
 
@@ -199,7 +228,7 @@ export async function inspectBlock(
 export interface MaturityDeps {
   readonly sql: Exec
   readonly rpc: Pick<NodeRpc, 'call'>
-  readonly chain: PoolChainId
+  readonly chain: MinedChainId
   readonly log: (level: 'info' | 'warn' | 'error', message: string, fields?: Record<string, unknown>) => void
   /** Counts each verdict. Wired to `pool_block_maturity_total` by the job registration. */
   readonly onVerdict?: (status: MaturityStatus) => void

@@ -67,6 +67,32 @@ export interface CoinbaseInput {
   readonly tag: Buffer
   readonly extranonce1Size: number
   readonly extranonce2Size: number
+  /**
+   * The merged-mining commitment from `auxpow.ts`, or absent when this pool merges no chain.
+   *
+   * ## Why it goes here, and why it goes BEFORE the extranonce
+   *
+   * `CAuxPow::check` requires the aux root to sit immediately after the four magic bytes, and the
+   * magic to occur exactly once in the whole scriptSig. Both are properties of a byte range this
+   * function owns — and only if the commitment is in `coinb1`, ahead of the miner's bytes. Putting
+   * it in `coinb2` would work for consensus, but it would sit *after* the extranonce, and the pool
+   * would no longer be able to say anything about the commitment's offset without first knowing
+   * which miner submitted and what it chose. Here, the commitment is a fact about the job.
+   *
+   * It follows the BIP34 height push rather than preceding it, because the height push must be the
+   * first item of the scriptSig and that is consensus on the Litecoin side. Merged mining does not
+   * get to reorder it: `check`'s backward-compatibility branch — the one that allows a missing magic
+   * when the root starts within 20 bytes — exists precisely because early implementations put the
+   * commitment first, and it is not a licence to do so on a chain with BIP34 active.
+   *
+   * **A commitment makes the job disposable.** It names one Dogecoin block, and Dogecoin's
+   * `mapNewBlock` is cleared the moment its own tip moves, after which that block hash answers
+   * `block hash unknown` to `submitauxblock`. So a job built with a commitment is only as good as
+   * the aux tip it was built against; `auxtemplate.ts` is what notices, and `work.ts` is what
+   * rebuilds. Nothing about the Litecoin block changes, which is why the rebuild is `cleanJobs =
+   * false`: the miner may finish what it is doing.
+   */
+  readonly auxCommitment?: Buffer | undefined
 }
 
 export interface CoinbaseParts {
@@ -98,14 +124,17 @@ export function buildCoinbase(input: CoinbaseInput): CoinbaseParts {
     throw new RangeError(`the extranonce is ${extranonceBytes} bytes; it must fit one script push`)
   }
   const tagPush = pushData(input.tag)
+  const aux = input.auxCommitment ?? Buffer.alloc(0)
 
   // The prefix counts the bytes the miner will insert, which do not exist yet. This single number
   // is the reason coinb1 and coinb2 cannot be built independently of each other.
-  const scriptSigLength = heightPush.length + 1 + extranonceBytes + tagPush.length
+  const scriptSigLength = heightPush.length + aux.length + 1 + extranonceBytes + tagPush.length
   if (scriptSigLength < 2 || scriptSigLength > MAX_SCRIPT_SIG_BYTES) {
     throw new RangeError(
       `the coinbase scriptSig would be ${scriptSigLength} bytes; consensus allows 2 to ${MAX_SCRIPT_SIG_BYTES}. ` +
-        'The adjustable part is the pool tag.',
+        (aux.length === 0
+          ? 'The adjustable part is the pool tag.'
+          : `The adjustable part is the pool tag; merged mining is taking ${aux.length} of the budget.`),
     )
   }
 
@@ -116,6 +145,7 @@ export function buildCoinbase(input: CoinbaseInput): CoinbaseParts {
     uint32LE(PREVOUT_INDEX),
     varInt(scriptSigLength),
     heightPush,
+    aux,
     // The push opcode for the extranonce. Its operand is the miner's bytes, which follow.
     Buffer.from([extranonceBytes]),
   ])
@@ -179,6 +209,44 @@ export function assembleCoinbase(parts: CoinbaseParts, extranonce1: Buffer, extr
  */
 export function coinbaseTxId(coinbase: Buffer): Buffer {
   return sha256d(coinbase)
+}
+
+/**
+ * The scriptSig of the coinbase's one input, read back out of the assembled bytes.
+ *
+ * ## Why this is read back rather than reassembled from `CoinbaseParts`
+ *
+ * The pool knows what it put in `coinb1` and `coinb2`, so it could concatenate those with the
+ * miner's extranonce and skip the parsing. It does not, for the same reason
+ * `witnessSerialisedCoinbase` splices rather than rebuilds: the caller is
+ * `CAuxPow::check`'s counterpart, and what `check` will search is **the bytes that were actually
+ * hashed**. A reassembly that agreed with those bytes every time except once would be a pool that
+ * submits a merged-mining proof against a coinbase it did not really build, and the one occasion it
+ * disagreed is the only occasion anybody would find out.
+ *
+ * ## Why the length is a single byte, and why that is asserted rather than assumed
+ *
+ * `buildCoinbase` refuses a scriptSig above `MAX_SCRIPT_SIG_BYTES`, which is consensus's 100, so the
+ * compact size in front of it is always one byte below 0xfd. A coinbase reaching here with a wider
+ * one did not come from this pool, and guessing at it would be a parser inventing a transaction
+ * layout to explain bytes it should be refusing.
+ */
+export function coinbaseScriptSig(coinbase: Buffer): Buffer {
+  // version(4) || input count(1) || prevout hash(32) || prevout index(4) || scriptSig length(1)
+  if (coinbase.length < 42) throw new RangeError('this is not a serialised transaction')
+  if (coinbase.readUInt8(4) !== 1) {
+    throw new RangeError(`a coinbase has exactly one input; this one declares ${coinbase.readUInt8(4)}`)
+  }
+  const at = 4 + 1 + 32 + 4
+  const length = coinbase.readUInt8(at)
+  if (length > MAX_SCRIPT_SIG_BYTES) {
+    throw new RangeError(`the coinbase scriptSig declares ${length} bytes; consensus allows ${MAX_SCRIPT_SIG_BYTES}`)
+  }
+  const script = coinbase.subarray(at + 1, at + 1 + length)
+  if (script.length !== length) {
+    throw new RangeError(`the coinbase declares a ${length}-byte scriptSig and carries ${script.length}`)
+  }
+  return script
 }
 
 /**

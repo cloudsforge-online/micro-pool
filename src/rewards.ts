@@ -79,12 +79,18 @@ import {
   windowShares,
   type Exec,
 } from './store.ts'
-import type { PoolChainId } from './chains.ts'
+import type { MinedChainId } from './chains.ts'
 
 export interface RewardCreditDeps {
   readonly sql: Exec
   readonly sink: PayoutSink
-  readonly chain: PoolChainId
+  /**
+   * The chain whose matured blocks this sweep allocates — which for a merge-mined chain is NOT the
+   * chain the shares are on. Every use of it below is about the BLOCK: which rows to read, which
+   * asset the reward is denominated in, which credit key the movement gets. The shares come from
+   * `block.shareChain` and from nowhere else; see the read site, and migration 7.
+   */
+  readonly chain: MinedChainId
   readonly network: Network
   readonly asset: AssetCode
   /** `POOL_FEE_BASIS_POINTS`, required with no default. `pplns.ts` says why there is no default. */
@@ -152,7 +158,12 @@ export async function creditMaturedBlocks(deps: RewardCreditDeps): Promise<Rewar
       block.windowFirstShareId === null || block.windowLastShareId === null
         ? []
         : await windowShares(deps.sql, {
-            chain: deps.chain,
+            // The block's OWN `share_chain`, not `deps.chain`. They are the same for every solo-mined
+            // block and they differ for every merge-mined one, and reading the sweep's chain here
+            // would allocate a Dogecoin block against Dogecoin shares — of which this pool writes
+            // none, so the window would come back empty and the finder would be paid nothing with no
+            // error anywhere. Migration 7 records the whole argument.
+            chain: block.shareChain,
             firstShareId: block.windowFirstShareId,
             lastShareId: block.windowLastShareId,
           })

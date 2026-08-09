@@ -80,7 +80,7 @@
 
 import type { AssetCode, Network } from '@cloudsforge/contracts-chain'
 import type { Actor } from '@cloudsforge/contracts-money'
-import type { PoolChainId } from './chains.ts'
+import type { MinedChainId } from './chains.ts'
 import type { LedgerClient } from './ledgerclient.ts'
 import {
   claimPayoutCredit,
@@ -112,7 +112,7 @@ import {
  * to prevent.
  */
 export function poolPayoutCreditKey(
-  chain: PoolChainId,
+  chain: MinedChainId,
   network: Network,
   blockHash: string,
   workerId: number,
@@ -122,7 +122,7 @@ export function poolPayoutCreditKey(
 
 /** One miner's share of one block, as the accounting computed it. Not a payment. */
 export interface PayoutClaim {
-  readonly chain: PoolChainId
+  readonly chain: MinedChainId
   readonly network: Network
   readonly blockHash: string
   readonly blockHeight: number
@@ -427,7 +427,7 @@ export class LedgerPayoutSink implements PayoutSink {
    * for, which on 2026-08-09 is none of them. On a deployment with payouts off nothing constructs
    * this class, so the kind is neither seeded nor registered.
    */
-  async flushPending(chain: PoolChainId, limit: number): Promise<number> {
+  async flushPending(chain: MinedChainId, limit: number): Promise<number> {
     const pending = await pendingPayoutCredits(this.#deps.sql, { chain, limit })
     let posted = 0
     for (const credit of pending) {
@@ -470,7 +470,7 @@ export class LedgerPayoutSink implements PayoutSink {
    */
   async #post(credit: {
     id: number
-    chain: PoolChainId
+    chain: MinedChainId
     network: Network
     blockHash: string
     blockHeight: number

@@ -72,6 +72,16 @@ test('THE PRODUCER IS SCHEDULED ON EXACTLY THE SAME TERMS AS THE FLUSH IT FEEDS'
   // Keyed per chain, like every other job here: two chains are two independent accounting universes
   // and one key would make the Bitcoin allocation wait behind the Litecoin one.
   assert.equal(new Set(on.map((job) => `${job.kind} ${job.key}`)).size, on.length)
+
+  // A merge-mined chain is paid on its own terms, and the two thresholds are independent: here
+  // Dogecoin has a minimum and its parent does not, so the pair is scheduled for `doge` alone. That
+  // is a real configuration rather than a curiosity — the amounts are of different assets at
+  // different prices, and `env.ts` reads the two variables separately for exactly that reason.
+  const merged = recurringFor(['ltc'], ['doge'], ['doge'])
+  assert.deepEqual(
+    merged.filter((job) => job.kind === CREDIT_KIND || job.kind === PAYOUT_FLUSH_KIND).map((job) => job.key),
+    ['chain:doge', 'chain:doge'],
+  )
 })
 
 /* ------------------------------------------------------------------ the sweep, against a database */
@@ -191,6 +201,7 @@ async function block(
   const bounds = { first: args.from ?? all.first, last: all.last }
   await recordBlock(db(), {
     chain: 'ltc',
+    shareChain: 'ltc',
     height: args.height ?? HEIGHT,
     hash,
     foundByWorkerId: null,
@@ -394,6 +405,7 @@ test('A BLOCK WITH NO SHARES BEHIND IT PAYS NOBODY AND IS NOT WALKED AGAIN', { s
   // the row must not come back every ten minutes for ever.
   await recordBlock(db(), {
     chain: 'ltc',
+    shareChain: 'ltc',
     height: HEIGHT,
     hash: HASH,
     foundByWorkerId: null,

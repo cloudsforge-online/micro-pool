@@ -325,6 +325,59 @@ export const MIGRATIONS: readonly Migration[] = [
         where maturity_status = 'matured' and payout_credited_at is null;
     `,
   },
+  {
+    version: 7,
+    name: 'merged-mining-share-chain',
+    /*
+     * ═══ THE CHAIN A BLOCK IS ON STOPS BEING THE CHAIN THAT PAID FOR IT ═════════════════════════
+     *
+     * Every migration up to here could treat `chain` as one fact, because it was: a Litecoin block
+     * was found by Litecoin shares and there was nothing else it could have been found by. Merged
+     * mining separates the two. A Dogecoin block found by this pool is found by a miner who was
+     * hashing a *Litecoin* header, submitted to a *Litecoin* stratum port, and credited a share in
+     * `pool_shares` under `chain = 'ltc'`. The Dogecoin block exists on Dogecoin. The work that
+     * produced it exists on Litecoin. Both are true at once and one column cannot hold both.
+     *
+     * `chain` keeps its meaning exactly — the network the block is on. It is what `(chain, hash)`
+     * identifies, what `maturity.ts` asks the right node about, and what decides the reward's asset
+     * and decimals. `share_chain` is the new fact: whose shares the recorded window is drawn from.
+     *
+     * ## What goes wrong without it, and why nothing would look wrong
+     *
+     * The payout path is `blocksAwaitingCredit(chain)` → `windowShares(chain, first, last)`, and
+     * before this column the second call could only be given the first one's `chain`. A Dogecoin
+     * block would therefore select `pool_shares where chain = 'doge'` — a table this pool never
+     * writes a row to, because merged mining creates no Dogecoin shares. The query returns zero
+     * rows, the allocation is empty, the block is marked credited, and the miner who found it is
+     * paid nothing. No error is raised at any step. That is the defect this column exists to make
+     * impossible, so `blocksAwaitingCredit` returns `share_chain` and `rewards.ts` is required to
+     * pass it on rather than reuse the block's own chain.
+     *
+     * ## The back-fill is `= chain` and that is not a default, it is the historical truth
+     *
+     * Every row written before this migration was a solo-mined block on its own chain's shares. The
+     * update states that fact for the rows that already exist rather than inferring it later from a
+     * null, and the column is then `not null` so that a row which forgot to say is a failed write
+     * instead of a block allocated against nobody's shares.
+     *
+     * There is deliberately no `check (share_chain in ('btc','ltc'))`. Migration 2 did not constrain
+     * `chain` either, for the same reason: `chains.ts` is the authority on which chains exist, the
+     * list grows with releases, and a constraint here would mean a schema change every time one is
+     * added — with the failure landing on the migrator at deploy time rather than on the config that
+     * was wrong. The maturity constraint in migration 4 is not a counter-example: that one enumerates
+     * three states of a state machine this repository owns entirely and which nothing outside it can
+     * extend.
+     */
+    up: `
+      alter table pool_blocks
+        add column if not exists share_chain text;
+
+      update pool_blocks set share_chain = chain where share_chain is null;
+
+      alter table pool_blocks
+        alter column share_chain set not null;
+    `,
+  },
 ]
 
 /**

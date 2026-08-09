@@ -19,6 +19,17 @@
  *      the two checks into one — "is it a block? no, then is it a share?" — is how a pool loses the
  *      accounting for the single most valuable submission it will ever receive.
  *
+ * ## A fourth thing a share can be, on top of the three above
+ *
+ * When the job carried a merged-mining commitment, the same proof is measured against a second,
+ * entirely independent target — Dogecoin's. That is not a fourth verdict in the sense the three
+ * above are: it does not change whether the share is accepted, whether it is credited, or whether it
+ * is a Litecoin block. It is a second thing the same work is simultaneously worth, reported
+ * alongside the first and never instead of it. `AuxShareOutcome` below is the whole of it, and the
+ * rule that governs every line of it is the one `auxtemplate.ts` states: merged mining is a bonus on
+ * work that was going to happen anyway, and nothing here may make the parent chain worse to catch
+ * more of it.
+ *
  * ## Stale, duplicate, and the order they are checked in
  *
  * Staleness is checked first because it is the cheapest and because a stale share is not a fault:
@@ -33,11 +44,13 @@
  */
 
 import { buildHeader } from './coinbase.ts'
-import { coinbaseTxId } from './coinbase.ts'
+import { coinbaseScriptSig, coinbaseTxId } from './coinbase.ts'
 import { hashFromDisplay, isHex, swap32Hex } from './bytes.ts'
 import { merkleRootFromBranch } from './merkle.ts'
 import { meetsTarget, difficultyOfHash, powHash, targetForDifficulty } from './pow.ts'
 import { coinbaseFor, type Job } from './work.ts'
+import { magicOccurrences } from './auxpow.ts'
+import type { AuxBlock } from './auxtemplate.ts'
 import type { PowAlgorithm } from './chains.ts'
 
 /**
@@ -114,8 +127,50 @@ export type ShareResult =
       /** The difficulty it was credited at, which is what `pplns.ts` weights by. */
       readonly creditedDifficulty: number
       readonly isBlock: boolean
+      /** What this share is worth on the merged chain. `'none'` whenever the job committed to none. */
+      readonly aux: AuxShareOutcome
       readonly ntime: number
     }
+
+/**
+ * What one share turned out to be worth on the auxiliary chain.
+ *
+ * A union rather than a boolean because there are four answers and three of them are not "no". The
+ * one that a boolean would hide is `spoiled`: a share whose proof DOES meet Dogecoin's target and
+ * whose coinbase cannot carry a valid proof of it. That is the single most valuable submission this
+ * pool can receive being thrown away by consensus, and an operator has to be able to read it as
+ * something other than a share that simply was not good enough.
+ */
+export type AuxShareOutcome =
+  /** This job committed to no aux block. There was nothing to win. */
+  | { readonly kind: 'none' }
+  /** Committed, and this share's proof does not meet the aux chain's target. Almost every share. */
+  | { readonly kind: 'short' }
+  /**
+   * This share wins the aux block — and `block` is the one to submit.
+   *
+   * Carried out of here rather than read from `AuxTemplateSource` at submission time, because they
+   * differ every time Dogecoin finds a block. The proof is over THESE bytes, committing to THIS
+   * hash; the source's current hash is a block this miner never committed to and a proof for it does
+   * not verify.
+   */
+  | { readonly kind: 'won'; readonly block: AuxBlock }
+  /**
+   * It met the target, and the coinbase carries the merged-mining magic `occurrences` times rather
+   * than once, so `CAuxPow::check` will refuse it — "Multiple merged mining headers in coinbase",
+   * or no header at all.
+   *
+   * The pool contributes exactly one occurrence, in `coinb1`. A second can only come from the
+   * extranonce, which is the miner's to choose. This is not treated as misconduct and the share is
+   * still accepted for the parent chain: an honest counter reaches `fa be 6d 6d` about once in 2^32
+   * increments, a real rig steps through only a few dozen extranonce2 values per job, and a pool of
+   * a thousand of them would see it perhaps once in a couple of years — while a miner doing it
+   * deliberately loses nothing by having the share rejected instead. Refusing the share would
+   * therefore cost an honest miner credit for real Litecoin work in order to punish an adversary
+   * who was not going to meet Dogecoin's target anyway. The Litecoin block is entirely unaffected;
+   * only the merged half is lost, and it was a bonus.
+   */
+  | { readonly kind: 'spoiled'; readonly block: AuxBlock; readonly occurrences: number }
 
 /**
  * A key that identifies one solution, for duplicate detection.
@@ -187,6 +242,20 @@ export function validateShare(submission: ShareSubmission, context: ShareContext
   const pow = powHash(context.algorithm, header)
   const shareTarget = targetForDifficulty(context.algorithm, context.shareDifficulty)
 
+  // The share band gates both wins, the merged one exactly as it already gated the parent one.
+  //
+  // This was written the other way round first — deciding both wins above this line, so that a share
+  // meeting a block target could never be discarded for falling under the pool's own accounting
+  // threshold — and then undone, because the reasoning does not survive contact with the numbers.
+  // A share target is set by vardiff to make a rig produce a few shares a minute; a block target is
+  // set by a whole network's hashrate. Litecoin's is some seven orders of magnitude harder than any
+  // band this pool hands out, and Dogecoin's is within one order of Litecoin's because it is secured
+  // by the same scrypt hashrate. Neither can be met by a proof that missed the band.
+  //
+  // What the hoist DID change was regtest, where a block target is trivially easy and every
+  // submission is therefore "a block" — it turned the difficulty band into no band at all in the one
+  // environment the suite runs in. Buying an unreachable guarantee at the price of the testable one
+  // is the wrong trade.
   if (!meetsTarget(pow, shareTarget)) {
     const achieved = difficultyOfHash(context.algorithm, pow)
     return reject(
@@ -208,8 +277,25 @@ export function validateShare(submission: ShareSubmission, context: ShareContext
     achievedDifficulty: difficultyOfHash(context.algorithm, pow),
     creditedDifficulty: context.shareDifficulty,
     isBlock: meetsTarget(pow, job.template.blockTarget),
+    aux: auxOutcome(job, pow, coinbase),
     ntime,
   }
+}
+
+/**
+ * What this share is worth on the merged chain.
+ *
+ * The order is target first, coinbase second, and it is deliberate: reading the scriptSig back out
+ * of every share's coinbase would be a parse per share for a question that is answered `short` for
+ * every share but one in some hundreds of millions.
+ */
+function auxOutcome(job: Job, pow: Buffer, coinbase: Buffer): AuxShareOutcome {
+  const block = job.aux
+  if (block === null) return { kind: 'none' }
+  if (!meetsTarget(pow, block.target)) return { kind: 'short' }
+  const occurrences = magicOccurrences(coinbaseScriptSig(coinbase))
+  if (occurrences !== 1) return { kind: 'spoiled', block, occurrences }
+  return { kind: 'won', block }
 }
 
 function reject(code: StratumErrorCode, message: string): ShareResult {

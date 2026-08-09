@@ -4,7 +4,9 @@
 
 A **Stratum v1 mining pool** for the Bitcoin-family chains this estate runs its own nodes for. It
 builds block templates from those nodes, hands work to real mining hardware over raw TCP, judges the
-shares that come back, submits the blocks, and records who is owed what.
+shares that come back, submits the blocks, and records who is owed what. Where a chain is
+merge-mined — Dogecoin under Litecoin — the same share is worth a block on both, and the AuxPoW
+commitment that makes that true is built into every coinbase.
 
 Implements §5 of
 [docs/ecosystem/36-multi-chain-and-mining-pool.md](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/36-multi-chain-and-mining-pool.md).
@@ -51,7 +53,7 @@ The other named holes, in one place:
 | Accrual across blocks | The minimum is a per-claim floor, not a running balance. A claim under it records nothing, so it stays payable later. |
 | Paying external miners | A miner with a payout address and no estate account is counted `skipped_no_account` and paid nothing. This service credits a ledger; it does not send a transaction. |
 | Reversing an orphaned credit | Nothing here reverses a credit. A block cannot reach `matured` and then `orphaned` through this service, and a correction is a new opposite ledger entry posted by a person — see the header of `src/rewards.ts`. |
-| Dogecoin | **Refused by name at boot.** `POOL_CHAINS=doge` will not start the service — see below. |
+| Dogecoin as a chain of its own | **Refused by name at boot**, and it always will be — `POOL_CHAINS=doge` asks for a listener that cannot exist. Dogecoin is mined here as an *auxiliary* chain of Litecoin: `POOL_LTC_AUX_CHAINS=doge`. See below. |
 | Stratum v2 | Not implemented and not planned for this pass. v1 is what deployed hardware speaks. |
 | TLS on the stratum port | Not implemented. Stratum v1 as deployed is plain TCP; the HTTP port is separate. |
 | Solo mining / PPS | Not implemented. PPLNS only. |
@@ -59,19 +61,101 @@ The other named holes, in one place:
 
 ---
 
-## Dogecoin is refused, not missing
+## Dogecoin is merge-mined, and it is a chain of Litecoin rather than a chain of its own
 
-Dogecoin is **merge-mined with Litecoin through AuxPoW**. A valid Dogecoin block carries an AuxPoW
-header committing to a Litecoin parent block, and this release does not build one.
+**One share, two chains, no extra hashing.** A Dogecoin block has no nonce of its own: it is won by
+finding a *Litecoin* header whose scrypt hash meets Dogecoin's target, where that Litecoin block's
+coinbase carries a commitment naming the Dogecoin block being claimed. The commitment is what makes
+the work non-transferable — the header's merkle root covers the coinbase, and the coinbase names one
+specific Dogecoin block, so the same proof cannot be re-pointed at another one afterwards.
 
-A pool that added `doge` to a table and handed out ordinary scrypt work would produce solutions the
-Dogecoin network discards — and it would look like it was working, because the shares would validate
-against the pool's own target perfectly. So `doge` is listed in `REFUSED_CHAINS` in `src/chains.ts`
-with the reason, and `src/env.ts` refuses to start with it configured. It is a decision, not a gap in
-a lookup table, and it is written that way so nobody fills the gap in.
+So `doge` is still refused in `POOL_CHAINS` and always will be. There is no `getblocktemplate` to
+poll for it, no coinbase of ours to build, and no stratum port to serve it on; asking for one asks
+for a listener that cannot exist. It is configured as an **auxiliary chain of a parent**:
 
-Implementing it means implementing AuxPoW: a merged-mining coinbase commitment on the Litecoin side,
-the parent-block proof on the Dogecoin side, and a second `submitblock` path. That is its own change.
+```sh
+POOL_LTC_AUX_CHAINS=doge
+POOL_DOGE_NODE_URL=http://user:pass@dogecoind:22555/
+POOL_DOGE_PAYOUT_ADDRESS=D…            # a Dogecoin address. dogecoind pays it; this pool never does
+```
+
+All three or none. Every half of this configuration produces a pool that mines Litecoin perfectly
+and mines no Dogecoin at all, and the only symptom is an absence — which nobody notices for as long
+as no aux block would have been won anyway. `src/env.ts` refuses each half at boot by name,
+including the reverse case: a `POOL_DOGE_NODE_URL` set with no parent merging it is a dogecoind
+running, reachable, configured and never called.
+
+**The pairing is checked and is tighter than consensus.** `AUX_PARENT` in `src/chains.ts` allows
+`doge` under `ltc` and nothing else. Dogecoin itself accepts a parent from any chain — its
+`fStrictChainId` is false for the parent on mainnet — but merging `doge` into Bitcoin's SHA-256d
+work is meaningless in practice and fails the way this repository fears most: no aux blocks, no
+errors.
+
+### What the miner sees, which is nothing
+
+The stratum protocol does not change. Jobs, extranonces, difficulty and `mining.submit` are byte for
+byte what they were; the commitment lives inside the coinbase, in the part a miner never inspects.
+A share is judged against three targets instead of two — the share target, the Litecoin block target
+and the Dogecoin block target — and a share can meet the third without meeting the second. That is
+the ordinary case, in fact, and it is the entire point: Dogecoin's difficulty is far below
+Litecoin's, so most merge-mined blocks are found by shares that were never Litecoin blocks.
+
+### The three things that are silent when wrong
+
+Everything in `src/auxpow.ts` was transcribed from Dogecoin 1.14.9's own `src/auxpow.cpp` at tag
+`v1.14.9` on 2026-08-09, because every rule in it is a consensus rule whose violation is a rejected
+block and nothing else — no warning, no log line on our side, and exactly one opportunity to observe
+it. Three are worth naming here:
+
+- **The 32 committed bytes are in DISPLAY order**, which is the reverse of every other 32 bytes in
+  this repository. `CAuxPow::check` reverses a `uint256`'s internal iteration order before searching
+  for it, which lands on exactly what `createauxblock` returned in its `hash` field. So the bytes go
+  in as the RPC gave them, with no `hashFromDisplay` and no `.reverse()`.
+- **The merged-mining magic `fa be 6d 6d` must occur exactly once in the whole scriptSig.** The
+  scriptSig also carries the miner's extranonce, which this pool does not choose. A miner whose
+  extranonce2 contains that pattern — or straddles it — produces a perfectly valid Litecoin block
+  and a Dogecoin block consensus throws away. `validate.ts` calls that share `spoiled`: the parent
+  share stands and is credited, the merged half is lost, and it is logged loudly. Refusing the share
+  outright was considered and rejected — it deters no adversary, who loses nothing either way, and
+  it costs an honest miner credit for real work roughly once every couple of years across a
+  thousand rigs.
+- **With one aux chain the merkle tree has height 0**, and at height 0 most of `CAuxPow::check`
+  collapses: the "chain merkle root" in the commitment *is* the Dogecoin block hash unhashed, the
+  branch is empty, `nSize` is 1, and the nonce is not searched because `rand % 1` is 0 for every
+  value. `AUX_CHAIN_MERKLE_SIZE` stands in for the tree that does not exist yet, and `env.ts`
+  refuses a second aux chain rather than configuring one that would be absent from every commitment
+  this pool publishes.
+
+### Where an aux block is submitted, and how it is paid
+
+The aux block goes to **dogecoind, by `submitauxblock`, and to no other node.** `submitauxblock`
+takes the aux block hash and the serialised AuxPoW and answers a **boolean** — not a reason string,
+unlike `submitblock` — and it can only answer at all while dogecoind's own tip has not moved, since
+the hash is a key into a map that node clears on every new block. The submission path holds that
+window rather than assuming it.
+
+Everything downstream then runs **on the block's own chain**, which is not the chain the shares are
+on:
+
+| | Parent chain (`ltc`) | Aux chain (`doge`) |
+| --- | --- | --- |
+| Shares, vardiff, pruning | yes | **no** — there are no `doge` shares; the shares are Litecoin's, and `pool_blocks.share_chain` records that |
+| Coinbase maturity | 100 confirmations | **240** — `consensus.nCoinbaseMaturity` from `chainparams.cpp` v1.14.9, effective from height 145,000; the estate's node is far past it |
+| Maturity re-check | against litecoind | **against dogecoind** — litecoind answers `-5` for a Dogecoin hash, which is not an answer about the block |
+| Credits and payouts | `POOL_LTC_MINIMUM_PAYOUT` | `POOL_DOGE_MINIMUM_PAYOUT`, **independent of its parent's** — different asset, different unit, prices four orders of magnitude apart |
+
+240 blocks at Dogecoin's one-minute target is four hours, which is by design about the same wall
+time as Litecoin's 100 at two and a half minutes. Crediting a Dogecoin block at 100 would allocate
+and pay out 140 blocks before the coinbase could be spent — a payout the pool cannot fund.
+
+### Whether it is actually happening is a field, not a log line
+
+Merged mining fails by **absence**. A dogecoind in initial block download refuses `createauxblock`;
+the pool then mines Litecoin exactly as well as it did before and every number it reports is
+identical to the merge-mining case. So `GET /v1/pool` carries `merged` per chain, with three states
+and not two: `null` (nothing configured), `committed: false` with a one-word reason (`syncing`,
+`no-peers`, `refused`, `unreachable`), or `committed: true`. A page that showed "mining DOGE" for
+the middle state would be telling a miner they are earning an asset they are not.
 
 ---
 
@@ -310,7 +394,16 @@ not it is ready.
       "windowSeconds": 600,
       "sharesInWindow": 0,
       "workersInWindow": 0,
-      "hashrateEstimate": 0
+      "hashrateEstimate": 0,
+      "merged": {
+        "chain": "doge",
+        "name": "Dogecoin",
+        "asset": "DOGE",
+        "committed": true,
+        "unavailability": null,
+        "height": 5015467,
+        "networkDifficulty": 12345678.5
+      }
     }
   ]
 }
@@ -323,6 +416,7 @@ not it is ready.
 | `height` | this chain has never obtained a template | The node has not answered yet. Distinct from height 0, which no live chain is at |
 | `networkDifficulty` | as above | |
 | `templateAgeSeconds` | as above | Not "the template is fresh" — there is no template |
+| `merged` | this chain merges nothing (`POOL_<CHAIN>_AUX_CHAINS` unset) | **This pool does not merge-mine.** Distinct from an object with `committed: false`, which means it is configured to and currently is not — a consumer branches on the null to decide whether to render the section at all |
 
 `ready` is per chain and is the same hard probe `/readyz` aggregates. `stratumPort` is the port the
 listener **binds**: a true fact about this process, the inside of whatever port mapping the deploy
@@ -334,6 +428,17 @@ on SHA-256d, 2^16 on scrypt. A single formula would report every Litecoin miner 
 faster than they are, and it would be believed, because the number carries no unit that would look
 wrong. `sharesInWindow` and `workersInWindow` come from the same window. All three are 0 for a chain
 nobody is mining, which is not the same as absent.
+
+`merged` is the merge-mined chain under this one, and **`committed` is the field that matters**: it
+says whether the work being handed out *right now* commits to an aux block, which is the one fact
+distinguishing "we are merge-mining Dogecoin" from "we intended to". It is read off the job registry
+rather than off the template source, so it describes the jobs miners are holding. `unavailability`
+is why not, in one word — `syncing`, `no-peers`, `refused`, `unreachable` — and is reported even
+when a block is present, because a stale block beside a node that has since started refusing is a
+state worth seeing. `networkDifficulty` inside `merged` is the aux chain's own difficulty computed
+on the **parent's** algorithm, which is the only unit it is meaningful in; beside the parent's it is
+roughly how much rarer an aux block is for the same hashing. There is deliberately no second
+`hashrateEstimate` in there: it would be the same shares and the same units as the one above it.
 
 `payoutsImplemented` is `false` and is in the body rather than only in this file, so that a page
 built against this API cannot accidentally imply a payment that will not arrive. **It appears here
@@ -376,15 +481,21 @@ to say** — an accepted block, ordinarily.
 
 `maturityStatus` is the **second, later verdict, and it is the one that says whether the reward
 exists.** `submitStatus: "accepted"` only ever meant the node took the block onto its tip; a coinbase
-is unspendable for 100 blocks on both these chains and a block can be orphaned well inside that
-window. So a leased job (`pool.check-maturity`, every ten minutes) re-reads each recorded block by
-hash against the same node the templater uses, and moves the row to one of three states:
+is unspendable for 100 blocks on BTC and LTC — **240 on Dogecoin** — and a block can be orphaned
+well inside that window. So a leased job (`pool.check-maturity`, every ten minutes) re-reads each
+recorded block by hash against the node **for that block's own chain**, and moves the row to one of
+three states:
 
 | `maturityStatus` | Meaning |
 | --- | --- |
-| `pending` | On the chain but not 100 deep yet — **or** the node could not be asked. Not payable. |
-| `matured` | On the active chain at 100 confirmations or more. The only payable state. |
+| `pending` | On the chain but not deep enough yet — **or** the node could not be asked. Not payable. |
+| `matured` | On the active chain at the full maturity depth or more. The only payable state. |
 | `orphaned` | The node holds this block and it is not on the active chain. Terminal. |
+
+The depth is per chain and is `COINBASE_MATURITY` in `src/maturity.ts`, which carries the
+`chainparams.cpp` provenance for each number. A merge-mined block is asked about on its own chain
+and nowhere else: litecoind answers `-5` for a Dogecoin hash, which this service reads as "not the
+node that took the submission" rather than as an answer about the block.
 
 Every block starts `pending` and only a positive answer from the node moves it, so an unreachable
 node delays a payment rather than inventing or destroying one. `confirmations` is the node's own
@@ -548,6 +659,8 @@ and nothing else, and the handshake timeout closes it.
 | `src/coinbase.ts` | Building the coinbase transaction: BIP34 height, the extranonce placeholders, the witness commitment, the `coinb1`/`coinb2` split. |
 | `src/mweb.ts` | Recognising Litecoin's MWEB integrating transaction in a template, and refusing one that is not last. |
 | `src/template.ts` | `getblocktemplate`, longpoll, staleness, the payout-address and network checks. |
+| `src/auxtemplate.ts` | `createauxblock` against the aux chain's node: the block being claimed, and why it is unavailable when it is. |
+| `src/auxpow.ts` | The 44 bytes that go in the coinbase and the AuxPoW proof handed back, transcribed from Dogecoin 1.14.9. |
 | `src/work.ts` | A template becomes a job: the `mining.notify` parameters and the job history a submit can still name. |
 | `src/stratum.ts` | The TCP listener and the line framing. Timeouts, back-pressure, the share buffer. |
 | `src/session.ts` | The Stratum v1 state machine: subscribe, authorize, configure, notify, submit. No socket in it. |
@@ -558,7 +671,7 @@ and nothing else, and the handshake timeout closes it.
 | `src/validate.ts` | Rebuilding the header from a submission and judging it against the share target and the block target. |
 | `src/blocks.ts` | What happens when a share is a block, in the order it has to happen in. |
 | `src/pplns.ts` | The sliding window, and the integer allocation that makes the parts sum to the whole. |
-| `src/maturity.ts` | Re-reading a found block against the node: still on the chain, and 100 deep? |
+| `src/maturity.ts` | Re-reading a found block against its own chain's node: still on the chain, and deep enough? The per-chain depths, with their provenance. |
 | `src/rewards.ts` | The walk from a matured block to per-worker claims: the window it was found against, the fee, and the remainder. |
 | `src/payouts.ts` | The credit key, the sink that posts it, and the two gates that refuse it — see the top of this file. |
 | `src/ledgerclient.ts` | One route of micro-ledger's API: `POST /entries`. Amounts are strings on the wire in both directions. |

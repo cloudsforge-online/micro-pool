@@ -21,7 +21,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { serialiseFoundBlock } from './blocks.ts'
-import { assembleCoinbase, witnessSerialisedCoinbase } from './coinbase.ts'
+import { assembleCoinbase, coinbaseScriptSig, witnessSerialisedCoinbase } from './coinbase.ts'
+import { commitmentOffset, magicOccurrences, MERGED_MINING_MAGIC, serialiseAuxPow } from './auxpow.ts'
+import { sha256d, targetFromCompactBits } from './pow.ts'
 import { buildJob, type Job } from './work.ts'
 import { parseTemplate } from './template.ts'
 import { MWEB_BLOCK_PRESENT } from './mweb.ts'
@@ -32,6 +34,7 @@ import {
   REGTEST_MWEB_BLOCK,
   type FakeTemplateOptions,
 } from './faketemplate.ts'
+import type { AuxBlock } from './auxtemplate.ts'
 import type { FoundBlock } from './session.ts'
 
 const EXTRANONCE1 = Buffer.from('deadbeef', 'hex')
@@ -47,6 +50,7 @@ function jobFor(options: FakeTemplateOptions = {}): Job {
     extranonce2Size: EXTRANONCE2.length,
     id: '1',
     cleanJobs: true,
+    aux: null,
     createdAt: new Date(0),
   })
 }
@@ -139,4 +143,108 @@ test('a bitcoin block has no marker byte at all, not a zero one', () => {
   const block = Buffer.from(serialiseFoundBlock(foundFor(job)), 'hex')
   const transactions = job.template.transactions.map((tx) => tx.data).join('')
   assert.ok(block.toString('hex').endsWith(transactions))
+})
+
+/* ------------------------------------------------- the merged-mining proof, which is not a block */
+
+const AUX_HASH = '3c9d1f0a55e2b7648f0e12a3d4c5b6978a9b0c1d2e3f405162738495a6b7c8d9'
+
+function auxBlockFor(hashHex = AUX_HASH): AuxBlock {
+  return {
+    chain: 'doge',
+    hashHex,
+    height: 5_100_000,
+    bitsHex: '1a0ffff0',
+    target: targetFromCompactBits(0x1a0ffff0),
+    previousBlockHashHex: 'f'.repeat(64),
+    coinbaseValue: 1_000_000_000_000n,
+    fetchedAt: new Date(0),
+  }
+}
+
+function mergedJob(aux: AuxBlock | null = auxBlockFor()): Job {
+  return buildJob({
+    chain: 'ltc',
+    template: parseTemplate(fakeTemplateReply({ mweb: true })),
+    payoutScriptHex: FAKE_PAYOUT_SCRIPT,
+    tag: Buffer.from('/cloudsforge/', 'utf8'),
+    extranonce1Size: EXTRANONCE1.length,
+    extranonce2Size: EXTRANONCE2.length,
+    id: '1',
+    cleanJobs: true,
+    aux,
+    createdAt: new Date(0),
+  })
+}
+
+test('the commitment is where CAuxPow::check will look, in the bytes actually submitted', () => {
+  // Not in the bytes that were meant to be built. `coinbase.ts` explains why the scriptSig is read
+  // back out of the assembled transaction, and this is the assertion that would notice if the two
+  // ever stopped agreeing — which is the only occasion either of them matters.
+  const job = mergedJob()
+  const coinbase = assembleCoinbase(job.coinbase, EXTRANONCE1, EXTRANONCE2)
+  const scriptSig = coinbaseScriptSig(coinbase)
+
+  assert.equal(magicOccurrences(scriptSig), 1, 'exactly once in the whole scriptSig, or check refuses it')
+  assert.notEqual(commitmentOffset(scriptSig, AUX_HASH), -1)
+})
+
+test('the aux root goes in unreversed, which is the opposite of every other hash here', () => {
+  // The one place in this repository where 32 bytes of a hash are written in display order.
+  // `auxpow.ts` is where the reasoning lives; this is what fails if somebody "fixes" it.
+  const scriptSig = coinbaseScriptSig(assembleCoinbase(mergedJob().coinbase, EXTRANONCE1, EXTRANONCE2))
+  const at = scriptSig.indexOf(MERGED_MINING_MAGIC) + MERGED_MINING_MAGIC.length
+  const root = scriptSig.subarray(at, at + 32)
+
+  assert.equal(root.toString('hex'), AUX_HASH)
+  assert.notEqual(root.toString('hex'), Buffer.from(AUX_HASH, 'hex').reverse().toString('hex'))
+})
+
+test('a job with no aux chain carries no merged-mining magic at all', () => {
+  const scriptSig = coinbaseScriptSig(assembleCoinbase(mergedJob(null).coinbase, EXTRANONCE1, EXTRANONCE2))
+  assert.equal(magicOccurrences(scriptSig), 0)
+})
+
+test('the serialised proof is the CMerkleTx fields, hashBlock included, then the CAuxPow ones', () => {
+  // The composition `serialiseAuxPow` documents, checked field by field from the outside. hashBlock
+  // is the one every write-up of merged mining omits, and omitting it does not fail a check — it
+  // shifts every later field 32 bytes and Dogecoin reports a malformed submission with no clue
+  // which field was wrong.
+  const job = mergedJob()
+  const coinbase = assembleCoinbase(job.coinbase, EXTRANONCE1, EXTRANONCE2)
+  const header = Buffer.alloc(80, 0x77)
+  const proof = serialiseAuxPow({ parentCoinbase: coinbase, parentHeader: header, merkleSteps: job.merkleSteps })
+
+  let at = 0
+  assert.ok(proof.subarray(at, (at += coinbase.length)).equals(coinbase), 'the coinbase, non-witness')
+  assert.ok(proof.subarray(at, (at += 32)).equals(sha256d(header)), 'hashBlock, internal order')
+  assert.equal(proof.readUInt8(at), job.merkleSteps.length, 'the merkle branch length')
+  at += 1
+  for (const step of job.merkleSteps) {
+    assert.ok(proof.subarray(at, (at += 32)).equals(step))
+  }
+  assert.equal(proof.readInt32LE(at), 0, 'nIndex: the coinbase is transaction 0')
+  at += 4
+  assert.equal(proof.readUInt8(at), 0, 'vChainMerkleBranch is empty at merkle height 0')
+  at += 1
+  assert.equal(proof.readInt32LE(at), 0, 'nChainIndex is 0 for every nonce at height 0')
+  at += 4
+  assert.ok(proof.subarray(at, (at += 80)).equals(header), 'the parent header, last')
+  assert.equal(at, proof.length, 'and nothing after it')
+})
+
+test('the proof carries the coinbase without its witness, because a txid is witness-stripped', () => {
+  // The template here has a witness commitment, so `serialiseFoundBlock` sends the witness form and
+  // this must not. Dogecoin hashes what it is given and compares it against the merkle branch; the
+  // witness form hashes to something that is in no merkle tree.
+  const job = mergedJob()
+  const coinbase = assembleCoinbase(job.coinbase, EXTRANONCE1, EXTRANONCE2)
+  const proof = serialiseAuxPow({
+    parentCoinbase: coinbase,
+    parentHeader: Buffer.alloc(80, 0x77),
+    merkleSteps: job.merkleSteps,
+  })
+
+  assert.ok(proof.subarray(0, coinbase.length).equals(coinbase))
+  assert.ok(!proof.includes(witnessSerialisedCoinbase(coinbase)), 'the witness form must not be in the proof')
 })

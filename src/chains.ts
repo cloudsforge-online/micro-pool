@@ -20,12 +20,23 @@
  * below, and `pow.ts` has no default branch — an algorithm that is not handled is a type error at
  * compile time rather than a rejected share at run time.
  *
- * ## DOGE IS REFUSED, BY NAME, AND THIS IS THE POINT OF `REFUSED_CHAINS`
+ * ## DOGE IS MINED, AND IS STILL REFUSED AS A PRIMARY CHAIN
  *
- * Dogecoin's proof of work is scrypt, and it would be very easy to read that fact off the
+ * This pool mines Dogecoin — see `auxpow.ts` and `AUX_PARENT` below — and it does so without doge
+ * appearing in `POOL_CHAINS` at all, because a merge-mined chain is not a thing miners connect to.
+ * The refusal in `REFUSED_CHAINS` is therefore still here and still fires; what changed on
+ * 2026-08-09 is what it says, which is now a redirection to `POOL_LTC_AUX_CHAINS` rather than a
+ * statement that the work is not implemented.
+ *
+ * The reasoning that put it there is unchanged and is why the entry was rewritten instead of
+ * deleted. Dogecoin's proof of work is scrypt, and it would be very easy to read that fact off the
  * contracts-chain spec — which says `family: 'bitcoin'`, decimals 8, exactly like Litecoin — and
  * conclude that adding `doge` to the table below is a one-line change. **It is not, and the
- * one-line change would produce a pool that mines Dogecoin blocks nobody can spend.**
+ * one-line change would produce a pool that mines Dogecoin blocks nobody can spend** — now more
+ * dangerously than before, because the merged-mining machinery exists and a reader could believe a
+ * `doge` row would use it. It would not: the row below is what `getblocktemplate`, the stratum
+ * listener and the share accounting are driven from, and none of those are how a Dogecoin block is
+ * won.
  *
  * Dogecoin has been merge-mined with Litecoin under AuxPoW since 2014. `contracts-chain`'s own DOGE
  * comment says so, and says why the confirmation depth depends on it: "its work is Litecoin's
@@ -44,6 +55,10 @@
  * have taken real work, recorded a real debt, and produced nothing. **A named refusal that fails at
  * configuration time is strictly better than a silent misconfiguration that fails once, later, on
  * the only block that was ever worth anything.**
+ *
+ * The auxiliary path avoids all of that by never producing a Dogecoin template: `createauxblock`
+ * asks dogecoind for a block it has already assembled and signed off on, and the pool's only
+ * contribution is the commitment and the proof.
  *
  * The same reasoning refuses ETC, for a different reason: Etchash is not this family's proof of
  * work at all, an ETC node speaks `eth_getWork` rather than `getblocktemplate`, and §5.3 of
@@ -147,9 +162,9 @@ export const REFUSED_CHAINS: Readonly<Record<string, string>> = Object.freeze({
   doge:
     'Dogecoin is merge-mined with Litecoin under AuxPoW and has been since 2014. Its blocks are ' +
     'won by a Litecoin header carrying a commitment to them, not by a nonce found against a ' +
-    'Dogecoin header, and this repository implements neither the auxiliary proof nor the ' +
-    'getauxblock/submitauxblock RPC surface it is submitted through. Mining it through the ' +
-    'getblocktemplate path would take real work from miners and submit a block consensus rejects.',
+    'Dogecoin header, so there is no getblocktemplate path for it to be mined through and no ' +
+    'stratum port for it to be served on. This pool DOES mine Dogecoin — as an auxiliary chain ' +
+    'of Litecoin. Set POOL_LTC_AUX_CHAINS=doge rather than adding doge to POOL_CHAINS.',
   etc:
     'Ethereum Classic is Etchash over an EVM account-model chain. It has no getblocktemplate, no ' +
     'coinbase transaction to build, and no merkle branch of the shape this pool computes. ' +
@@ -161,6 +176,87 @@ export const REFUSED_CHAINS: Readonly<Record<string, string>> = Object.freeze({
     'the estate’s one genuinely distinctive first action and that nothing in this track may ' +
     'weaken it. That question is answered by a person, not by adding a row to a table.',
 })
+
+/**
+ * Chains this pool mines as an AUXILIARY of a parent chain, rather than on their own.
+ *
+ * An aux chain has no stratum port, no template of this pool's own making, no share accounting and
+ * no vardiff. It is not something a miner connects to; it is a second thing the miner's Litecoin
+ * work is simultaneously worth. Everything in `PoolChain` above — the algorithm, the template rules,
+ * the difficulty unit — is a property of the PARENT, which is why an aux chain is not one of these
+ * and does not get a row in that table.
+ */
+export type AuxChainId = 'doge'
+
+export const AUX_CHAIN_IDS: readonly AuxChainId[] = Object.freeze(['doge'])
+
+/**
+ * Which parent each aux chain may be merged into, and there is exactly one answer per aux chain.
+ *
+ * Dogecoin's AuxPoW accepts a parent on any chain — `fStrictChainId` is false for the parent on
+ * mainnet, so the proof does not care what chain the header came from. **This table is therefore
+ * tighter than consensus, deliberately.** A Dogecoin block is worth what it is worth because its
+ * parent is Litecoin: the two share scrypt, the hashrate securing one secures the other, and the
+ * difficulties are within an order of magnitude of each other. Merging doge into Bitcoin's SHA-256d
+ * work is not forbidden by Dogecoin and is meaningless in practice — a Bitcoin share meets DOGE's
+ * scrypt target never, because the two proofs are different functions over the same 80 bytes.
+ *
+ * So the pairing is checked at configuration time rather than discovered at run time as a chain that
+ * produces no aux blocks and no errors, which is the failure a table like this exists to prevent.
+ */
+export const AUX_PARENT: Readonly<Record<AuxChainId, PoolChainId>> = Object.freeze({
+  doge: 'ltc',
+})
+
+export function isAuxChainId(value: string): value is AuxChainId {
+  return (AUX_CHAIN_IDS as readonly string[]).includes(value)
+}
+
+/**
+ * Any chain this pool can win a block on, however it won it.
+ *
+ * The union exists for exactly the places where the distinction stops mattering: a miner is owed
+ * DOGE and LTC in the same units-and-minimums vocabulary, and a payout sink does not care that one
+ * of the two arrived by commitment rather than by nonce. Everywhere the distinction DOES matter —
+ * stratum, templates, vardiff, share accounting — the narrower `PoolChainId` is still the type, and
+ * that is what keeps an aux chain from acquiring a listener by type inference.
+ */
+export type MinedChainId = PoolChainId | AuxChainId
+
+export function isMinedChainId(value: string): value is MinedChainId {
+  return isPoolChainId(value) || isAuxChainId(value)
+}
+
+/** Every chain a block could be won on, parents first. Stable order, for logs and for tests. */
+export const MINED_CHAIN_IDS: readonly MinedChainId[] = Object.freeze([...POOL_CHAIN_IDS, ...AUX_CHAIN_IDS])
+
+/** The asset an aux chain pays in. Read from contracts-chain like every other one. */
+export function auxAssetFor(chain: AuxChainId): AssetCode {
+  // Uppercased rather than tabled: an aux chain has no `PoolChain` row to read an asset out of, and
+  // a second table mapping 'doge' to 'DOGE' would be a place for the two to disagree. `chainSpec`
+  // throws on an asset it does not know, so a slug that is not an asset fails loudly here.
+  const asset = chain.toUpperCase() as AssetCode
+  chainSpec(asset)
+  return asset
+}
+
+/** The chain's human name, for a log line or a page. Read from contracts-chain. */
+export function auxNameFor(chain: AuxChainId): string {
+  return chainSpec(auxAssetFor(chain)).name
+}
+
+/**
+ * The asset a block on ANY mined chain pays in — the one place the two lookups above are joined.
+ *
+ * For the callers downstream of a found block: maturity, allocation, the payout sink. They hold a
+ * `MinedChainId` because a block can be won on either kind of chain, and they have no business
+ * knowing which kind this one is; what they need is the asset the reward is denominated in, and
+ * that question has the same answer for both. Written here rather than as a ternary at each call
+ * site, because a ternary at each call site is where one of them eventually gets it backwards.
+ */
+export function minedAssetFor(chain: MinedChainId): AssetCode {
+  return isPoolChainId(chain) ? assetFor(chain) : auxAssetFor(chain)
+}
 
 export function isPoolChainId(value: string): value is PoolChainId {
   return (POOL_CHAIN_IDS as readonly string[]).includes(value)

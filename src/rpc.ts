@@ -30,14 +30,25 @@
  */
 
 import { CircuitOpenError, HttpClient, HttpError, TimeoutError } from '@cloudsforge/http'
-import type { PoolChainId } from './chains.ts'
+import type { AuxChainId, PoolChainId } from './chains.ts'
+
+/**
+ * The chains this client can be pointed at.
+ *
+ * Wider than `PoolChainId` because merged mining talks to a node this pool does not mine ON — an
+ * aux chain has no template, no stratum port and no share accounting here, but it has a node, and
+ * every error message and log label this file produces wants to name it. The union is only ever a
+ * LABEL: nothing in this file dispatches on it, so an aux chain reaching here cannot take a code
+ * path meant for a primary one.
+ */
+export type RpcChainId = PoolChainId | AuxChainId
 
 /** The node answered and refused. Carries the JSON-RPC error code verbatim. */
 export class NodeRpcError extends Error {
   readonly code: number
   readonly rpcMethod: string
-  readonly chain: PoolChainId
-  constructor(args: { code: number; message: string; method: string; chain: PoolChainId }) {
+  readonly chain: RpcChainId
+  constructor(args: { code: number; message: string; method: string; chain: RpcChainId }) {
     super(`${args.chain} ${args.method} → ${args.code} ${args.message}`)
     this.name = 'NodeRpcError'
     this.code = args.code
@@ -49,8 +60,8 @@ export class NodeRpcError extends Error {
 /** The node did not answer. Not a domain failure — the caller makes no progress and retries later. */
 export class NodeUnavailableError extends Error {
   readonly rpcMethod: string
-  readonly chain: PoolChainId
-  constructor(args: { method: string; chain: PoolChainId; cause: string }) {
+  readonly chain: RpcChainId
+  constructor(args: { method: string; chain: RpcChainId; cause: string }) {
     super(`${args.chain} ${args.method}: the node did not answer — ${args.cause}`)
     this.name = 'NodeUnavailableError'
     this.rpcMethod = args.method
@@ -75,7 +86,7 @@ export interface NodeCallOptions {
 }
 
 export interface NodeRpcOptions {
-  readonly chain: PoolChainId
+  readonly chain: RpcChainId
   /** Full endpoint URL, credential and all. Never logged, never stored, never put in an error. */
   readonly url: string
   readonly deadlineMs?: number
@@ -123,7 +134,7 @@ export function basicAuthFor(url: string): string | undefined {
 export const NODE_RPC_SCOPES: readonly string[] = Object.freeze([])
 
 export class NodeRpc {
-  readonly chain: PoolChainId
+  readonly chain: RpcChainId
   /** Host and port only. Safe to log, and it is what every log line and metric label uses. */
   readonly host: string
   readonly #path: string

@@ -30,6 +30,9 @@ import { fakeTemplateReply, FAKE_PAYOUT_SCRIPT, MAINNET_BITS, REGTEST_BITS } fro
 import { shareKey, STRATUM_ERROR, validateShare, MAX_NTIME_AHEAD_SECONDS, type ShareContext } from './validate.ts'
 import { powHash, sha256d } from './pow.ts'
 import type { PowAlgorithm } from './chains.ts'
+import type { AuxBlock } from './auxtemplate.ts'
+import { magicOccurrences, MERGED_MINING_MAGIC } from './auxpow.ts'
+import { coinbaseScriptSig } from './coinbase.ts'
 
 const EXTRANONCE1 = Buffer.from('a1b2c3d4', 'hex')
 const NOW = 1_760_000_500
@@ -37,7 +40,7 @@ const NOW = 1_760_000_500
 /** The difficulty at which a share is cheap enough to find inside a test. See the file header. */
 const EASY = 1 / 65536
 
-function job(options: { bitsHex?: string; chain?: 'btc' | 'ltc' } = {}): Job {
+function job(options: { bitsHex?: string; chain?: 'btc' | 'ltc'; aux?: AuxBlock | null } = {}): Job {
   const template = parseTemplate(fakeTemplateReply({ bitsHex: options.bitsHex ?? REGTEST_BITS }))
   return buildJob({
     chain: options.chain ?? 'btc',
@@ -48,9 +51,36 @@ function job(options: { bitsHex?: string; chain?: 'btc' | 'ltc' } = {}): Job {
     extranonce2Size: 4,
     id: 'job-1',
     cleanJobs: true,
+    aux: options.aux ?? null,
     createdAt: new Date(NOW * 1000),
   })
 }
+
+/**
+ * An aux block whose target is named directly rather than decoded from bits.
+ *
+ * `parseAuxBlock` derives the target from `bits` and `auxtemplate.test.ts` is where that decoding is
+ * under test. Here the target is the independent variable — the whole point is to put it either side
+ * of a share that has already been found — and going through a compact-bits encoding to express
+ * "everything meets this" would be testing the encoder a second time in the file that needs the
+ * number.
+ */
+function auxAt(target: bigint): AuxBlock {
+  return {
+    chain: 'doge',
+    hashHex: 'd0'.repeat(32),
+    height: 5_400_000,
+    bitsHex: '1a01cf29',
+    target,
+    previousBlockHashHex: 'ab'.repeat(32),
+    coinbaseValue: 1_000_000_000_000n,
+    fetchedAt: new Date(NOW * 1000),
+  }
+}
+
+/** Everything meets it, and nothing does. The two ends of `meetsTarget`. */
+const ANY_HASH_WINS = (1n << 256n) - 1n
+const NO_HASH_WINS = 1n
 
 function context(overrides: Partial<ShareContext> = {}): ShareContext {
   return {
@@ -340,4 +370,72 @@ test('the stratum error codes are the ones miner firmware prints', () => {
   assert.equal(STRATUM_ERROR.LOW_DIFFICULTY, 23)
   assert.equal(STRATUM_ERROR.UNAUTHORIZED, 24)
   assert.equal(STRATUM_ERROR.NOT_SUBSCRIBED, 25)
+})
+
+/* ------------------------------------------------- the merged chain, which is a second target */
+
+test('a job with no commitment reports nothing about the merged chain', () => {
+  // `none` and `short` are different facts and the union keeps them apart: one says this pool was
+  // not merging, the other says it was and this share was not good enough.
+  const ctx = context()
+  const result = validateShare({ jobId: ctx.job.id, ...mine(ctx) }, ctx)
+  assert.equal(result.status, 'accepted')
+  if (result.status !== 'accepted') return
+  assert.equal(result.aux.kind, 'none')
+  assert.equal(magicOccurrences(coinbaseScriptSig(result.coinbase)), 0, 'an uncommitted coinbase carries magic')
+})
+
+test('a share that misses the aux target is short, and is still an ordinary accepted share', () => {
+  const ctx = context({ job: job({ aux: auxAt(NO_HASH_WINS) }) })
+  const result = validateShare({ jobId: ctx.job.id, ...mine(ctx) }, ctx)
+  assert.equal(result.status, 'accepted')
+  if (result.status !== 'accepted') return
+  assert.equal(result.aux.kind, 'short')
+  assert.equal(result.creditedDifficulty, EASY, 'the merged chain changed what the parent credited')
+  assert.equal(result.isBlock, true, 'the regtest block target was not met; the fixture changed')
+})
+
+test('A SHARE THAT MEETS THE AUX TARGET CARRIES THE BLOCK THE JOB COMMITTED TO', () => {
+  // Identity, not equality. The hash `submitauxblock` is called with has to be the one this
+  // coinbase committed to; reading it from `AuxTemplateSource` at submission time would submit a
+  // proof for whatever Dogecoin is building NOW, which is a block this miner never committed to.
+  const committed = auxAt(ANY_HASH_WINS)
+  const ctx = context({ job: job({ aux: committed }) })
+  const result = validateShare({ jobId: ctx.job.id, ...mine(ctx) }, ctx)
+
+  assert.equal(result.status, 'accepted')
+  if (result.status !== 'accepted') return
+  assert.equal(result.aux.kind, 'won')
+  if (result.aux.kind !== 'won') return
+  assert.equal(result.aux.block, committed, 'the winning share names a block other than the one in its coinbase')
+  assert.equal(magicOccurrences(coinbaseScriptSig(result.coinbase)), 1)
+})
+
+test('AN EXTRANONCE CARRYING THE MAGIC SPOILS THE MERGED HALF AND NOT THE PARENT SHARE', () => {
+  // `CAuxPow::check` searches the scriptSig and refuses a second occurrence outright — "Multiple
+  // merged mining headers in coinbase". The pool contributes one, in coinb1; the miner chose this
+  // one. The Litecoin block is untouched by it, so the share is credited exactly as any other, and
+  // only the Dogecoin half is lost. See the reasoning in `auxpow.ts` for why this is not a refusal.
+  const ctx = context({ job: job({ aux: auxAt(ANY_HASH_WINS) }) })
+  const submission = { jobId: ctx.job.id, ...mine(ctx, MERGED_MINING_MAGIC.toString('hex')) }
+  const result = validateShare(submission, ctx)
+
+  assert.equal(result.status, 'accepted', 'an honest miner lost credit for real work over 4 bytes it chose')
+  if (result.status !== 'accepted') return
+  assert.equal(result.creditedDifficulty, EASY)
+  assert.equal(result.aux.kind, 'spoiled')
+  if (result.aux.kind !== 'spoiled') return
+  assert.equal(result.aux.occurrences, 2)
+  assert.equal(magicOccurrences(coinbaseScriptSig(result.coinbase)), 2, 'the fixture did not reach the case')
+})
+
+test('the aux target is measured against the same proof as the parent, not a second hash', () => {
+  // Merged mining does not re-hash anything. One scrypt digest, compared to two targets — which is
+  // the entire reason a Dogecoin block costs a Litecoin miner nothing. A second hash here would be
+  // this file quietly reintroducing the cost merged mining exists to avoid.
+  const ctx = context({ job: job({ aux: auxAt(ANY_HASH_WINS) }) })
+  const result = validateShare({ jobId: ctx.job.id, ...mine(ctx) }, ctx)
+  assert.equal(result.status, 'accepted')
+  if (result.status !== 'accepted') return
+  assert.equal(powHash(ctx.algorithm, result.header).toString('hex'), result.powHash.toString('hex'))
 })

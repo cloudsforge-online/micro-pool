@@ -44,12 +44,14 @@ import { StratumServer, type Wire } from './stratum.ts'
 import { browserInitialDifficulty, browserVardiff, DEFAULT_VARDIFF, type VardiffOptions } from './vardiff.ts'
 import { assertNodeNetwork, payoutScriptFor, TemplateSource, type BlockTemplate } from './template.ts'
 import { AddressChecker } from './payoutaddress.ts'
-import { submitFoundBlock } from './blocks.ts'
+import { AuxTemplateSource, type AuxUnavailability } from './auxtemplate.ts'
+import { submitFoundAuxBlock, submitFoundBlock } from './blocks.ts'
 import { insertShares, upsertWorker, type Exec } from './store.ts'
-import { algorithmFor, nameFor } from './chains.ts'
+import { algorithmFor, auxNameFor, nameFor, type AuxChainId } from './chains.ts'
 import { hashesPerDifficulty, networkDifficultyOf } from './pow.ts'
 import { EXTRANONCE2_BYTES } from './stratum.ts'
 import type { AcceptedShare } from './session.ts'
+import type { AuxChainConfig } from './env.ts'
 // Types only, and that matters: `env.ts` validates eagerly and calls `process.exit(1)` on a bad
 // environment, so a value import here would make merely importing this module — from a test, from a
 // script — require a complete configuration. The published endpoint is therefore composed by the
@@ -127,6 +129,43 @@ export interface ChainStatus {
   readonly networkDifficulty: number | null
   readonly templateAgeSeconds: number | null
   readonly ready: boolean
+  /**
+   * The chain merge-mined underneath this one, or `null` when none is configured.
+   *
+   * Null and "configured but not currently committed" are different answers and both are reported,
+   * because merged mining fails by ABSENCE and by nothing else. A dogecoind in initial block
+   * download, one with no peers, a `createauxblock` refused — every one of them leaves this pool
+   * mining Litecoin exactly as well as it did before, with no error anywhere a miner or an operator
+   * would look. `committed` is the one fact that distinguishes "we are merge-mining Dogecoin" from
+   * "we intended to", and it is here so that answering it does not require reading the log.
+   */
+  readonly merged: MergedChainStatus | null
+}
+
+/** What is known about the aux chain right now, for `GET /v1/pool` and for whatever renders it. */
+export interface MergedChainStatus {
+  readonly chain: AuxChainId
+  readonly name: string
+  /**
+   * **Whether the work being handed out right this moment commits to an aux block.**
+   *
+   * False is not an error state and is the expected one on a node that is still syncing; it is
+   * simply the truth, and a consumer that showed "merge-mining Dogecoin" while this was false would
+   * be telling a miner they are earning DOGE when they are not.
+   */
+  readonly committed: boolean
+  /** Why there is no commitment, in one word, or `null` when there is one. `auxtemplate.ts` names them. */
+  readonly unavailability: AuxUnavailability | null
+  readonly height: number | null
+  /**
+   * The aux chain's own network difficulty, on the PARENT's algorithm.
+   *
+   * Dogecoin is scrypt like its parent, so this is comparable to the `networkDifficulty` beside it
+   * and the comparison is the interesting one: it is roughly how much rarer an aux block is than a
+   * parent block for the same hashing, which is what a miner wants to know about a chain they are
+   * being paid in.
+   */
+  readonly networkDifficulty: number | null
 }
 
 /** Domain metrics for the pool. Declared, not inferred from a log line — AD-20. */
@@ -222,6 +261,20 @@ export class ChainService {
   readonly #addresses: AddressChecker
   readonly #vardiff: VardiffOptions
   readonly #logger: Logger
+  /** The one chain merged into this one's work, or null. `env.ts` caps the list at one entry. */
+  readonly #auxConfig: AuxChainConfig | null
+  readonly #auxRpc: NodeRpc | null
+  readonly #aux: AuxTemplateSource | null
+  /**
+   * Set false when the aux node ANSWERS and the answer is unusable. Never on unavailability.
+   *
+   * The parent's equivalent of this condition kills the process; here it must not, and the asymmetry
+   * is the single most important thing about merged mining in this file. Litecoin mining does not
+   * depend on Dogecoin in any direction, so a dogecoind that is misconfigured, unreachable, syncing
+   * or simply absent has to cost exactly the merged half and nothing else. A boot check that took
+   * the stratum port down for it would turn a bonus into a dependency.
+   */
+  #auxUsable = true
   #loop: Promise<void> | null = null
 
   constructor(deps: ChainServiceDeps) {
@@ -231,6 +284,34 @@ export class ChainService {
     this.#vardiff = { ...DEFAULT_VARDIFF, targetSharesPerMinute: deps.vardiffSharesPerMinute }
 
     this.#rpc = new NodeRpc({ chain, url: deps.config.nodeUrl })
+
+    // `[0]` rather than a loop: `loadAuxChains` refuses more than `AUX_CHAIN_MERKLE_SIZE` entries,
+    // which is one, so a second element cannot exist. Written as an index into the configured list
+    // so that widening the tree later changes this file rather than hiding a silent truncation.
+    const auxConfig = deps.config.aux[0] ?? null
+    this.#auxConfig = auxConfig
+    this.#auxRpc = auxConfig === null ? null : new NodeRpc({ chain: auxConfig.chain, url: auxConfig.nodeUrl })
+    this.#aux =
+      auxConfig === null || this.#auxRpc === null
+        ? null
+        : new AuxTemplateSource({
+            chain: auxConfig.chain,
+            rpc: this.#auxRpc,
+            payoutAddress: auxConfig.payoutAddress,
+            // Fires on transitions only — `auxtemplate.ts` explains why, and it is what makes this
+            // loggable at info on a source polled once per Litecoin template.
+            onChange: (block, why) => {
+              if (block !== null) {
+                this.#logger.info('merging a new aux block', {
+                  aux: auxConfig.chain,
+                  height: block.height,
+                  hash: block.hashHex,
+                })
+              } else {
+                this.#logger.warn('mining without a merged-mining commitment', { aux: auxConfig.chain, why })
+              }
+            },
+          })
     this.#registry = new JobRegistry({
       chain,
       tag: Buffer.from(deps.coinbaseTag, 'utf8'),
@@ -310,6 +391,67 @@ export class ChainService {
             this.#logger.error('a block was found and the bookkeeping failed', { err })
           })
       },
+      onAuxBlock: (found) => {
+        const auxRpc = this.#auxRpc
+        const auxConfig = this.#auxConfig
+        if (auxRpc === null || auxConfig === null) {
+          // A job carries a commitment only when this service built one, and it builds one only
+          // from `#aux`, which exists only when `#auxConfig` does. Reaching here means a share met
+          // the target of an aux block that arrived from nowhere — worth a line rather than a
+          // throw, because the parent block from the same share has already been handled.
+          this.#logger.error('a share won an aux block on a chain that is not configured', {
+            aux: found.block.chain,
+            hash: found.block.hashHex,
+          })
+          return
+        }
+        // Counted on the PARENT's chain label, because that is where the share was: `aux_block` on
+        // ltc reads as "an ltc share also won a merged block", which is what happened. Counting it
+        // under doge would put it in the same series as doge shares, of which there are never any.
+        deps.metrics.increment('pool_shares_total', { chain, outcome: 'aux_block' })
+        // Not awaited, for the reason `onBlock` above gives — and independent of it. Both may be in
+        // flight at once for one share, against two different nodes, and neither waits on the other.
+        void submitFoundAuxBlock(
+          {
+            sql: deps.sql,
+            rpc: auxRpc,
+            chain: auxConfig.chain,
+            parent: chain,
+            algorithm: algorithmFor(chain),
+            pplnsMultiplier: deps.pplnsMultiplier,
+            flushShares: () => this.#stratum.flush(),
+            log: (level, message, fields) => this.#logger[level](message, fields),
+          },
+          found,
+        )
+          .then((result) => {
+            deps.metrics.increment('pool_blocks_found_total', {
+              chain: auxConfig.chain,
+              result: result.accepted ? 'accepted' : 'rejected',
+            })
+            // A refused submission usually means the aux tip moved, and the source is holding a hash
+            // that is now `block hash unknown` for every future share. Dropping it costs one RPC on
+            // the next template and stops this pool committing to a dead block until then.
+            if (!result.accepted) this.#aux?.invalidate('refused')
+          })
+          .catch((err: unknown) => {
+            this.#logger.error('an aux block was found and the bookkeeping failed', { err })
+          })
+      },
+      onAuxSpoiled: (spoiled) => {
+        // The share was accepted and paid on the parent; only the merged half is lost. `auxpow.ts`
+        // has the arithmetic for why this is not a rejection. The counter is what makes it visible:
+        // one of these is a curiosity, a stream of them from one account is a miner stuffing the
+        // magic bytes into its extranonce, and the two are indistinguishable from a log line.
+        deps.metrics.increment('pool_shares_total', { chain, outcome: 'aux_spoiled' })
+        this.#logger.warn('a share met the aux target with an unusable coinbase', {
+          aux: spoiled.block.chain,
+          hash: spoiled.block.hashHex,
+          account: spoiled.account,
+          worker: spoiled.worker,
+          occurrences: spoiled.occurrences,
+        })
+      },
       onOutcome: (outcome, code) => {
         if (outcome === 'rejected') {
           // Rejections are counted with their protocol code and never stored. The code is the whole
@@ -350,6 +492,27 @@ export class ChainService {
     return this.#rpc
   }
 
+  /** The chain merge-mined underneath this one, or null when none is configured. */
+  get auxChain(): AuxChainId | null {
+    return this.#auxConfig?.chain ?? null
+  }
+
+  /**
+   * The aux chain's node client, or null when there is no aux chain.
+   *
+   * Exposed for the same one caller and by the same argument as `node` above, and the argument is if
+   * anything stronger here: this is the node that answered the `submitauxblock`, and it is the only
+   * node in the estate that has ever heard of the Dogecoin hash the block row records. The parent's
+   * node would answer `-5` to every `getblock` for one, which `maturity.ts` reads as "not the node
+   * that took the submission" and leaves pending — so a maturity sweep pointed at the wrong one of
+   * these two would never mature a single merge-mined block and would never say why.
+   *
+   * Non-null whenever `auxChain` is, and the two are read together for exactly that reason.
+   */
+  get auxNode(): NodeRpc | null {
+    return this.#auxRpc
+  }
+
   /** Whether this chain can currently serve work. Read by `/readyz`. */
   get ready(): boolean {
     return this.#source.current !== null && !this.#source.isStale()
@@ -388,6 +551,29 @@ export class ChainService {
       networkDifficulty: template ? networkDifficultyOf(algorithmFor(chain), template.blockTarget) : null,
       templateAgeSeconds: template ? Math.round((Date.now() - template.fetchedAt.getTime()) / 1000) : null,
       ready: this.ready,
+      merged: this.#mergedStatus(),
+    }
+  }
+
+  #mergedStatus(): MergedChainStatus | null {
+    const config = this.#auxConfig
+    if (config === null) return null
+    const block = this.#aux?.current ?? null
+    return {
+      chain: config.chain,
+      name: auxNameFor(config.chain),
+      // The job registry's own answer, not the template source's. They differ for exactly one tick
+      // — a fresh aux block has arrived and the job carrying it has not been built yet — and the
+      // question this field asks is about the work miners hold, so the registry is the authority.
+      committed: this.#registry.current?.aux != null,
+      // Reported even when a block is present, because the two are not opposites: a source that has
+      // a stale block and a node that has since started refusing is a state worth seeing.
+      unavailability: this.#aux?.unavailability ?? (this.#auxUsable ? null : 'refused'),
+      height: block?.height ?? null,
+      // The PARENT's algorithm, deliberately. An aux block is won by the parent's proof of work, so
+      // its difficulty is only meaningful in the parent's units — `blocks.ts` passes the same
+      // algorithm to `networkDifficultyOf` when it records one.
+      networkDifficulty: block ? networkDifficultyOf(algorithmFor(this.#deps.config.chain), block.target) : null,
     }
   }
 
@@ -458,6 +644,11 @@ export class ChainService {
       address: this.#deps.config.payoutAddress,
     })
 
+    // The aux chain's own boot checks, and every one of them is non-fatal by construction — see
+    // `#auxUsable`. They run BEFORE the first template so that the first job this pool ever hands
+    // out already carries a commitment, rather than being rebuilt for one a few seconds later.
+    await this.#bringUpAux()
+
     // One template before the port opens, so the first miner to connect gets work rather than
     // silence — and so that a coinbase this configuration cannot build (an over-long tag, an
     // unusable payout script) fails here rather than on the first connection. The job is built by
@@ -478,6 +669,95 @@ export class ChainService {
     // The polling loop runs for the life of the process and ends when the signal aborts. It is
     // held rather than dropped so `stop()` can wait for it.
     this.#loop = this.#source.run()
+  }
+
+  /**
+   * Validate the aux node, then take one aux block, without ever failing the chain.
+   *
+   * The parent's `#bringUp` refuses to open the stratum port unless the node is on the right network
+   * and the payout address validates. This function asks the same two questions of the aux node and
+   * answers them the opposite way, because the consequence is the opposite: a wrong parent
+   * configuration mines Litecoin towards an address nobody holds, and a wrong aux configuration
+   * produces no aux block at all. `createauxblock` is what refuses a bad Dogecoin address, and it
+   * refuses it before dogecoind builds anything — so the failure mode being guarded against here is
+   * silence, not loss.
+   *
+   * What the checks buy is therefore the *diagnostic*, at boot, where somebody is watching: an
+   * operator who has swapped `POOL_DOGE_PAYOUT_ADDRESS` for a Litecoin one otherwise sees a pool
+   * that mines happily and merges nothing, for ever, with one `refused` in a warning line.
+   *
+   * `NodeUnavailableError` is deliberately not one of the answers that disables anything. A
+   * dogecoind that is starting up beside this process is the ordinary case on a cold estate, and the
+   * source retries on every template.
+   */
+  async #bringUpAux(): Promise<void> {
+    const aux = this.#aux
+    const config = this.#auxConfig
+    const rpc = this.#auxRpc
+    if (aux === null || config === null || rpc === null) return
+
+    try {
+      await assertNodeNetwork(rpc, this.#deps.network)
+      // The scriptPubKey is discarded on purpose: this pool never builds the Dogecoin coinbase, so
+      // the answer is worthless and the REFUSAL is the whole point of the call.
+      await payoutScriptFor(rpc, config.payoutAddress)
+      this.#logger.info('aux payout address validated by the aux node', {
+        aux: config.chain,
+        network: this.#deps.network,
+        address: config.payoutAddress,
+      })
+    } catch (err) {
+      if (err instanceof NodeUnavailableError) {
+        this.#logger.warn('the aux node did not answer at boot — merging will start when it does', {
+          aux: config.chain,
+          node: rpc.host,
+          err: String(err),
+        })
+      } else {
+        this.#auxUsable = false
+        this.#logger.error(
+          'this aux chain is misconfigured and will NOT be merged; the parent chain is unaffected',
+          { aux: config.chain, node: rpc.host, err: String(err) },
+        )
+        return
+      }
+    }
+
+    await this.#refreshAux()
+  }
+
+  /**
+   * Ask the aux node for a block, and republish the current job if the commitment has to change.
+   *
+   * `setAux` is what decides whether anything is republished, and it republishes on a change of the
+   * aux chain's TIP rather than of its block hash — `work.ts` has the reasoning, and the short
+   * version is that dogecoind keeps every block it built under one tip submittable, so chasing the
+   * freshest hash would issue a job every few seconds for no gain.
+   *
+   * Never throws. `refresh()` does not, and `setAux` only can by way of `buildJob`, which is already
+   * a fatal configuration fault the moment the first template arrives.
+   */
+  async #refreshAux(): Promise<void> {
+    const aux = this.#aux
+    if (aux === null || !this.#auxUsable) return
+    try {
+      const block = await aux.refresh()
+      const job = this.#registry.setAux(block)
+      if (job === null) return
+      // `cleanJobs` is the registry's decision here as everywhere, and for an aux rebuild it is
+      // false: the Litecoin block has not changed, and telling miners to abandon it to chase a
+      // Dogecoin tip would trade a real block for a merged one.
+      this.#stratum.broadcast(job, job.cleanJobs)
+      this.#logger.info('new job for a changed aux tip', {
+        jobId: job.id,
+        height: job.height,
+        aux: block?.chain,
+        auxHeight: block?.height,
+        cleanJobs: job.cleanJobs,
+      })
+    } catch (err) {
+      this.#logger.error('could not rebuild a job for the aux commitment', { err: String(err) })
+    }
   }
 
   async stop(): Promise<void> {
@@ -505,6 +785,13 @@ export class ChainService {
       // what `/readyz` will then report.
       this.#logger.error('could not build a job from a template', { err: String(err), height: template.height })
     }
+
+    // AFTER the Litecoin job has been broadcast, and not awaited. The aux block is a bonus and the
+    // parent's job must never wait a dogecoind round-trip for it — `auxtemplate.ts` states the rule
+    // and this is the one place it could have been broken. The cost of the ordering is that the job
+    // just published may carry the previous commitment; `#refreshAux` republishes if the aux tip
+    // moved, and if it did not then the previous commitment is still the right one.
+    void this.#refreshAux()
   }
 
   /**

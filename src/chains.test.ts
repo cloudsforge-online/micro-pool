@@ -10,6 +10,13 @@
  * rejects. The refusal has to carry that reason with it, at the point of refusal, which is what these
  * tests check.
  *
+ * Since merged mining landed, that refusal has a second job and it is the more important one. The
+ * pool now DOES mine Dogecoin — as an auxiliary chain of Litecoin, through `POOL_LTC_AUX_CHAINS`.
+ * A reader who finds `auxpow.ts` and then finds `doge` refused could very reasonably conclude that
+ * adding the row is how you turn the new machinery on. It is not; the row would take the primary
+ * path, which is the one that produces rejected blocks. So the refusal has to name the setting that
+ * works, and a test here holds it to that.
+ *
  * The other half of this file is that `@cloudsforge/contracts-chain` is the source of decimals and
  * names, never this repository. Restating a chain parameter is how two services come to disagree
  * about what an amount means.
@@ -28,6 +35,11 @@ import {
   poolChain,
   POOL_CHAIN_IDS,
   REFUSED_CHAINS,
+  AUX_CHAIN_IDS,
+  AUX_PARENT,
+  auxAssetFor,
+  auxNameFor,
+  isAuxChainId,
 } from './chains.ts'
 
 /* ------------------------------------------------------------------ what is mined */
@@ -71,20 +83,45 @@ test('bitcoin does not ask for mweb, and that is not an omission to be tidied up
 /* ------------------------------------------------------------------ what is refused */
 
 test('dogecoin is a named refusal, not an omission', () => {
-  assert.ok(!isPoolChainId('doge'), 'doge must not be minable')
+  assert.ok(!isPoolChainId('doge'), 'doge must not be minable as a primary chain')
   const reason = REFUSED_CHAINS['doge']
   assert.ok(typeof reason === 'string' && reason.length > 0, 'doge must be refused with a reason')
   // The reason must name the actual mechanism, or the next reader will "fix" it by adding a row.
   assert.match(reason, /AuxPoW/)
   assert.match(reason, /merge-mined/)
   assert.match(reason, /Litecoin/)
-  // And it must say what would happen if someone did it anyway.
-  assert.match(reason, /consensus rejects/)
 })
 
-test('the refusal names the RPC surface that is missing, not just the idea', () => {
-  // So that anyone implementing it later knows where the work is.
-  assert.match(REFUSED_CHAINS['doge'] as string, /getauxblock|submitauxblock/)
+test('the refusal redirects rather than saying the work is unimplemented', () => {
+  // This assertion changed when merged mining landed, and the change is the point. The refusal used
+  // to mean "nobody has built this"; it now means "this is built, and it is not configured here".
+  // A doge row in POOL_CHAINS is MORE dangerous than it was, because a reader who saw the aux
+  // machinery could reasonably believe the row would use it — it would not. So the reason has to
+  // carry the setting that does work, spelled exactly as an operator would type it.
+  const reason = REFUSED_CHAINS['doge'] as string
+  assert.match(reason, /POOL_LTC_AUX_CHAINS=doge/)
+  assert.match(reason, /DOES mine Dogecoin/)
+  // And it must still say why the primary path cannot exist, so the redirect is not mistaken for a
+  // temporary limitation someone could lift by finding the right RPC.
+  assert.match(reason, /getblocktemplate/)
+})
+
+test('doge is an aux chain, and the parent it may be merged into is litecoin', () => {
+  assert.ok(isAuxChainId('doge'))
+  assert.ok(!isAuxChainId('ltc'), 'a chain this pool mines directly is not an aux chain')
+  assert.deepEqual([...AUX_CHAIN_IDS], ['doge'])
+  assert.equal(AUX_PARENT['doge'], 'ltc')
+  // Tighter than consensus on purpose: Dogecoin's own `fStrictChainId` is false for the parent, so
+  // it would accept a Bitcoin parent too. This pool commits to one pairing so that a share arriving
+  // on the BTC port can never be checked against a Dogecoin target it was never built for.
+  assert.equal(Object.keys(AUX_PARENT).length, 1)
+})
+
+test('an aux chain carries the same asset vocabulary as a mined one', () => {
+  // `auxAssetFor` goes through `chainSpec`, so a DOGE reward is denominated by the same decimals
+  // table as every other balance in the estate rather than by a constant in this service.
+  assert.equal(auxAssetFor('doge'), 'DOGE')
+  assert.ok(auxNameFor('doge').length > 0)
 })
 
 test('ethereum classic is refused as a different shape of chain entirely', () => {

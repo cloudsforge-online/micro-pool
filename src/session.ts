@@ -40,6 +40,7 @@ import { Vardiff, roundDifficulty, type VardiffOptions } from './vardiff.ts'
 // name arrives as `chainName` in the deps instead.
 import type { PoolChainId, PowAlgorithm } from './chains.ts'
 import type { AddressVerdict } from './payoutaddress.ts'
+import type { AuxBlock } from './auxtemplate.ts'
 
 export interface OutgoingMessage {
   readonly id: number | string | null
@@ -70,6 +71,48 @@ export interface FoundBlock {
   readonly creditedDifficulty: number
 }
 
+/**
+ * A share whose proof met the auxiliary chain's target. Everything `submitauxblock` needs.
+ *
+ * It is not a `FoundBlock` with an extra field, and the two are deliberately not merged. A parent
+ * block is submitted as a whole block — header, coinbase, transactions, the lot — and an aux block
+ * is submitted as a HASH the node already holds plus a proof that this parent header committed to
+ * it. Different RPC, different bytes, different failure modes. One shape carrying both would have
+ * half its fields unused on every use.
+ *
+ * `headerHash` is absent for the same reason: an aux submission is identified by the Dogecoin block
+ * hash in `block`, and the parent's own hash is derived inside `serialiseAuxPow` from the header.
+ */
+export interface FoundAuxBlock {
+  readonly job: Job
+  /** The block dogecoind is holding. `job.aux`, carried explicitly so the caller cannot re-read it. */
+  readonly block: AuxBlock
+  /** The 80 bytes whose scrypt hash met `block.target`. */
+  readonly header: Buffer
+  /** The coinbase as the miner hashed it — non-witness, which is what `CMerkleTx` wants. */
+  readonly coinbase: Buffer
+  readonly account: string
+  readonly worker: string
+  readonly creditedDifficulty: number
+}
+
+/**
+ * A share that would have won an aux block and cannot prove it — see `AuxShareOutcome.spoiled`.
+ *
+ * There is nothing to submit and nothing to retry. This exists so the event is not silent: it is the
+ * single most valuable submission this pool can receive being refused by consensus for four bytes
+ * the miner chose, and an operator who never hears about it has no way to tell it from a pool that
+ * simply never found one.
+ */
+export interface SpoiledAuxBlock {
+  readonly job: Job
+  readonly block: AuxBlock
+  readonly account: string
+  readonly worker: string
+  /** How many times `fa be 6d 6d` occurs in the coinbase scriptSig. Never 1, or it would not be here. */
+  readonly occurrences: number
+}
+
 export interface SessionDeps {
   readonly chain: PoolChainId
   /**
@@ -92,6 +135,17 @@ export interface SessionDeps {
   readonly send: (message: OutgoingMessage) => void
   readonly onAcceptedShare: (share: AcceptedShare) => void
   readonly onBlock: (block: FoundBlock) => void
+  /**
+   * A share that won the merged chain's block, and one that would have.
+   *
+   * Both are required rather than optional even though a chain with no aux configured can never
+   * reach either. An optional callback is one a wiring change can drop, and the thing it would drop
+   * is a Dogecoin block — the failure would be a service that mines merged for months and submits
+   * nothing, with no error anywhere, because every `job.aux` was set and nobody was listening.
+   * Required, a missing handler is a type error at the one construction site.
+   */
+  readonly onAuxBlock: (block: FoundAuxBlock) => void
+  readonly onAuxSpoiled: (spoiled: SpoiledAuxBlock) => void
   /** Counters. Kept as a callback so `telemetry` does not have to exist to test this file. */
   readonly onOutcome?: ((outcome: 'accepted' | 'rejected', code: number | null) => void) | undefined
   /**
@@ -644,6 +698,29 @@ export class Session {
         account,
         worker: this.#worker,
         creditedDifficulty: result.creditedDifficulty,
+      })
+    }
+
+    // Independently of the above, and never instead of it. One proof can win both chains at once —
+    // that is the whole of merged mining — and a share that wins Dogecoin and not Litecoin is the
+    // ordinary case, because the two targets are set by different networks.
+    if (result.aux.kind === 'won') {
+      this.#deps.onAuxBlock({
+        job,
+        block: result.aux.block,
+        header: result.header,
+        coinbase: result.coinbase,
+        account,
+        worker: this.#worker,
+        creditedDifficulty: result.creditedDifficulty,
+      })
+    } else if (result.aux.kind === 'spoiled') {
+      this.#deps.onAuxSpoiled({
+        job,
+        block: result.aux.block,
+        account,
+        worker: this.#worker,
+        occurrences: result.aux.occurrences,
       })
     }
 

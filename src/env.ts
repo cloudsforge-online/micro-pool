@@ -53,7 +53,19 @@
 import { hostname } from 'node:os'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { assertServiceCredential, SecretError } from '@cloudsforge/secrets'
-import { isPoolChainId, POOL_CHAIN_IDS, REFUSED_CHAINS, type PoolChainId } from './chains.ts'
+import { AUX_CHAIN_MERKLE_SIZE } from './auxpow.ts'
+import {
+  AUX_CHAIN_IDS,
+  AUX_PARENT,
+  auxNameFor,
+  isAuxChainId,
+  isPoolChainId,
+  POOL_CHAIN_IDS,
+  REFUSED_CHAINS,
+  type AuxChainId,
+  type MinedChainId,
+  type PoolChainId,
+} from './chains.ts'
 import { STRATUM_WS_PATH } from './wsstratum.ts'
 
 /**
@@ -376,8 +388,38 @@ export interface PayoutConfig {
    * no minimum is not paid at all and that is a supported configuration: an estate that pays
    * Litecoin miners and has not decided what to do about Bitcoin is a decision, not a half-made one.
    * `bigint` because these are compared against amounts that do not fit a double.
+   *
+   * Keyed on the MINED chain, so a merge-mined one is in here on exactly the same terms as a parent
+   * — `POOL_DOGE_MINIMUM_PAYOUT` beside `POOL_LTC_MINIMUM_PAYOUT`, either or both or neither. The
+   * two are genuinely independent: they are amounts of different assets, in different units, at
+   * different prices, and a Dogecoin block pays its finder in DOGE however the LTC threshold is set.
    */
-  readonly minimums: ReadonlyMap<PoolChainId, bigint>
+  readonly minimums: ReadonlyMap<MinedChainId, bigint>
+}
+
+/**
+ * One chain merge-mined underneath a parent, and the two facts that take to do it.
+ *
+ * Deliberately smaller than `ChainConfig`, and the omissions are the point. There is no stratum
+ * port because no miner connects to an aux chain; no initial difficulty because a share's difficulty
+ * is a property of the parent's algorithm; no template poll because the aux block is refreshed on
+ * the parent's tick. An aux chain that grew any of those fields would be a chain this pool mines on
+ * its own, which is exactly what `REFUSED_CHAINS.doge` explains it cannot be.
+ */
+export interface AuxChainConfig {
+  readonly chain: AuxChainId
+  /** Carries HTTP Basic userinfo. Never logged. */
+  readonly nodeUrl: string
+  /**
+   * The address the AUX node pays this block's reward to — its own chain's address, not the parent's.
+   *
+   * A Litecoin address here is not a type error anywhere in this service: it is handed straight to
+   * `createauxblock`, and dogecoind would refuse it with a message about an invalid address that
+   * says nothing about which of the two payout variables was wrong. Named `POOL_DOGE_PAYOUT_ADDRESS`
+   * beside `POOL_LTC_PAYOUT_ADDRESS` so the pairing is visible in the deploy manifest rather than in
+   * a comment.
+   */
+  readonly payoutAddress: string
 }
 
 export interface ChainConfig {
@@ -385,6 +427,15 @@ export interface ChainConfig {
   /** Carries HTTP Basic userinfo. Never logged. */
   readonly nodeUrl: string
   readonly payoutAddress: string
+  /**
+   * The chains merged into this one's work, in the order configured. Empty for a chain mining alone.
+   *
+   * A list rather than an option because AuxPoW's commitment carries a merkle root over the aux
+   * chains, and one chain is the degenerate case of that tree rather than a different mechanism.
+   * `AUX_CHAIN_MERKLE_SIZE` in `auxpow.ts` currently pins the tree to a single slot, so a second
+   * entry is refused at load rather than silently mined into a commitment that names only the first.
+   */
+  readonly aux: readonly AuxChainConfig[]
   /**
    * The port this chain's stratum listener BINDS. Not necessarily a port anything can reach: it is
    * the inside of whatever port mapping the deploy wrote. See `stratumPublicPort`.
@@ -547,12 +598,73 @@ const DEFAULT_STRATUM_PORT: Readonly<Record<PoolChainId, number>> = Object.freez
  */
 const DEFAULT_INITIAL_DIFFICULTY: Readonly<Record<PoolChainId, number>> = Object.freeze({ btc: 65_536, ltc: 512 })
 
+/**
+ * The aux chains named for one parent, each loaded in full or refused by name.
+ *
+ * **Every failure here is a half-configuration**, and each one produces a pool that mines Litecoin
+ * perfectly and silently mines no Dogecoin at all — a state whose only symptom is an absence, which
+ * nobody notices for as long as no aux block would have been won anyway. So the variable that names
+ * an aux chain and the two that configure it are all-or-nothing together, in the same way and for
+ * the same reason as the stratum host/port pair above.
+ */
+function loadAuxChains(source: Source, parent: PoolChainId): readonly AuxChainConfig[] {
+  const variable = `POOL_${parent.toUpperCase()}_AUX_CHAINS`
+  const names = optional(source, variable, '')
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter((name) => name !== '')
+  if (names.length === 0) return Object.freeze([])
+
+  const seen = new Set<string>()
+  const aux: AuxChainConfig[] = []
+  for (const name of names) {
+    if (seen.has(name)) throw new EnvError(`${variable} lists ${name} twice`)
+    seen.add(name)
+    if (!isAuxChainId(name)) {
+      // Named against the aux table rather than against POOL_CHAINS, because the mistake this
+      // catches is "I put the parent in the aux list" as often as it is a typo, and answering
+      // "unknown chain" for `POOL_LTC_AUX_CHAINS=ltc` sends the reader looking for a spelling error.
+      throw new EnvError(
+        `${variable} asks for ${name}, which this pool does not merge-mine. It merge-mines ` +
+          `${AUX_CHAIN_IDS.join(', ')}; a chain mined on its own belongs in POOL_CHAINS.`,
+      )
+    }
+    const required_parent = AUX_PARENT[name]
+    if (required_parent !== parent) {
+      throw new EnvError(
+        `${variable} merges ${name} into ${parent}, and ${auxNameFor(name)} is merge-mined into ` +
+          `${required_parent}. See AUX_PARENT in src/chains.ts: the pairing is tighter than ` +
+          'consensus on purpose, because the wrong parent produces no aux blocks and no errors.',
+      )
+    }
+    const upper = name.toUpperCase()
+    aux.push({
+      chain: name,
+      nodeUrl: httpUrl(source, `POOL_${upper}_NODE_URL`),
+      payoutAddress: required(source, `POOL_${upper}_PAYOUT_ADDRESS`),
+    })
+  }
+
+  if (aux.length > AUX_CHAIN_MERKLE_SIZE) {
+    // Refused at load rather than at the first job. The commitment carries a merkle root over the
+    // aux chains and `auxpow.ts` pins that tree to one slot today, so a second entry would be
+    // configured, logged, and then absent from every commitment this pool ever publishes.
+    throw new EnvError(
+      `${variable} lists ${aux.length} chains and this pool commits to ${AUX_CHAIN_MERKLE_SIZE} ` +
+        '(AUX_CHAIN_MERKLE_SIZE in src/auxpow.ts). A second aux chain needs the merkle tree that ' +
+        'constant stands in for, not a longer list here.',
+    )
+  }
+  return Object.freeze(aux)
+}
+
 function loadChain(source: Source, chain: PoolChainId): ChainConfig {
   const upper = chain.toUpperCase()
   return {
     chain,
     nodeUrl: httpUrl(source, `POOL_${upper}_NODE_URL`),
     payoutAddress: required(source, `POOL_${upper}_PAYOUT_ADDRESS`),
+    aux: loadAuxChains(source, chain),
     stratumPort: integer(source, `POOL_${upper}_STRATUM_PORT`, DEFAULT_STRATUM_PORT[chain], 1, 65_535),
     stratumPublicPort: optionalInteger(source, `POOL_${upper}_STRATUM_PUBLIC_PORT`, 1, 65_535),
     initialDifficulty: decimal(
@@ -701,10 +813,18 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
    * Each is a state somebody started and did not finish, and each would otherwise produce a pool
    * that pays nobody while its operator believes it pays everybody. Nothing here falls back.
    */
-  const minimums = new Map<PoolChainId, bigint>()
+  const minimums = new Map<MinedChainId, bigint>()
   for (const chain of chains) {
     const minimum = optionalUnits(source, `POOL_${chain.chain.toUpperCase()}_MINIMUM_PAYOUT`)
     if (minimum !== null) minimums.set(chain.chain, minimum)
+    // A merge-mined chain's minimum is read on exactly the same terms as its parent's, and is
+    // INDEPENDENT of it. Paying Litecoin miners in LTC and not in DOGE is a real configuration —
+    // the amounts are in different units of different assets at different prices, and one number
+    // cannot stand for both — so the two are read separately and either may be absent.
+    for (const aux of chain.aux) {
+      const auxMinimum = optionalUnits(source, `POOL_${aux.chain.toUpperCase()}_MINIMUM_PAYOUT`)
+      if (auxMinimum !== null) minimums.set(aux.chain, auxMinimum)
+    }
   }
   // A minimum for a chain this pool does not mine is a variable that does nothing, typed by somebody
   // who believes that chain is being paid. Checked against POOL_CHAINS rather than against the two
@@ -716,6 +836,29 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
       throw new EnvError(
         `${variable} sets a payout minimum for ${name} and POOL_CHAINS does not list ${name}, so it ` +
           'would pay nobody. Either mine that chain or remove the variable.',
+      )
+    }
+  }
+  /*
+   * A node URL, a payout address or a minimum for an aux chain nobody merged is the other half of
+   * the same mistake, and it is the likelier one: a deploy that sets `POOL_DOGE_NODE_URL` and
+   * forgets `POOL_LTC_AUX_CHAINS` has a dogecoind running, reachable, configured — and never called.
+   * Nothing fails, no log line is written, and the pool mines Litecoin exactly as it did before.
+   *
+   * `MINIMUM_PAYOUT` is in the list for the same reason it is checked against `POOL_CHAINS` above:
+   * it is the variable that says "pay these miners", and a pool that is not merging the chain will
+   * never win a block on it to pay anyone for.
+   */
+  const merged = new Set<AuxChainId>(chains.flatMap((chain) => chain.aux.map((aux) => aux.chain)))
+  for (const name of AUX_CHAIN_IDS) {
+    if (merged.has(name)) continue
+    for (const suffix of ['NODE_URL', 'PAYOUT_ADDRESS', 'MINIMUM_PAYOUT'] as const) {
+      const variable = `POOL_${name.toUpperCase()}_${suffix}`
+      if (!source[variable]?.trim()) continue
+      throw new EnvError(
+        `${variable} configures ${name} and no chain merges it. Set ` +
+          `POOL_${AUX_PARENT[name].toUpperCase()}_AUX_CHAINS=${name} to mine it, or remove the ` +
+          'variable — as it stands this pool would never win a block on that chain.',
       )
     }
   }

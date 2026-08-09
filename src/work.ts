@@ -51,12 +51,28 @@
  * gets code 20. The ring is kept anyway, and only for the REASON — "the tip moved" and "this pool
  * keeps the last four jobs" are different things to tell an operator, and neither is derivable from
  * a number.
+ *
+ * ## Merged mining makes a job rebuildable, which nothing here previously was
+ *
+ * Until AuxPoW there was exactly one reason a job existed: a template arrived. A job now also gets
+ * built when the *Dogecoin* tip moves under a commitment this pool already made, because the
+ * commitment lives in `coinb1` and there is no way to change it without changing the coinbase, and
+ * no way to change the coinbase without a new job. `setAux` is that path and it is deliberately
+ * narrow — see its comment for the two rebuilds it refuses, which are far more common than the one
+ * it performs.
+ *
+ * The consequence worth stating here is what it does NOT do. A rebuild leaves the job it displaced
+ * live and submittable, because the Litecoin block those miners are working on has not changed and
+ * a share against the old commitment still wins it. Only the Dogecoin half of that job is dead, and
+ * the Dogecoin half was always a bonus on work that was going to happen anyway.
  */
 
 import { assembleCoinbase, buildCoinbase, type CoinbaseParts } from './coinbase.ts'
+import { auxCommitment } from './auxpow.ts'
 import { stratumPrevHash, toStratumScalar } from './bytes.ts'
 import { merkleSteps } from './merkle.ts'
 import type { BlockTemplate } from './template.ts'
+import type { AuxBlock } from './auxtemplate.ts'
 import type { PoolChainId } from './chains.ts'
 
 /**
@@ -130,6 +146,20 @@ export interface Job {
   readonly ntimeHex: string
   /** True when this job's parent block differs from the previous job's — a real new tip. */
   readonly cleanJobs: boolean
+  /**
+   * The aux block this job's coinbase commits to, or null when it commits to none.
+   *
+   * Carried on the job rather than read from the source at submission time, and that is the entire
+   * point of the field. `AuxTemplateSource.current` is what the pool would commit to *now*; this is
+   * what this particular coinbase actually did commit to, minutes ago, and the two differ every time
+   * Dogecoin finds a block. A share arriving against this job proves work over THESE bytes, so the
+   * hash `submitauxblock` is called with has to come from here — asking the source would submit a
+   * proof for a block the miner never committed to, which is a proof that does not verify.
+   *
+   * Null is ordinary. See `auxtemplate.ts`: dogecoind in initial block download, with no peers, or
+   * simply unconfigured all mean mine Litecoin without a commitment.
+   */
+  readonly aux: AuxBlock | null
   readonly createdAt: Date
 }
 
@@ -142,6 +172,7 @@ export interface JobBuildOptions {
   readonly extranonce2Size: number
   readonly id: string
   readonly cleanJobs: boolean
+  readonly aux: AuxBlock | null
   readonly createdAt: Date
 }
 
@@ -155,6 +186,10 @@ export function buildJob(options: JobBuildOptions): Job {
     tag: options.tag,
     extranonce1Size: options.extranonce1Size,
     extranonce2Size: options.extranonce2Size,
+    // Built here rather than passed in already-serialised so that a job and its commitment cannot be
+    // constructed out of step with each other: `job.aux` and the 44 bytes in `coinb1` come from the
+    // same expression, and there is no argument a caller could get wrong independently.
+    auxCommitment: options.aux === null ? undefined : auxCommitment(options.aux.hashHex),
   })
 
   const steps = merkleSteps(template.transactions.map((tx) => tx.txid))
@@ -176,6 +211,7 @@ export function buildJob(options: JobBuildOptions): Job {
     bitsHex: template.bitsHex,
     ntimeHex: toStratumScalar(template.curTime),
     cleanJobs: options.cleanJobs,
+    aux: options.aux,
     createdAt: options.createdAt,
   }
 }
@@ -225,6 +261,7 @@ export interface JobRegistryOptions {
 export class JobRegistry {
   readonly chain: PoolChainId
   #payoutScriptHex: string | null = null
+  #aux: AuxBlock | null = null
   #jobs: Job[] = []
   #counter = 0
   /**
@@ -252,6 +289,54 @@ export class JobRegistry {
 
   get current(): Job | null {
     return this.#jobs[0] ?? null
+  }
+
+  /** What the NEXT job will commit to. `current.aux` is what the current one already did. */
+  get aux(): AuxBlock | null {
+    return this.#aux
+  }
+
+  /**
+   * Take a fresh aux block from the source, and rebuild the current job if the old commitment has
+   * stopped being worth anything.
+   *
+   * Returns the rebuilt job, which the caller must broadcast, or null when nothing needed doing —
+   * which is the common case and is the reason this method exists rather than a plain setter.
+   *
+   * ## A new aux hash is NOT a reason to rebuild. A new aux TIP is.
+   *
+   * `createauxblock` hands back a different hash every time dogecoind reassembles its block, which is
+   * every time its mempool turns over — several times a minute. But `mapNewBlock` is only cleared on
+   * a **tip** change (see `auxtemplate.ts`, quoting `AuxMiningCreateBlock`), so every one of those
+   * hashes stays submittable until DOGE actually finds a block. Rebuilding on each new hash would
+   * therefore issue a new job every few seconds, churn `JOB_HISTORY` fast enough to evict work miners
+   * are still grinding on, and buy exactly nothing: the hash already committed to is still in the
+   * node's map and still wins the same Dogecoin block.
+   *
+   * So the trigger is the aux chain's own previous-block hash moving, which is the one event that
+   * turns the committed hash into `block hash unknown`.
+   *
+   * ## Losing the aux block is not a reason to rebuild either
+   *
+   * When the source goes to null — dogecoind restarted, lost its peers, fell back into initial block
+   * download — the commitment already in `coinb1` is inert, not harmful. It costs 44 bytes of a
+   * scriptSig that has room for them and it cannot make the Litecoin block any less valid. Rebuilding
+   * to strip it would spend a job to remove something that is not doing damage, and would throw away
+   * the commitment in the case where dogecoind comes back with the same tip and the hash was live the
+   * whole time. Null propagates to the next job the tip change builds, and no sooner.
+   */
+  setAux(aux: AuxBlock | null): Job | null {
+    this.#aux = aux
+    // Nothing to rebuild, and nothing lost: the next `push` reads `#aux` and commits to whatever it
+    // then holds.
+    if (aux === null) return null
+    const current = this.#jobs[0]
+    if (current === undefined) return null
+    // Same aux tip: the hash in `coinb1` is still in dogecoind's map and still wins the same block.
+    if (current.aux !== null && current.aux.previousBlockHashHex === aux.previousBlockHashHex) return null
+    // Either the aux tip moved under the commitment, or this job has none and could have one. Both
+    // are worth a job; neither is worth telling miners to discard Litecoin work, hence `false`.
+    return this.#install(current.template, false)
   }
 
   get(id: string): Job | null {
@@ -332,11 +417,23 @@ export class JobRegistry {
    * template is that it must not keep working on the old one for even a second longer.
    */
   push(template: BlockTemplate): Job {
+    const previous = this.#jobs[0]
+    const cleanJobs = !previous || previous.template.previousBlockHashHex !== template.previousBlockHashHex
+    return this.#install(template, cleanJobs)
+  }
+
+  /**
+   * Build a job for a template, retire whatever that displaces, and return it.
+   *
+   * Shared by `push` and `setAux` because the two differ in exactly one thing — who decides
+   * `cleanJobs` — and in nothing else. A separate rebuild path would be a second place for the
+   * retirement bookkeeping to be wrong, and the retirement bookkeeping is what answers a miner whose
+   * share arrived late.
+   */
+  #install(template: BlockTemplate, cleanJobs: boolean): Job {
     if (this.#payoutScriptHex === null) {
       throw new Error(`no payout script is set for ${this.chain}; the node has not validated the payout address yet`)
     }
-    const previous = this.#jobs[0]
-    const cleanJobs = !previous || previous.template.previousBlockHashHex !== template.previousBlockHashHex
 
     this.#counter += 1
     const job = buildJob({
@@ -350,6 +447,7 @@ export class JobRegistry {
       // interpreted by this process, and a restart drops every connection anyway.
       id: this.#counter.toString(16),
       cleanJobs,
+      aux: this.#aux,
       createdAt: new Date(this.#now()),
     })
 
