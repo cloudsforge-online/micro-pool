@@ -50,10 +50,23 @@ CONTAINER="${CONTAINER:-cloudsforge-pool-regtest}"
 IMAGE="cloudsforge/litecoind-regtest:${VERSION}"
 PORT="${PORT:-19443}"
 RPC_USER="pooltest"
-# A regtest node with no wallet worth anything and no port reachable off this host. Written in the
-# clear on purpose: a placeholder that looks like a secret is how a string gets copied somewhere it
-# matters, and this one has to be in two places at once.
-RPC_PASSWORD="pooltest"
+# GENERATED PER RUN, and it used to be the literal `pooltest` with a comment defending it: a
+# regtest node with nothing in its wallet and no port reachable off this host, so the value is
+# worthless, and a placeholder that LOOKS like a secret is how a string gets copied somewhere it
+# matters. The reasoning is sound and the conclusion still went the wrong way. "This value does not
+# matter" is a claim about the environment the file is read in, and the file cannot see that
+# environment — it is the same reasoning that put the estate administrator's password in a public
+# repository (micro-org#276), and it is why the estate's hygiene check refuses a credential-shaped
+# literal without asking how much the credential is worth.
+#
+# The argument for writing it down was that it has to be in two places at once. A variable is
+# already in as many places as it is read; nothing needed the LITERAL twice. So it is drawn from
+# urandom, and the only thing that changes for a person running this is that KEEP=1 prints a
+# different URL each time.
+#
+# `od | tr` rather than `tr -dc … | head -c`: the second closes the pipe early, which is a SIGPIPE
+# on `tr`, which is a failure under `set -o pipefail` — intermittently, depending on buffering.
+RPC_PASSWORD="$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')"
 WORK="${TMPDIR:-/tmp}/cloudsforge-pool-regtest"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
