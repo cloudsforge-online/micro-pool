@@ -21,6 +21,36 @@
  * because that is a miner (or a mis-set client) burning the pool's accounting on work with no chance
  * of ever being a block. `JOB_HISTORY` bounds it, and `clean_jobs` on a new tip tells honest miners
  * to drop everything anyway.
+ *
+ * ## Why a job that is GONE still has to answer for itself (micro-org#237)
+ *
+ * A job leaves the history in one of two ways and, until this was written, both of them left the
+ * pool answering exactly what it answers a miner that made an id up. That is the whole of #237: a
+ * miner has to be able to tell "you were too slow" apart from "your submission is wrong", because
+ * they are opposite instructions. The first means refetch and carry on and is nobody's fault; the
+ * second means the client has a bug, and miner software counts those and stops sessions over them.
+ *
+ * `hearth` reached the same defect from the HTTP side — its `/mining/submit` answered 400 where it
+ * meant 409 — and fixed it in `node/src/retiredtemplates.js` with a bounded ring of retired ids.
+ * The split it drew is the one drawn here, in the codes Stratum has instead of status codes:
+ *
+ *   - a job this pool ISSUED and has since retired  → `JOB_NOT_FOUND` (21), the stale code
+ *   - an id this pool never issued                  → `OTHER` (20), the same code a malformed
+ *                                                     `mining.submit` already gets
+ *
+ * hearth refused the cheaper fix of calling every unknown id stale, and so does this. "Your work
+ * was late" and "you are sending ids this pool never handed out" are different facts, and a pool
+ * that answers a fabricated id with "fetch fresh work" is telling a broken client to keep going.
+ *
+ * hearth had to name a hole it could not close: its ring is bounded, so an id retired long enough
+ * ago is forgotten and answers `unknown` again — its template ids are sixteen random bytes and it
+ * has no other way to know whether it issued one. THIS registry has no such hole, because its ids
+ * are a monotonic counter rendered in hex (see `push`). Every id this process ever issued is
+ * therefore recognisable from the counter alone, whether or not the ring still remembers it, so a
+ * retired job is answered `stale` for the life of the process and only a genuinely fabricated id
+ * gets code 20. The ring is kept anyway, and only for the REASON — "the tip moved" and "this pool
+ * keeps the last four jobs" are different things to tell an operator, and neither is derivable from
+ * a number.
  */
 
 import { assembleCoinbase, buildCoinbase, type CoinbaseParts } from './coinbase.ts'
@@ -39,6 +69,48 @@ import type { PoolChainId } from './chains.ts'
  * interval on either chain.
  */
 export const JOB_HISTORY = 4
+
+/**
+ * How many retired job ids keep their REASON, as a multiple of the live history.
+ *
+ * Under a steady stream of fee-improvement templates the history retires exactly one job for every
+ * job it gains, so a ring the size of the history is consumed by one full turnover — and the entry
+ * it would drop first belongs to the miner that has been grinding longest, which is the one likeliest
+ * to still be mid-attempt. A margin is the entire point. Four turnovers rather than three or five
+ * because nothing available distinguishes those; the defensible claim is only that it must be more
+ * than one.
+ *
+ * Nothing is lost when it is exceeded. An id past the end of the ring is still recognised as one this
+ * pool issued — see the header — so it is still answered `stale`; it is answered without a reason.
+ */
+export const RETAINED_TURNOVERS = 4
+
+/**
+ * Why a job is no longer submittable against, in the words an operator needs.
+ *
+ *   superseded  the tip moved under it. Its parent block is not the chain's any more, so the block
+ *               it was mining cannot be won by anybody.
+ *   evicted     it fell past `JOB_HISTORY` as newer templates arrived. Nothing to do with its age
+ *               and nothing to do with the tip: a busy pool retires perfectly live work this way,
+ *               so it must read to a miner exactly as supersession does.
+ *   forgotten   this pool issued it and no longer remembers which of the two it was.
+ */
+export type JobRetirement = 'superseded' | 'evicted' | 'forgotten'
+
+/** What `JobRegistry.recall` says about an id the registry does not hold. */
+export interface JobRecall {
+  /**
+   * True when this pool issued the id, whatever else is or is not remembered about it.
+   *
+   * Set explicitly in both branches rather than left off one of them. Absent-and-falsy is what
+   * produced micro-org#237 in the first place: "nobody thought about it here" and "this is
+   * definitely not stale" were the same value, and no reviewer could tell them apart.
+   */
+  readonly stale: boolean
+  readonly reason: JobRetirement | 'unknown'
+  /** The text that goes back to the miner, over the wire, in the error member. */
+  readonly message: string
+}
 
 export interface Job {
   /** The `mining.notify` job id. Opaque to the miner; it comes back verbatim on `mining.submit`. */
@@ -155,6 +227,14 @@ export class JobRegistry {
   #payoutScriptHex: string | null = null
   #jobs: Job[] = []
   #counter = 0
+  /**
+   * Retired ids and why, newest last — `Map` keeps insertion order, so eviction is oldest-first.
+   *
+   * Ids only. A retired job holds its whole `BlockTemplate`, transactions and all, which is the
+   * expensive part and is precisely what retiring it was for; keeping one alive to answer questions
+   * about itself would defeat the bound that retired it. An id is a handful of bytes.
+   */
+  readonly #retired = new Map<string, Exclude<JobRetirement, 'forgotten'>>()
   readonly #options: JobRegistryOptions
   readonly #history: number
   readonly #now: () => number
@@ -176,6 +256,71 @@ export class JobRegistry {
 
   get(id: string): Job | null {
     return this.#jobs.find((job) => job.id === id) ?? null
+  }
+
+  /** How many retired ids still carry a reason. Test and operational visibility only. */
+  get remembered(): number {
+    return this.#retired.size
+  }
+
+  /**
+   * What to tell a miner that submitted against an id this registry does not hold — micro-org#237.
+   *
+   * Only ever called after `get` has returned null; a live job is not a question. The two answers
+   * are the two facts, and they are not two shades of one refusal:
+   *
+   *   stale     the work was late. Not a fault, not a strike, refetch and carry on.
+   *   unknown   this pool never issued that id. The client is confused, is talking to the wrong
+   *             pool, or is fabricating ids, and telling it to fetch fresh work would be telling a
+   *             broken client that it is fine.
+   */
+  recall(id: string): JobRecall {
+    const reason = this.#retired.get(id)
+    if (reason !== undefined) return { stale: true, reason, message: this.#message(reason) }
+    if (this.#wasIssued(id)) return { stale: true, reason: 'forgotten', message: this.#message('forgotten') }
+    return {
+      stale: false,
+      // Named rather than guessed at. An operator who reads "not issued by this pool" about an id
+      // they know WAS issued would be right to stop trusting the stale answers too, so this claim
+      // has to be one the registry can actually make — which, its ids being a counter, it can.
+      reason: 'unknown',
+      message: 'unknown job — this id was not issued by this pool',
+    }
+  }
+
+  /**
+   * Did this process hand out this exact string?
+   *
+   * Ids are `#counter.toString(16)` and the counter only ever climbs, so every id ever issued is
+   * every canonical lowercase hex rendering of 1 through the counter. Compared back through
+   * `toString(16)` rather than by value alone so that `0x3`, `03`, `+3`, ` 3` and `3 ` — all of
+   * which `parseInt` accepts as three — are not credited as ids the pool issued. It issued `3`.
+   *
+   * A restart resets the counter, but a restart also drops every connection, so no miner is holding
+   * an id from the previous process to submit against this one.
+   */
+  #wasIssued(id: string): boolean {
+    const n = Number.parseInt(id, 16)
+    return Number.isSafeInteger(n) && n >= 1 && n <= this.#counter && n.toString(16) === id
+  }
+
+  #message(reason: JobRetirement): string {
+    if (reason === 'superseded') return 'stale job — the tip moved under it; fetch fresh work'
+    if (reason === 'evicted') {
+      // Interpolated rather than written out, so this can never quote a history this registry has
+      // since been configured away from.
+      return `stale job — this pool keeps the last ${this.#history} jobs; fetch fresh work`
+    }
+    return 'stale job — issued by this pool and retired too long ago to say why; fetch fresh work'
+  }
+
+  #retire(id: string, reason: Exclude<JobRetirement, 'forgotten'>): void {
+    this.#retired.set(id, reason)
+    while (this.#retired.size > this.#history * RETAINED_TURNOVERS) {
+      const oldest = this.#retired.keys().next()
+      if (oldest.done) break
+      this.#retired.delete(oldest.value)
+    }
   }
 
   /**
@@ -211,7 +356,25 @@ export class JobRegistry {
     // A new tip invalidates history outright. Every job built on the old parent is now mining a
     // block that cannot be won, so keeping them would credit shares for work with no chance — and
     // the miners were told to drop them by `clean_jobs` in the same breath.
-    this.#jobs = cleanJobs ? [job] : [job, ...this.#jobs].slice(0, this.#history)
+    const kept = cleanJobs ? [job] : [job, ...this.#jobs].slice(0, this.#history)
+
+    // Whatever fell out is RETIRED, not discarded: a share against it is still in flight somewhere
+    // and has to be answered as late rather than as wrong — micro-org#237.
+    //
+    // Oldest first — `#jobs` is newest-first, hence the reverse — so that the ring's insertion order
+    // always reads as time of retirement, which is the thing its eviction rule assumes. Measured
+    // 2026-08-09: with these bounds that ordering is not observable from outside, because a tip
+    // change retires at most `#history` jobs at once and the ring holds four times that, so every
+    // member of a batch outlives every entry already in it whichever way round they go in. Written
+    // this way regardless, because the alternative is a structure whose order is right by accident
+    // of two constants that are allowed to move.
+    const keptIds = new Set(kept.map((held) => held.id))
+    for (let index = this.#jobs.length - 1; index >= 0; index -= 1) {
+      const retiring = this.#jobs[index]
+      if (retiring && !keptIds.has(retiring.id)) this.#retire(retiring.id, cleanJobs ? 'superseded' : 'evicted')
+    }
+
+    this.#jobs = kept
     return job
   }
 }

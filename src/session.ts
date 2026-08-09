@@ -416,9 +416,14 @@ export class Session {
 
     const job = this.#deps.registry.get(jobIdRaw)
     if (!job) {
-      // Stale, not dishonest. The miner was working on a job that has since been superseded — see
-      // `work.ts` on why some history is kept and why it is bounded.
-      this.#reject(id, STRATUM_ERROR.JOB_NOT_FOUND, 'job not found — this share is stale')
+      // Two different facts, and until micro-org#237 they got one answer. A job this pool issued and
+      // has since retired is STALE — the miner did real work that arrived late, which is not a
+      // fault and which code 21 is the protocol's word for. An id this pool never issued is not
+      // stale, and telling a client that fabricates ids to "fetch fresh work" tells it it is fine;
+      // it gets code 20, the same answer a malformed submit gets a few lines up. `recall` in
+      // `work.ts` draws the line and says why it can.
+      const gone = this.#deps.registry.recall(jobIdRaw)
+      this.#reject(id, gone.stale ? STRATUM_ERROR.JOB_NOT_FOUND : STRATUM_ERROR.OTHER, gone.message)
       return
     }
 
