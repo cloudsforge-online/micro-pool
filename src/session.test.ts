@@ -464,3 +464,116 @@ test('parseWorkerName accepts the address shapes miners actually use', () => {
     assert.notEqual(parseWorkerName(good), null, `${good} was refused`)
   }
 })
+
+/* -------------------------------------------------- the browser transport (micro-org#289) */
+
+/**
+ * A redeemer that answers one secret and records everything it was asked.
+ *
+ * Single-use is `tickets.ts`'s property and is tested there; what matters here is which FIELD this
+ * session reads and what it does with the answer.
+ */
+function ticketing(secret: string, identity: { account: string; worker: string }) {
+  const presented: string[] = []
+  const spent = new Set<string>()
+  const redeem = (value: string) => {
+    presented.push(value)
+    if (value !== secret || spent.has(value)) return null
+    spent.add(value)
+    return identity
+  }
+  return { presented, redeem }
+}
+
+test('on the browser transport the identity comes from the ticket, not from the username', () => {
+  // The reversal micro-org#289 settled on. A browser has just proved who it is to
+  // `POST /v1/pool/ticket`; taking its word for an account name afterwards would be strictly worse
+  // information than the pool already holds, and would let a tab mine into somebody else's history.
+  const tickets = ticketing('ticket-value', { account: 'cf-00112233445566aa', worker: 'web-abc123' })
+  const h = harness({ redeemTicket: tickets.redeem })
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: ['cloudsforge-web/1'] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qattacker.rig1', 'ticket-value'] })
+
+  assert.equal(h.sent.find((m) => m.id === 2)?.result, true)
+  assert.equal(h.session.account, 'cf-00112233445566aa')
+  assert.equal(h.session.worker, 'web-abc123')
+  // The username was not consulted at all — not parsed, not fallen back to, not blended in.
+  assert.deepEqual(tickets.presented, ['ticket-value'])
+})
+
+test('a browser share is credited to the ticket account', () => {
+  // The end of the chain the whole feature exists for: work done in a tab lands in `pool_shares`
+  // under the label this service minted for that estate account. `payoutsImplemented` is false, so
+  // this is a record of work and nothing else — but it is the record the account is entitled to.
+  const tickets = ticketing('t', { account: 'cf-1122334455667788', worker: 'web-ffeedd' })
+  const h = harness({ redeemTicket: tickets.redeem })
+  const job = h.pushTemplate()
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['ignored', 't'] })
+  mineFor(h, job)
+
+  assert.equal(h.shares.length, 1)
+  assert.equal(h.shares[0]?.account, 'cf-1122334455667788')
+  assert.equal(h.shares[0]?.worker, 'web-ffeedd')
+})
+
+test('every way of failing to present a ticket gets the same refusal', () => {
+  // One answer for four causes, for the reason `tickets.ts` gives: telling them apart would let
+  // anybody holding a candidate value learn whether it was ever real, and an honest client does the
+  // same thing in all four cases, which is ask for another ticket.
+  const messages = new Set<string>()
+  for (const password of [undefined, '', '   ', 'never-was-a-ticket', 'ticket-value']) {
+    const tickets = ticketing('ticket-value', { account: 'cf-a', worker: 'web-a' })
+    // Spend it first, so the last case is a REPLAY of a real value rather than an unknown one.
+    if (password === 'ticket-value') tickets.redeem('ticket-value')
+    const h = harness({ redeemTicket: tickets.redeem })
+    h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+    h.session.handle({ id: 2, method: 'mining.authorize', params: ['acct.rig', password] })
+
+    const reply = h.sent.find((m) => m.id === 2)
+    assert.equal(reply?.result, false, `${JSON.stringify(password)} was accepted`)
+    const error = reply?.error as [number, string, unknown]
+    assert.equal(error[0], STRATUM_ERROR.UNAUTHORIZED)
+    assert.ok(!h.session.authorised)
+    messages.add(error[1])
+  }
+  assert.equal(messages.size, 1, 'the refusals differ, which is an oracle')
+})
+
+test('the refusal says where to get a ticket and repeats nothing that was presented', () => {
+  // A refusal is the log line anything on the internet can make this process write, so it must not
+  // contain the value it was handed. It must still be actionable: a page that cannot tell "your
+  // ticket expired" from "this pool is broken" retries the wrong thing.
+  const tickets = ticketing('ticket-value', { account: 'cf-a', worker: 'web-a' })
+  const h = harness({ redeemTicket: tickets.redeem })
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['acct.rig', 'super-secret-ticket'] })
+
+  const serialised = JSON.stringify(h.sent)
+  assert.ok(!serialised.includes('super-secret-ticket'), 'the presented value was echoed back')
+  assert.match((h.sent.find((m) => m.id === 2)?.error as [number, string, unknown])[1], /POST \/v1\/pool\/ticket/)
+})
+
+test('a ticket account still receives its difficulty before its first job', () => {
+  // The ordering rule is a property of the session, not of the transport, and the browser path is a
+  // second entry into it. A tab told a job before a difficulty assumes 1 and hashes for ever.
+  const tickets = ticketing('t', { account: 'cf-a', worker: 'web-a' })
+  const h = harness({ redeemTicket: tickets.redeem })
+  h.pushTemplate()
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['x', 't'] })
+
+  const notifications = h.sent.filter((m) => m.method !== undefined).map((m) => m.method)
+  assert.ok(notifications.indexOf('mining.set_difficulty') < notifications.indexOf('mining.notify'))
+})
+
+test('without a redeemer the username path is untouched, and no ticket can be presented', () => {
+  // Raw TCP is unchanged by micro-org#289 and this is the assertion that says so. A pool with no
+  // identity configured hands `session.ts` no redeemer, and every miner in the field keeps
+  // authorising with a payout address and the password every one of them sends, which is `x`.
+  const h = harness()
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'anything-at-all'] })
+  assert.equal(h.sent.find((m) => m.id === 2)?.result, true)
+  assert.equal(h.session.account, 'bc1qexampleaddress')
+})

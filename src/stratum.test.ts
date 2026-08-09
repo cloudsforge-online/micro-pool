@@ -716,3 +716,151 @@ test('listen rejects rather than resolving when the port is taken', async () => 
   await assert.rejects(second.listen(), /EADDRINUSE/)
   assert.equal(second.boundPort, null)
 })
+
+/* -------------------------------------------------- the WebSocket transport (micro-org#289) */
+
+/**
+ * A `Wire` that is not a socket.
+ *
+ * The point of the seam. `wsframe.test.ts` proves the framing and `wsstratum.test.ts` proves the
+ * upgrade; what has to be proved HERE is that a wire which is not a `net.Socket` gets the same
+ * session, the same line splitter and the same teardown — so the fake is deliberately minimal, and
+ * anything `stratum.ts` starts needing from a socket beyond these six members breaks this file.
+ */
+function fakeWire() {
+  const lines: string[] = []
+  let dataHandler: ((chunk: string) => void) | null = null
+  let closeHandler: (() => void) | null = null
+  let destroyed = false
+  const wire = {
+    get destroyed() {
+      return destroyed
+    },
+    writableLength: 0,
+    write: (line: string) => {
+      lines.push(line)
+    },
+    destroy: () => {
+      if (destroyed) return
+      destroyed = true
+      closeHandler?.()
+    },
+    onData: (handler: (chunk: string) => void) => {
+      dataHandler = handler
+    },
+    onClose: (handler: () => void) => {
+      closeHandler = handler
+    },
+  }
+  return {
+    wire,
+    lines,
+    /** Everything received, parsed, in order. */
+    messages: () => lines.map((line) => JSON.parse(line) as Record<string, unknown>),
+    feed: (text: string) => dataHandler?.(text),
+  }
+}
+
+const BROWSER_START = 1 / 65536 / 4
+
+function browserOptions(redeem: (secret: string) => { account: string; worker: string } | null) {
+  return {
+    initialDifficulty: BROWSER_START,
+    vardiff: { ...TEST_VARDIFF, minDifficulty: BROWSER_START },
+    redeemTicket: redeem,
+  }
+}
+
+test('a pool with no identity configured serves no browsers and says so', async () => {
+  // Not an error and not a crash: identity is optional configuration, a pool run by somebody with no
+  // estate is the ordinary case, and `wsstratum.ts` turns this false into a refused upgrade carrying
+  // a status rather than a socket that connects and then never speaks.
+  const h = await harness()
+  const fake = fakeWire()
+  assert.equal(h.server.servesBrowsers, false)
+  assert.equal(h.server.attachWebSocket(fake.wire), false)
+  assert.equal(h.server.connectionCount, 0)
+  assert.deepEqual(fake.lines, [], 'a refused wire must be told nothing at all')
+})
+
+test('a browser authorises with a ticket and mines under the account the ticket named', async () => {
+  const h = await harness({ browser: browserOptions(() => ({ account: 'cf-00112233445566aa', worker: 'web-a1b2c3' })) })
+  h.push()
+  const fake = fakeWire()
+  assert.equal(h.server.servesBrowsers, true)
+  assert.equal(h.server.attachWebSocket(fake.wire), true)
+
+  fake.feed(`${JSON.stringify({ id: 1, method: 'mining.subscribe', params: ['cloudsforge-web/1'] })}\n`)
+  fake.feed(`${JSON.stringify({ id: 2, method: 'mining.authorize', params: ['ignored', 'a-ticket'] })}\n`)
+
+  const messages = fake.messages()
+  assert.equal(messages.find((m) => m.id === 2)?.result, true)
+  // The whole handshake reached a wire that has no file descriptor behind it.
+  assert.ok(messages.some((m) => m.method === 'mining.notify'))
+  assert.equal(h.server.connectionCount, 1)
+})
+
+test('a browser starts at the browser difficulty, not at the one a rig gets', async () => {
+  // The per-transport band, observed where it actually lands: in the `mining.set_difficulty` the
+  // client is sent. A browser handed a rig's starting difficulty submits nothing for hours and is
+  // indistinguishable from a miner that is broken.
+  const h = await harness({ browser: browserOptions(() => ({ account: 'cf-a', worker: 'web-a' })) })
+  const fake = fakeWire()
+  h.server.attachWebSocket(fake.wire)
+  fake.feed(`${JSON.stringify({ id: 1, method: 'mining.subscribe', params: [] })}\n`)
+  fake.feed(`${JSON.stringify({ id: 2, method: 'mining.authorize', params: ['x', 't'] })}\n`)
+
+  const set = fake.messages().find((m) => m.method === 'mining.set_difficulty')
+  assert.deepEqual(set?.params, [BROWSER_START])
+
+  // And a TCP miner on the same server is still handed the hardware one. One `StratumServer`, one
+  // registry, one set of jobs, two bands.
+  const tcp = await h.connect()
+  tcp.send({ id: 1, method: 'mining.subscribe', params: [] })
+  tcp.send({ id: 2, method: 'mining.authorize', params: [USERNAME, 'x'] })
+  const tcpSet = await tcp.await((m) => m.method === 'mining.set_difficulty', 'set_difficulty over TCP')
+  assert.deepEqual(tcpSet.params, [SHARE_DIFFICULTY])
+})
+
+test('a browser that presents no ticket is refused and never gets work', async () => {
+  const h = await harness({ browser: browserOptions(() => null) })
+  h.push()
+  const fake = fakeWire()
+  h.server.attachWebSocket(fake.wire)
+  fake.feed(`${JSON.stringify({ id: 1, method: 'mining.subscribe', params: [] })}\n`)
+  fake.feed(`${JSON.stringify({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'x'] })}\n`)
+
+  const messages = fake.messages()
+  assert.equal(messages.find((m) => m.id === 2)?.result, false)
+  // The username was a perfectly good one and would have worked over TCP. On this transport it is
+  // not an identity, and a refusal that still handed out a job would credit the work to a stranger.
+  assert.ok(!messages.some((m) => m.method === 'mining.notify'))
+})
+
+test('a browser is broadcast to, and its slot is released when it goes away', async () => {
+  const h = await harness({ browser: browserOptions(() => ({ account: 'cf-a', worker: 'web-a' })) })
+  const fake = fakeWire()
+  h.server.attachWebSocket(fake.wire)
+  fake.feed(`${JSON.stringify({ id: 1, method: 'mining.subscribe', params: [] })}\n`)
+  fake.feed(`${JSON.stringify({ id: 2, method: 'mining.authorize', params: ['x', 't'] })}\n`)
+
+  const before = fake.messages().filter((m) => m.method === 'mining.notify').length
+  h.server.broadcast(h.push(), true)
+  assert.equal(fake.messages().filter((m) => m.method === 'mining.notify').length, before + 1)
+
+  // The teardown is the shared one: closing the wire must free the connection and its extranonce,
+  // or a page refreshed a few thousand times exhausts a four-byte space this listener never reuses.
+  fake.wire.destroy()
+  assert.equal(h.server.connectionCount, 0)
+})
+
+test('a draining pool refuses a browser rather than handing it work it will not settle', async () => {
+  // Same rule the TCP listener follows on the way down, and it has to be checked separately because
+  // the WebSocket transport does not go through `#accept`: the HTTP server is still up and still
+  // accepting upgrades at the moment the chains are closing.
+  const h = await harness({ browser: browserOptions(() => ({ account: 'cf-a', worker: 'web-a' })) })
+  await h.server.close()
+  const fake = fakeWire()
+  assert.equal(h.server.attachWebSocket(fake.wire), false)
+  assert.equal(h.server.connectionCount, 0)
+})

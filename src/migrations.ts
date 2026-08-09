@@ -110,18 +110,79 @@ export const MIGRATIONS: readonly Migration[] = [
       create index if not exists pool_blocks_recent_idx on pool_blocks (chain, found_at desc);
     `,
   },
+  {
+    version: 3,
+    name: 'account-links',
+    /*
+     * ═══ THIS IS A NEW TABLE BECAUSE `pool_workers` MUST NOT GROW A USER COLUMN ═════════════════
+     *
+     * Version 2 above says, in the DDL and not only in prose: "There is no join to an estate user
+     * here and that is deliberate: a miner points hardware at a port and gives an address, and
+     * requiring an account first would exclude every miner who already has one." micro-org#289 adds
+     * a browser miner that DOES have an estate account, and the obvious change — a nullable
+     * `user_id` on `pool_workers` — would quietly retire that sentence. It is not made.
+     *
+     * The property being preserved is not tidiness. Raw TCP is unchanged by this migration and by
+     * the release it belongs to: a stranger still connects to the stratum port, still types whatever
+     * they like as a username, still has no account, and still appears in `pool_workers` on exactly
+     * the same terms as before. The link below is additive and opt-in, it is written only when an
+     * estate user asks this service for a mining ticket, and every path that reads a share or a
+     * worker is untouched by its existence. A column on `pool_workers` would have made the estate
+     * account a property of every miner — null for most of them, which is the shape that invites the
+     * next reader to make it `not null`.
+     *
+     * ## Deliberately NOT chain-scoped, which is the one place this table differs from every other
+     *
+     * Every other table here carries `chain` and every statement filters on it, because a pool
+     * serving two chains has two accounting universes. A person is not per chain. One estate user
+     * has one pool account and mines whatever they point a tab at, so the label is minted once and
+     * reused, and `store.test.ts` drives its scoping sweep from `POOL_CHAIN_TABLES` rather than from
+     * every table this service owns for exactly this reason.
+     */
+    up: `
+      create table if not exists pool_account_links (
+        -- The estate user id, as it appears in the 'sub' claim of an access token. Never published:
+        -- GET /v1/pool/shares?account= is unauthenticated, so the label a browser miner is credited
+        -- under is the opaque 'account' below and never this column. See src/tickets.ts.
+        user_id      text        primary key,
+        -- The pool account label. Random and opaque, minted on first use, and inside the character
+        -- set session.ts enforces for a stratum username so that it is a legal account everywhere
+        -- else in this schema.
+        account      text        not null,
+        created_at   timestamptz not null default now(),
+        last_used_at timestamptz not null default now(),
+        -- One user, one account, and no account shared by two users. The first half stops a share
+        -- history being split in two by a race on first use; the second stops one user's work being
+        -- credited into another's page.
+        constraint pool_account_links_account_uniq unique (account)
+      );
+    `,
+  },
 ]
 
 /**
- * The tables this service owns, named once.
+ * The tables whose every row belongs to one chain.
  *
- * Read by `store.test.ts` twice over: to reset the schema between database-backed cases, and — the
- * reason it is a constant rather than a literal in a test — to drive the scoping sweep that checks
- * every statement in `store.ts` naming one of these also filters on `chain`. A list that lived only
- * in the test would grow a table late or not at all, and the statement it failed to cover would be
- * the one reading another chain's shares.
+ * This is the list that drives the scoping sweep in `store.test.ts` — the check that every statement
+ * naming one of these also filters on `chain`. A pool serving Bitcoin and Litecoin has two
+ * independent accounting universes in one schema, a query that forgot the column would divide a
+ * Bitcoin block's reward among Litecoin miners, and nothing about the resulting numbers looks wrong
+ * from outside. The list is a constant rather than a literal in the test so that a new table is
+ * covered by the sweep the day it is added rather than the day somebody remembers.
+ *
+ * `pool_account_links` is deliberately NOT here. It maps an estate user to their pool account label
+ * and a person is not per chain; migration 3 says so where the table is created.
  */
-export const POOL_TABLES: readonly string[] = Object.freeze(['pool_shares', 'pool_blocks', 'pool_workers'])
+export const POOL_CHAIN_TABLES: readonly string[] = Object.freeze(['pool_shares', 'pool_blocks', 'pool_workers'])
+
+/**
+ * Every table this service owns, chain-scoped or not.
+ *
+ * Read by `store.test.ts` to reset the schema between database-backed cases, and to check rule 1
+ * from the other direction: a statement in `store.ts` naming a table that is not in this list is a
+ * pool reading somebody else's data.
+ */
+export const POOL_TABLES: readonly string[] = Object.freeze([...POOL_CHAIN_TABLES, 'pool_account_links'])
 
 /**
  * The version this build requires. `index.ts` asserts it at boot and refuses to serve below it,

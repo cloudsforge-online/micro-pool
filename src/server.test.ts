@@ -36,6 +36,7 @@ import type { Server } from 'node:http'
 import { Lifecycle } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
 import { createServer, type PoolSnapshot, type ServerDeps } from './server.ts'
+import { TokenError, VerifierUnavailableError, type Principal } from '@cloudsforge/auth'
 import { registerPoolMetrics, type ChainStatus } from './chainservice.ts'
 import type { Exec } from './store.ts'
 
@@ -59,6 +60,8 @@ function chainStatus(over: Partial<ChainStatus> = {}): ChainStatus {
     // string, which is the entire point of the field beside it.
     stratumPort: 3334,
     stratumEndpoint: null,
+    // And likewise the browser's endpoint: null unless an operator published an origin.
+    websocketEndpoint: null,
     connections: 2,
     height: 2_912_004,
     networkDifficulty: 34_512_119.5,
@@ -82,17 +85,25 @@ interface Harness {
   readonly url: string
   readonly lifecycle: Lifecycle
   readonly metrics: Metrics
+  /** Every line the service logged, as text. The ticket tests search it for what must not be there. */
+  readonly logs: string[]
 }
 
 async function withServer(
-  options: { snapshot?: PoolSnapshot; rows?: readonly unknown[]; beforeScrape?: ServerDeps['beforeScrape'] },
+  options: {
+    snapshot?: PoolSnapshot
+    rows?: readonly unknown[]
+    beforeScrape?: ServerDeps['beforeScrape']
+    browserMining?: ServerDeps['browserMining']
+  },
   fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
   const lifecycle = new Lifecycle({ cacheMs: 0 })
   const metrics = registerPoolMetrics(registerHttpMetrics(new Metrics()))
-  // Discarded rather than silenced, so a log line that cannot be serialised still throws instead of
-  // being swallowed by a null logger.
-  const logger = new Logger({ service: 'pool-test', sink: () => {} })
+  // Captured rather than silenced, so a log line that cannot be serialised still throws instead of
+  // being swallowed by a null logger — and so a test can assert what a line does NOT contain.
+  const logs: string[] = []
+  const logger = new Logger({ service: 'pool-test', sink: (line) => logs.push(String(line)) })
   const server: Server = createServer({
     lifecycle,
     logger,
@@ -100,12 +111,13 @@ async function withServer(
     sql: stubSql(options.rows ?? []),
     snapshot: () => options.snapshot ?? snapshot(),
     ...(options.beforeScrape ? { beforeScrape: options.beforeScrape } : {}),
+    ...(options.browserMining ? { browserMining: options.browserMining } : {}),
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   lifecycle.markReady()
   const { port } = server.address() as AddressInfo
   try {
-    await fn({ url: `http://127.0.0.1:${port}`, lifecycle, metrics })
+    await fn({ url: `http://127.0.0.1:${port}`, lifecycle, metrics, logs })
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
@@ -198,6 +210,7 @@ test('the pool summary carries the whole shape the console is written against', 
       'stratumEndpoint',
       'stratumPort',
       'templateAgeSeconds',
+      'websocketEndpoint',
       'windowSeconds',
       'workersInWindow',
     ])
@@ -403,4 +416,178 @@ test('every answer is counted under its route, and an unmatched path collapses t
     assert.match(rendered, /route="unmatched"/)
     assert.ok(!rendered.includes('nope-one'), 'a caller-supplied path became a metric label')
   })
+})
+
+/* ------------------------------------------------ the ticket route (micro-org#289) */
+
+const USER: Principal = { kind: 'user', userId: 'user-7', handle: 'someone', roles: ['player'] }
+
+/**
+ * A `browserMining` block that verifies one token and mints one predictable ticket.
+ *
+ * The `Verifier` itself is `@cloudsforge/auth`'s and is tested there against real JWKS; what has to
+ * be proved here is which STATUS each of its failures becomes and what reaches the caller with it.
+ */
+function browserMining(options: { principal?: (token: string) => Promise<Principal>; secret?: string } = {}) {
+  const minted: { account: string; worker: string }[] = []
+  return {
+    minted,
+    deps: {
+      principal: options.principal ?? (async () => USER),
+      mint: (identity: { account: string; worker: string }) => {
+        minted.push(identity)
+        return {
+          secret: options.secret ?? 'the-ticket-value',
+          account: identity.account,
+          worker: identity.worker,
+          expiresAtMs: Date.now() + 60_000,
+        }
+      },
+    },
+  }
+}
+
+test('a pool with no identity configured answers 503 with a reason, not 404', async () => {
+  // The difference matters to the page: 404 says "this pool is old", 503 says "this pool does not do
+  // browser mining", and only the second tells a reader to point firmware at the stratum port.
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, { method: 'POST' })
+    assert.equal(res.status, 503)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    assert.equal(body.error.code, 'browser_mining_unavailable')
+    assert.match(body.error.message, /stratum port/)
+  })
+})
+
+test('a ticket request with no bearer token is 401 and mints nothing', async () => {
+  const browser = browserMining()
+  await withServer({ browserMining: browser.deps }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, { method: 'POST' })
+    assert.equal(res.status, 401)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'unauthenticated')
+    assert.equal(browser.minted.length, 0)
+  })
+})
+
+test('a token that does not verify is 401 and the reason is never echoed', async () => {
+  // A verification failure's message names key ids, issuers and clock skews. Repeating it to an
+  // unauthenticated caller is how a token oracle gets built, so the answer is deliberately flat.
+  const browser = browserMining({
+    principal: async () => {
+      throw new TokenError('no key with kid=abc123 in the issuer key set', 'unknown_kid')
+    },
+  })
+  await withServer({ browserMining: browser.deps }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer not-a-real-token' },
+    })
+    assert.equal(res.status, 401)
+    const text = await res.text()
+    assert.ok(!text.includes('abc123'), 'the verifier reason reached the caller')
+    assert.ok(!text.includes('not-a-real-token'), 'the presented token was reflected')
+    assert.equal(browser.minted.length, 0)
+  })
+})
+
+test('identity being unreachable is 503, never 401', async () => {
+  // The distinction `statusFor` exists for. A JWKS that is down is not a caller who is lying, and
+  // 401 would tell a signed-in page to sign in again, which cannot possibly help.
+  const browser = browserMining({
+    principal: async () => {
+      throw new VerifierUnavailableError('fetch failed')
+    },
+  })
+  await withServer({ browserMining: browser.deps }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, { method: 'POST', headers: { authorization: 'Bearer t' } })
+    assert.equal(res.status, 503)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'identity_unavailable')
+  })
+})
+
+test('a service principal is refused with 403, because there is nobody to credit', async () => {
+  const browser = browserMining({
+    principal: async () => ({ kind: 'service', service: 'hub-web', scopes: ['pool:read'] }),
+  })
+  await withServer({ browserMining: browser.deps }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, { method: 'POST', headers: { authorization: 'Bearer t' } })
+    // 403 and not 401: the credential was perfectly good, and presenting a better one will not help.
+    assert.equal(res.status, 403)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'forbidden')
+    assert.equal(browser.minted.length, 0)
+  })
+})
+
+test('an authenticated user gets a ticket, an account and a worker the SERVER chose', async () => {
+  const browser = browserMining()
+  await withServer({ browserMining: browser.deps, rows: [{ account: 'cf-00112233445566aa' }] }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer t' },
+      // A body, deliberately, naming an account that is not theirs. Nothing reads it.
+      body: JSON.stringify({ account: 'bc1qsomebodyelse', worker: 'not-mine' }),
+    })
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as Record<string, unknown>
+    assert.deepEqual(Object.keys(body).sort(), ['account', 'expiresInMs', 'ticket', 'worker'])
+    assert.equal(body.ticket, 'the-ticket-value')
+    assert.equal(body.account, 'cf-00112233445566aa')
+    assert.match(String(body.worker), /^web-[0-9a-f]{6}$/)
+    // Elapsed time, not an absolute one: the only clock a browser and this process reliably share.
+    assert.ok(typeof body.expiresInMs === 'number' && body.expiresInMs > 0 && body.expiresInMs <= 60_000)
+    assert.ok(!JSON.stringify(body).includes('bc1qsomebodyelse'), 'the client named its own account')
+  })
+})
+
+test('the minted ticket never appears in a log line', async () => {
+  // The audit trail for browser mining is the account and the worker. A secret in a log is a secret
+  // in the collector, in the retention window and in whatever anybody grep'd it into.
+  const browser = browserMining({ secret: 'SECRET-TICKET-VALUE' })
+  await withServer({ browserMining: browser.deps, rows: [{ account: 'cf-1122334455667788' }] }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, { method: 'POST', headers: { authorization: 'Bearer t' } })
+    assert.equal(res.status, 200)
+    const logs = h.logs.join('\n')
+    assert.ok(!logs.includes('SECRET-TICKET-VALUE'), 'the ticket was logged')
+    // And the token that bought it is not in there either.
+    assert.ok(!logs.includes('Bearer'), 'an authorization header reached the log')
+    // What IS there: the account, so a browser miner's work can be traced by an operator.
+    assert.ok(logs.includes('cf-1122334455667788'), 'the audit trail is missing the account')
+  })
+})
+
+test('the ticket route is a POST and nothing else', async () => {
+  const browser = browserMining()
+  await withServer({ browserMining: browser.deps }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/ticket`, { headers: { authorization: 'Bearer t' } })
+    assert.equal(res.status, 404)
+    assert.equal(browser.minted.length, 0)
+  })
+})
+
+/* ------------------------------------------------ the websocket endpoint (micro-org#289) */
+
+test('AN UNPUBLISHED WEBSOCKET ENDPOINT IS NULL, EXACTLY AS THE STRATUM ONE IS', async () => {
+  // The same defect micro-org#285 fixed for stratum, refused a second time before it can happen: a
+  // published address is configuration or it is nothing. A `wss://` URL assembled from the request
+  // Host would be right on this estate by accident and wrong for anybody who runs this pool anywhere
+  // else — and wrong in the way that costs a reader an evening blaming their browser.
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool`, { headers: { host: 'pool.cloudsforge.online' } })
+    const body = (await res.json()) as { chains: { websocketEndpoint: unknown }[] }
+    assert.equal(body.chains[0]?.websocketEndpoint, null)
+    assert.ok(!JSON.stringify(body).includes('wss://'), 'an endpoint was invented from somewhere')
+  })
+})
+
+test('a published websocket endpoint is reported exactly as configured', async () => {
+  await withServer(
+    { snapshot: snapshot({ chains: [chainStatus({ websocketEndpoint: 'wss://pool.cloudsforge.online/v1/pool/stratum/ltc' })] }) },
+    async (h) => {
+      const res = await fetch(`${h.url}/v1/pool`, { headers: { host: 'somewhere.else.example' } })
+      const body = (await res.json()) as { chains: { websocketEndpoint: unknown }[] }
+      // Byte for byte what the operator configured, with the chain in the path so a page needs to
+      // read exactly one field to connect.
+      assert.equal(body.chains[0]?.websocketEndpoint, 'wss://pool.cloudsforge.online/v1/pool/stratum/ltc')
+    },
+  )
 })

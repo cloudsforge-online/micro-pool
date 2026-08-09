@@ -28,9 +28,12 @@ import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Lifecycle, installSignalHandlers, postgresProbe, type Probe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
-import { SERVICE, env, stratumEndpointOf } from './env.ts'
+import { Verifier } from '@cloudsforge/auth'
+import { SERVICE, env, stratumEndpointOf, websocketEndpointOf } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer } from './server.ts'
+import { attachStratumWebSocket } from './wsstratum.ts'
+import { TicketStore } from './tickets.ts'
 import { ChainService, registerPoolMetrics } from './chainservice.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
 import type { Exec } from './store.ts'
@@ -103,11 +106,28 @@ lifecycle.addProbe(
   ),
 )
 
-// 6. The chains. One `ChainService` each, constructed now and started below — construction is pure
-//    wiring and cannot fail on a network, so it happens before anything is listening.
+// 6a. Identity and mining tickets, when an operator configured them. Both are optional and null is a
+//     supported, tested mode — see `env.ts`. Constructed before the chains because a chain's browser
+//     transport is switched on by being handed the redeemer, and constructing the `Verifier` costs
+//     nothing: `createRemoteJWKSet` does not fetch until the first verification, so a JWKS that is
+//     down at boot delays the first ticket rather than the process.
+const tickets = env.identity === null ? null : new TicketStore()
+const verifier = env.identity === null ? null : new Verifier(env.identity)
+logger.info('browser mining', {
+  // Stated at boot either way, so an operator who expected browser mining and got none finds out
+  // from the first ten lines of the log rather than from a page that will not connect.
+  enabled: tickets !== null,
+  // Whether an endpoint is ADVERTISED is a separate fact from whether one is served, and the two
+  // being different is a real (if quiet) configuration: the transport works for anybody who knows
+  // the URL, and `GET /v1/pool` reports null because nobody published one.
+  advertised: env.websocketPublicOrigin !== null,
+})
+
+// 6b. The chains. One `ChainService` each, constructed now and started below — construction is pure
+//     wiring and cannot fail on a network, so it happens before anything is listening.
 //
-//    The abort controller is what stops every template loop at shutdown. It is aborted from a
-//    shutdown hook rather than from a signal handler directly, so the ordering below governs it.
+//     The abort controller is what stops every template loop at shutdown. It is aborted from a
+//     shutdown hook rather than from a signal handler directly, so the ordering below governs it.
 const chainsAbort = new AbortController()
 const chains = env.chains.map(
   (config) =>
@@ -121,6 +141,13 @@ const chains = env.chains.map(
       // Composed here, where the environment already is, so that `chainservice.ts` needs nothing
       // from `env.ts` but its types. Null unless an operator published both halves.
       stratumEndpoint: stratumEndpointOf(env.stratumPublicHost, config),
+      // Likewise composed here: the origin an operator published plus the path this service owns.
+      // `wsstratum.ts` holds the path, so the two cannot drift.
+      websocketEndpoint: websocketEndpointOf(env.websocketPublicOrigin, config.chain),
+      // Undefined unless identity is configured, and that absence is what keeps the browser
+      // transport off entirely — no ticket redeemer, no `attachWebSocket`, no browser difficulty
+      // band. Raw TCP is identical in both modes.
+      redeemTicket: tickets === null ? undefined : (secret) => tickets.redeem(secret),
       coinbaseTag: env.coinbaseTag,
       pplnsMultiplier: env.pplnsMultiplier,
       templatePollMs: env.templatePollMs,
@@ -174,6 +201,29 @@ const server = createServer({
     metrics.set('jobs_pending', stats.pending)
     metrics.set('jobs_overdue', stats.overdue)
   },
+  browserMining:
+    verifier === null || tickets === null
+      ? undefined
+      : {
+          principal: (token) => verifier.principal(token),
+          mint: (identity) => tickets.mint(identity),
+        },
+})
+
+// 7b. The WebSocket transport, on the HTTP server that was just built and before it listens.
+//
+//     Attached unconditionally, because refusing an upgrade needs a listener to refuse it: with no
+//     `upgrade` handler Node closes the socket with no status at all, and a browser is then told
+//     only that the connection failed. A pool with no identity configured answers 503 with a reason
+//     here, which is the same answer `POST /v1/pool/ticket` gives and is one a page can display.
+//
+//     `resolve` is consulted per upgrade rather than captured, so a chain that is not yet ready —
+//     its node still starting beside us — refuses browsers exactly as it refuses to hand out work,
+//     and starts serving them the moment it comes up without anything being re-registered.
+attachStratumWebSocket({
+  server,
+  resolve: (chain) => chains.find((service) => service.chain === chain) ?? null,
+  log: (level, message, fields) => logger[level](message, fields),
 })
 
 // 8. The job runner. Background work is claimed under a lease, so a replica that is draining stops
@@ -275,6 +325,12 @@ lifecycle.onShutdown(async () => {
   // and — the part that matters — flushes the buffered shares one final time. A miner disconnected
   // here reconnects elsewhere in seconds; a share dropped here is work somebody did that nobody
   // has a record of.
+  //
+  // It is also what lets the HTTP hook below finish. Node stops tracking a socket's lifetime once an
+  // `upgrade` handler has hijacked it, so `server.close()` does not call back while a browser miner
+  // is still connected — however that browser goes away. Destroying the wires from this side, before
+  // the HTTP server is asked to close, is what makes the shutdown bounded rather than a wait on the
+  // drain timeout.
   chainsAbort.abort()
   for (const chain of chains) await chain.stop()
   logger.info('stratum listeners closed and shares flushed')

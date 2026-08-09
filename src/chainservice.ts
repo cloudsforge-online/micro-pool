@@ -40,13 +40,13 @@
 
 import { JobRegistry } from './work.ts'
 import { NodeRpc, NodeUnavailableError } from './rpc.ts'
-import { StratumServer } from './stratum.ts'
-import { DEFAULT_VARDIFF, type VardiffOptions } from './vardiff.ts'
+import { StratumServer, type Wire } from './stratum.ts'
+import { browserInitialDifficulty, browserVardiff, DEFAULT_VARDIFF, type VardiffOptions } from './vardiff.ts'
 import { assertNodeNetwork, payoutScriptFor, TemplateSource, type BlockTemplate } from './template.ts'
 import { submitFoundBlock } from './blocks.ts'
 import { insertShares, upsertWorker, type Exec } from './store.ts'
 import { algorithmFor, nameFor } from './chains.ts'
-import { networkDifficultyOf } from './pow.ts'
+import { hashesPerDifficulty, networkDifficultyOf } from './pow.ts'
 import { EXTRANONCE2_BYTES } from './stratum.ts'
 import type { AcceptedShare } from './session.ts'
 // Types only, and that matters: `env.ts` validates eagerly and calls `process.exit(1)` on a bad
@@ -72,6 +72,23 @@ export interface ChainServiceDeps {
    * `POOL_<CHAIN>_STRATUM_PUBLIC_PORT`, and `null` whenever an operator has published neither.
    */
   readonly stratumEndpoint: StratumEndpoint | null
+  /**
+   * The complete URL a BROWSER dials for this chain, or `null` when nobody has published an origin.
+   *
+   * Composed by the caller from `POOL_WEBSOCKET_PUBLIC_ORIGIN` and this service's own path, for the
+   * same reason `stratumEndpoint` is: this process cannot observe the name it is reached at, and
+   * inventing one is the defect micro-org#285 records. Advertised, not used — the transport answers
+   * on whatever address actually reaches it, and this string is only what `GET /v1/pool` reports.
+   */
+  readonly websocketEndpoint: string | null
+  /**
+   * Spend a browser mining ticket, or `undefined` when this deployment has no identity configured.
+   *
+   * Its presence is what turns browser mining on for this chain: `StratumServer` builds its `browser`
+   * block only when a redeemer exists, `attachWebSocket` refuses without one, and the difficulty band
+   * below moves only for connections that arrive through it. Raw TCP never sees any of it.
+   */
+  readonly redeemTicket?: ((secret: string) => { account: string; worker: string } | null) | undefined
   readonly coinbaseTag: string
   readonly pplnsMultiplier: number
   readonly templatePollMs: number
@@ -98,6 +115,12 @@ export interface ChainStatus {
    * composing a connection string out of the bind, which is the defect micro-org#285 records.
    */
   readonly stratumEndpoint: StratumEndpoint | null
+  /**
+   * What to pass to `new WebSocket(...)` to mine this chain in a browser, or `null` when this
+   * deployment publishes no origin or serves no browsers. One complete URL with nothing for a
+   * consumer to assemble — which is the whole lesson of micro-org#285.
+   */
+  readonly websocketEndpoint: string | null
   readonly connections: number
   readonly height: number | null
   readonly networkDifficulty: number | null
@@ -184,6 +207,14 @@ export class ChainService {
       extranonce2Size: EXTRANONCE2_BYTES,
     })
 
+    // The browser band, computed once and only when there is a browser to serve. It is a different
+    // START and a different FLOOR from the hardware one, not a different algorithm: `vardiff.ts` has
+    // the arithmetic, and the short version is that pure-JS scrypt does a few hundred hashes a second
+    // where an ASIC does terahashes, so a browser at the hardware floor produces no share at all and
+    // is indistinguishable from a miner that is broken.
+    const redeemTicket = deps.redeemTicket
+    const perDifficulty = hashesPerDifficulty(algorithmFor(chain))
+
     this.#stratum = new StratumServer({
       chain,
       algorithm: algorithmFor(chain),
@@ -192,6 +223,14 @@ export class ChainService {
       port: deps.config.stratumPort,
       initialDifficulty: deps.config.initialDifficulty,
       vardiff: this.#vardiff,
+      browser:
+        redeemTicket === undefined
+          ? undefined
+          : {
+              initialDifficulty: browserInitialDifficulty(perDifficulty),
+              vardiff: browserVardiff(this.#vardiff, perDifficulty),
+              redeemTicket,
+            },
       persistShares: (shares) => this.#persistShares(shares),
       onBlock: (block) => {
         this.#deps.metrics.increment('pool_shares_total', { chain, outcome: 'block' })
@@ -251,6 +290,20 @@ export class ChainService {
     return this.#source.current !== null && !this.#source.isStale()
   }
 
+  /**
+   * Take a connection that arrived as a WebSocket upgrade on the HTTP port, or refuse it.
+   *
+   * Delegated rather than exposing the listener, so `wsstratum.ts` depends on a two-line structural
+   * interface and not on `StratumServer`. Refused — false — when this chain serves no browsers, is
+   * shutting down, or has no fresh template: a browser handed an accepted connection and then no job
+   * shows a miner that has started and is doing nothing, which is a worse answer than a refused
+   * upgrade the page can retry.
+   */
+  attachWebSocket(wire: Wire): boolean {
+    if (!this.ready) return false
+    return this.#stratum.attachWebSocket(wire)
+  }
+
   status(): ChainStatus {
     const chain = this.#deps.config.chain
     const template = this.#source.current
@@ -260,6 +313,11 @@ export class ChainService {
       algorithm: algorithmFor(chain),
       stratumPort: this.#deps.config.stratumPort,
       stratumEndpoint: this.#deps.stratumEndpoint,
+      // Reported only if a browser dialling it would actually be served. `env.ts` already refuses a
+      // published origin with no identity configured, so this second condition should be
+      // unreachable — it is here because the failure it prevents is the exact one micro-org#285 is
+      // about, and the cost of it being belt and braces is one boolean.
+      websocketEndpoint: this.#stratum.servesBrowsers ? this.#deps.websocketEndpoint : null,
       connections: this.#stratum.connectionCount,
       height: template?.height ?? null,
       networkDifficulty: template ? networkDifficultyOf(algorithmFor(chain), template.blockTarget) : null,

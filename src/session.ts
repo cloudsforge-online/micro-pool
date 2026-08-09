@@ -78,6 +78,18 @@ export interface SessionDeps {
   readonly onBlock: (block: FoundBlock) => void
   /** Counters. Kept as a callback so `telemetry` does not have to exist to test this file. */
   readonly onOutcome?: ((outcome: 'accepted' | 'rejected', code: number | null) => void) | undefined
+  /**
+   * Spend a mining ticket presented in the `mining.authorize` password field, or refuse it.
+   *
+   * **Present only on the WebSocket transport, and mandatory there.** Its presence is what switches
+   * `#authorize` from "the username is the identity" to "the ticket is the identity"; its absence is
+   * raw TCP, unchanged. There is no third mode, and in particular there is no transport on which a
+   * ticket is optional — a connection that could authorise either way would let a browser choose to
+   * mine as somebody else's payout address by typing it.
+   *
+   * The function returns the account and worker labels. It does not take them.
+   */
+  readonly redeemTicket?: ((secret: string) => { account: string; worker: string } | null) | undefined
 }
 
 /**
@@ -234,8 +246,28 @@ export class Session {
    *
    * The username splits on the first dot: `account.worker`. A username with no dot is an account
    * with a single unnamed worker.
+   *
+   * ## On the WebSocket transport it is the other way round, and that is not an inconsistency
+   *
+   * When `redeemTicket` is present — which is only ever on the browser transport — the password is
+   * the identity and the USERNAME is ignored. The reversal is forced by what the two transports can
+   * prove. A raw TCP miner has no estate account and cannot be asked for one; their username is a
+   * payout address they chose, and the pool takes their word for it because there is nothing else to
+   * take. A browser miner has just presented an estate access token to `POST /v1/pool/ticket` and
+   * been handed a value that names an account this service minted, so taking their word for anything
+   * would be strictly worse information.
+   *
+   * **The password is still never read as a password, never stored and never logged.** It is looked
+   * up by equality in an in-memory map and then forgotten, and it appears in no error message: a
+   * failure says the ticket was refused and does not repeat the value, because a refusal is the log
+   * line anything on the internet can make this process write.
    */
   #authorize(id: number | string | null, params: readonly unknown[]): void {
+    const redeem = this.#deps.redeemTicket
+    if (redeem !== undefined) {
+      this.#authorizeWithTicket(id, params, redeem)
+      return
+    }
     const username = typeof params[0] === 'string' ? params[0].trim() : ''
     if (username === '') {
       this.#deps.send({ id, result: false, error: [STRATUM_ERROR.UNAUTHORIZED, 'a worker name is required', null] })
@@ -252,6 +284,44 @@ export class Session {
     }
     this.#account = parsed.account
     this.#worker = parsed.worker
+    this.#completeAuthorize(id)
+  }
+
+  /**
+   * `mining.authorize` on the browser transport: the password is a ticket and nothing else is read.
+   *
+   * Refusal is one message for every cause — no ticket, an unknown one, an expired one, one already
+   * spent. `tickets.ts` gives the reason: distinguishing them would let anybody holding a candidate
+   * value learn whether it was ever real, and an honest client does the same thing in all four cases,
+   * which is ask for another ticket.
+   */
+  #authorizeWithTicket(
+    id: number | string | null,
+    params: readonly unknown[],
+    redeem: (secret: string) => { account: string; worker: string } | null,
+  ): void {
+    const presented = typeof params[1] === 'string' ? params[1].trim() : ''
+    const redeemed = presented === '' ? null : redeem(presented)
+    if (redeemed === null) {
+      this.#deps.send({
+        id,
+        result: false,
+        error: [
+          STRATUM_ERROR.UNAUTHORIZED,
+          // Says what to do and repeats nothing that was presented.
+          'a mining ticket is required — get one from POST /v1/pool/ticket and send it as the password',
+          null,
+        ],
+      })
+      return
+    }
+    this.#account = redeemed.account
+    this.#worker = redeemed.worker
+    this.#completeAuthorize(id)
+  }
+
+  /** The tail both authorisation paths share: say yes, set a difficulty, then hand out work. */
+  #completeAuthorize(id: number | string | null): void {
     this.#deps.send({ id, result: true, error: null })
 
     // Difficulty first, then work. A miner that receives a job before it has been told a difficulty

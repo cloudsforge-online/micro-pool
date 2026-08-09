@@ -6,6 +6,21 @@
  * TCP, which is why the listener is a separate port from the HTTP one and why nothing
  * authentication-shaped happens on it.
  *
+ * ## There are now two transports, and only one of them is in this file
+ *
+ * micro-org#289 added Stratum v1 over WebSocket, on the HTTP port, for a browser miner. That
+ * transport is `wsstratum.ts` and `wsframe.ts`; **the protocol is not forked**. Both transports end
+ * up in `#attach` below, building the same `Session` against the same registry and the same
+ * validation, and the only thing either of them does is turn bytes into lines and lines back into
+ * bytes. `Wire` is the seam: a thing that carries lines, is either a `net.Socket` or a
+ * `WsConnection`, and is not asked which.
+ *
+ * **Raw TCP behaviour is unchanged by that addition.** A miner on the stratum port still gets a
+ * free-text username, no account, no authentication and the hardware difficulty band, exactly as
+ * before. Everything that is different for a browser — a redeemed ticket instead of a username, a
+ * difficulty floor set for JavaScript rather than for silicon — arrives through the optional
+ * `browser` block below and is reachable only from `attachWebSocket`.
+ *
  * ## What this file guards against, which a naive `data` handler does not
  *
  *   - **A line that never ends.** A peer can send bytes forever with no newline in them. Without a
@@ -34,9 +49,10 @@
 
 import { createServer, type Server, type Socket } from 'node:net'
 import { randomBytes } from 'node:crypto'
-import { Session, type AcceptedShare, type FoundBlock, type OutgoingMessage } from './session.ts'
+import { Session, type AcceptedShare, type FoundBlock } from './session.ts'
 import type { JobRegistry, Job } from './work.ts'
 import type { VardiffOptions } from './vardiff.ts'
+import type { RedeemedTicket } from './tickets.ts'
 import type { PoolChainId, PowAlgorithm } from './chains.ts'
 
 /** Longest line accepted. A `mining.submit` is around 200 bytes; this is two orders of magnitude up. */
@@ -47,6 +63,46 @@ const MAX_WRITE_BUFFER = 1024 * 1024
 const EXTRANONCE1_BYTES = 4
 export const EXTRANONCE2_BYTES = 4
 
+/**
+ * Something that carries stratum lines. A `net.Socket` and a WebSocket both are one.
+ *
+ * Deliberately not `net.Socket` and deliberately not an `EventEmitter`: this is the entire contract
+ * between a transport and the protocol, it is four methods and two properties, and writing it down
+ * is what makes it impossible for the second transport to grow behaviour the first does not have.
+ * `wsframe.ts`'s `WsConnection` satisfies it structurally, as does the adapter around `net.Socket`
+ * below — neither implements an interface by name, so neither can drift from it silently.
+ */
+export interface Wire {
+  readonly destroyed: boolean
+  /** Bytes queued but not yet flushed. `broadcast` drops a connection that stops draining. */
+  readonly writableLength: number
+  /** One line, newline included. */
+  write(line: string): void
+  destroy(): void
+  onData(handler: (chunk: string) => void): void
+  onClose(handler: () => void): void
+}
+
+/**
+ * What differs for a connection arriving over WebSocket. Absent means this pool serves browsers not
+ * at all, which is the default and the only mode raw TCP has ever known.
+ */
+export interface BrowserTransportOptions {
+  /**
+   * Where a browser connection starts, which is nowhere near where a rig starts. `vardiff.ts` has
+   * the arithmetic: at Litecoin's hardware start of 512, one share is 37 hours of pure-JS scrypt.
+   */
+  readonly initialDifficulty: number
+  /** The hardware band with its floor moved for the transport. See `browserVardiff`. */
+  readonly vardiff: VardiffOptions
+  /**
+   * Spend a mining ticket, or refuse. Mandatory on this transport — a WebSocket connection has no
+   * other way to name an account, and the label it mines under is this function's answer and never
+   * the client's claim.
+   */
+  readonly redeemTicket: (secret: string) => RedeemedTicket | null
+}
+
 export interface StratumServerOptions {
   readonly chain: PoolChainId
   readonly algorithm: PowAlgorithm
@@ -55,6 +111,8 @@ export interface StratumServerOptions {
   readonly port: number
   readonly initialDifficulty: number
   readonly vardiff: VardiffOptions
+  /** Present only when an operator has configured identity; see `env.ts` and `index.ts`. */
+  readonly browser?: BrowserTransportOptions | undefined
   readonly flushIntervalMs?: number
   /**
    * How long a connection may stay silent before it is closed. Defaults to `HANDSHAKE_TIMEOUT_MS`.
@@ -76,11 +134,48 @@ export interface StratumServerOptions {
 }
 
 interface Connection {
-  readonly socket: Socket
+  readonly wire: Wire
   readonly session: Session
   readonly extranonce1: Buffer
   buffer: string
   handshakeTimer: NodeJS.Timeout | null
+}
+
+/**
+ * A `net.Socket` seen as a `Wire`.
+ *
+ * The encoding and the two socket-level timers are set here rather than by the caller so that the
+ * TCP transport's whole shape is in one place. `setEncoding('utf8')` is what makes `data` a string
+ * on this path and matches what the WebSocket transport delivers, so the line splitter above sees
+ * one kind of chunk.
+ */
+function socketWire(socket: Socket): Wire {
+  // Nagle's algorithm batches small writes, and every message in this protocol is a small write.
+  // Left on, a `mining.notify` can sit in the kernel for tens of milliseconds after a new block —
+  // which is exactly the interval in which every share being computed is already worthless.
+  socket.setNoDelay(true)
+  socket.setTimeout(IDLE_TIMEOUT_MS)
+  socket.setEncoding('utf8')
+  socket.on('timeout', () => socket.destroy())
+  socket.on('error', () => socket.destroy())
+  return {
+    get destroyed() {
+      return socket.destroyed
+    },
+    get writableLength() {
+      return socket.writableLength
+    },
+    write: (line) => {
+      if (!socket.destroyed) socket.write(line)
+    },
+    destroy: () => socket.destroy(),
+    onData: (handler) => {
+      socket.on('data', (chunk: string | Buffer) => handler(typeof chunk === 'string' ? chunk : chunk.toString('utf8')))
+    },
+    onClose: (handler) => {
+      socket.on('close', handler)
+    },
+  }
 }
 
 export class StratumServer {
@@ -132,25 +227,44 @@ export class StratumServer {
     })
   }
 
+  /** Whether this chain will accept a browser. False unless the deploy configured identity. */
+  get servesBrowsers(): boolean {
+    return this.#options.browser !== undefined
+  }
+
   /** Push a job to every authorised connection. The fan-out `mining.notify` exists for. */
   broadcast(job: Job, cleanJobs: boolean): void {
     for (const connection of this.#connections) {
-      if (connection.socket.writableLength > MAX_WRITE_BUFFER) {
+      if (connection.wire.writableLength > MAX_WRITE_BUFFER) {
         // The peer has stopped reading. Feeding it more is how one dead miner becomes the pool's
         // memory ceiling.
         this.#options.log('warn', 'dropping a connection that is not draining', { chain: this.chain })
-        connection.socket.destroy()
+        connection.wire.destroy()
         continue
       }
       connection.session.pushJob(job, cleanJobs)
     }
   }
 
+  /**
+   * Take a connection that arrived over WebSocket.
+   *
+   * Returns false when this chain serves no browsers, which is not an error: identity is optional
+   * configuration and a pool run by somebody with no estate at all is the ordinary case. The caller
+   * turns that into a refused upgrade rather than a socket that connects and then says nothing.
+   */
+  attachWebSocket(wire: Wire): boolean {
+    const browser = this.#options.browser
+    if (browser === undefined || this.#closing) return false
+    this.#attach(wire, browser)
+    return true
+  }
+
   async close(): Promise<void> {
     this.#closing = true
     if (this.#flushTimer) clearTimeout(this.#flushTimer)
     this.#flushTimer = null
-    for (const connection of this.#connections) connection.socket.destroy()
+    for (const connection of this.#connections) connection.wire.destroy()
     this.#connections.clear()
     const server = this.#server
     if (server) {
@@ -198,15 +312,22 @@ export class StratumServer {
       socket.destroy()
       return
     }
-    // Nagle's algorithm batches small writes, and every message in this protocol is a small write.
-    // Left on, a `mining.notify` can sit in the kernel for tens of milliseconds after a new block —
-    // which is exactly the interval in which every share being computed is already worthless.
-    socket.setNoDelay(true)
-    socket.setTimeout(IDLE_TIMEOUT_MS)
+    // No browser options: a raw TCP miner authorises with a username exactly as it always has.
+    this.#attach(socketWire(socket), undefined)
+  }
 
+  /**
+   * Build one session on one wire. The single place a connection comes into existence.
+   *
+   * Both transports arrive here, which is the point: the handshake timeout, the extranonce
+   * allocation, the line splitting, the share buffering and the teardown are one implementation, and
+   * a change to any of them cannot apply to one transport and not the other.
+   */
+  #attach(wire: Wire, browser: BrowserTransportOptions | undefined): void {
     const extranonce1 = this.#allocateExtranonce1()
+    const vardiff = browser?.vardiff ?? this.#options.vardiff
     const connection: Connection = {
-      socket,
+      wire,
       extranonce1,
       buffer: '',
       handshakeTimer: null,
@@ -216,29 +337,29 @@ export class StratumServer {
         registry: this.#options.registry,
         extranonce1,
         extranonce2Size: EXTRANONCE2_BYTES,
-        initialDifficulty: this.#options.initialDifficulty,
-        minDifficulty: this.#options.vardiff.minDifficulty,
-        maxDifficulty: this.#options.vardiff.maxDifficulty,
-        vardiff: this.#options.vardiff,
+        initialDifficulty: browser?.initialDifficulty ?? this.#options.initialDifficulty,
+        minDifficulty: vardiff.minDifficulty,
+        maxDifficulty: vardiff.maxDifficulty,
+        vardiff,
         now: this.#now,
-        send: (message) => this.#send(socket, message),
+        send: (message) => wire.write(`${JSON.stringify(message)}\n`),
         onAcceptedShare: (share) => this.#pending.push(share),
         onBlock: (block) => this.#options.onBlock(block),
         onOutcome: this.#options.onOutcome,
+        // Undefined on raw TCP, which is what keeps that path byte-for-byte what it was: a session
+        // with no redeemer reads the username and ignores the password, exactly as before.
+        redeemTicket: browser?.redeemTicket,
       }),
     }
     this.#connections.add(connection)
 
     connection.handshakeTimer = setTimeout(() => {
-      if (!connection.session.authorised) socket.destroy()
+      if (!connection.session.authorised) wire.destroy()
     }, this.#options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS)
     connection.handshakeTimer.unref?.()
 
-    socket.setEncoding('utf8')
-    socket.on('data', (chunk: string) => this.#onData(connection, chunk))
-    socket.on('timeout', () => socket.destroy())
-    socket.on('error', () => socket.destroy())
-    socket.on('close', () => {
+    wire.onData((chunk) => this.#onData(connection, chunk))
+    wire.onClose(() => {
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer)
       this.#extranonces.delete(extranonce1.toString('hex'))
       this.#connections.delete(connection)
@@ -270,7 +391,7 @@ export class StratumServer {
     connection.buffer += chunk
     if (connection.buffer.length > MAX_LINE_BYTES) {
       this.#options.log('warn', 'closing a connection that sent an oversized line', { chain: this.chain })
-      connection.socket.destroy()
+      connection.wire.destroy()
       return
     }
 
@@ -290,11 +411,11 @@ export class StratumServer {
     } catch {
       // Not JSON at all — a port scan, a browser, a miner pointed at the wrong port. There is no id
       // to answer to, so there is nothing to say.
-      connection.socket.destroy()
+      connection.wire.destroy()
       return
     }
     if (typeof parsed !== 'object' || parsed === null) {
-      connection.socket.destroy()
+      connection.wire.destroy()
       return
     }
     const message = parsed as { id?: unknown; method?: unknown; params?: unknown }
@@ -314,12 +435,7 @@ export class StratumServer {
         method: message.method,
         err: String(err),
       })
-      connection.socket.destroy()
+      connection.wire.destroy()
     }
-  }
-
-  #send(socket: Socket, message: OutgoingMessage): void {
-    if (socket.destroyed) return
-    socket.write(`${JSON.stringify(message)}\n`)
   }
 }
