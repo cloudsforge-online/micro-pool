@@ -212,6 +212,44 @@ export function coinbaseTxId(coinbase: Buffer): Buffer {
 }
 
 /**
+ * The scriptSig of the coinbase's one input, read back out of the assembled bytes.
+ *
+ * ## Why this is read back rather than reassembled from `CoinbaseParts`
+ *
+ * The pool knows what it put in `coinb1` and `coinb2`, so it could concatenate those with the
+ * miner's extranonce and skip the parsing. It does not, for the same reason
+ * `witnessSerialisedCoinbase` splices rather than rebuilds: the caller is
+ * `CAuxPow::check`'s counterpart, and what `check` will search is **the bytes that were actually
+ * hashed**. A reassembly that agreed with those bytes every time except once would be a pool that
+ * submits a merged-mining proof against a coinbase it did not really build, and the one occasion it
+ * disagreed is the only occasion anybody would find out.
+ *
+ * ## Why the length is a single byte, and why that is asserted rather than assumed
+ *
+ * `buildCoinbase` refuses a scriptSig above `MAX_SCRIPT_SIG_BYTES`, which is consensus's 100, so the
+ * compact size in front of it is always one byte below 0xfd. A coinbase reaching here with a wider
+ * one did not come from this pool, and guessing at it would be a parser inventing a transaction
+ * layout to explain bytes it should be refusing.
+ */
+export function coinbaseScriptSig(coinbase: Buffer): Buffer {
+  // version(4) || input count(1) || prevout hash(32) || prevout index(4) || scriptSig length(1)
+  if (coinbase.length < 42) throw new RangeError('this is not a serialised transaction')
+  if (coinbase.readUInt8(4) !== 1) {
+    throw new RangeError(`a coinbase has exactly one input; this one declares ${coinbase.readUInt8(4)}`)
+  }
+  const at = 4 + 1 + 32 + 4
+  const length = coinbase.readUInt8(at)
+  if (length > MAX_SCRIPT_SIG_BYTES) {
+    throw new RangeError(`the coinbase scriptSig declares ${length} bytes; consensus allows ${MAX_SCRIPT_SIG_BYTES}`)
+  }
+  const script = coinbase.subarray(at + 1, at + 1 + length)
+  if (script.length !== length) {
+    throw new RangeError(`the coinbase declares a ${length}-byte scriptSig and carries ${script.length}`)
+  }
+  return script
+}
+
+/**
  * The coinbase again, this time with the segwit marker, flag and witness stack, for `submitblock`.
  *
  * A block that carries a witness commitment output must have a coinbase with exactly one witness

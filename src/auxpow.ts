@@ -52,10 +52,20 @@
  * and the block is refused. The scriptSig also carries the miner's extranonce, which this pool does
  * not choose — so a miner submitting the four bytes `fa be 6d 6d` as its extranonce2, or straddling
  * that pattern across the extranonce boundary, would produce a Litecoin block that is perfectly
- * valid and a Dogecoin block that consensus throws away. `hasSingleCommitment` is the check for it
- * and `session.ts` refuses such a share outright when merged mining is on: an honest counter reaches
- * that value once in 2^32 increments of a per-job counter, i.e. never, and a miner that sends it
- * deliberately is spending nothing to destroy the most valuable submission the pool can receive.
+ * valid and a Dogecoin block that consensus throws away. `hasSingleCommitment` and
+ * `magicOccurrences` are the checks for it.
+ *
+ * **The share is still accepted for Litecoin.** This paragraph said the opposite until the
+ * arithmetic was done, and the old reasoning — "a miner that sends it deliberately is spending
+ * nothing to destroy the most valuable submission the pool can receive" — is recorded here because
+ * it is half right and the half it is wrong about is the half that decides. An adversary sending the
+ * pattern deliberately loses nothing whether the share is rejected or merely disqualified from the
+ * merged half, so refusing it deters nobody. What refusing it does cost is an HONEST miner's credit
+ * for real Litecoin work: a rig steps through only a few dozen extranonce2 values per ten-second
+ * job, so at 2^-32 per value a pool of a thousand of them trips it roughly once every couple of
+ * years — rare, but not never, and the miner whose share is thrown away did nothing wrong. So
+ * `validate.ts` reports it as `AuxShareOutcome.spoiled`: the parent share stands, the merged half is
+ * lost, and the event is loud enough for an operator to see it happen.
  */
 
 import { hashToDisplay } from './bytes.ts'
