@@ -158,6 +158,70 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 4,
+    name: 'block-maturity',
+    /*
+     * ═══ `submit_status` IS WHAT THE NODE SAID ONCE. THIS IS WHETHER IT STAYED TRUE ═════════════
+     *
+     * Migration 2 above records `submit_status` and says what it is for: "What the node said when
+     * the block was submitted". Nothing re-read it afterwards, and micro-org#302 is the defect that
+     * follows from that — a coinbase is unspendable for 100 blocks on both chains and a block can be
+     * orphaned well inside that window, so `accepted` means the node took the block, not that the
+     * block is in the chain. Paying against `accepted` alone pays money that does not exist.
+     *
+     * The columns below are a SECOND fact beside the first rather than a correction of it. Nothing
+     * overwrites `submit_status`, because the node's verbatim verdict at submission time is the most
+     * useful diagnostic this service produces and a row that had been edited to say `orphaned` would
+     * have lost it. `maturity_status` answers a different question — is this block on the active
+     * chain at spendable depth — and `maturity.ts` is the only thing that writes it.
+     *
+     * ## Why the default is `pending` and why that is the safe direction
+     *
+     * Every block already on file becomes `pending` and is therefore NOT payable, including blocks
+     * the pool found months ago that have been buried since. The watcher re-reads each one against
+     * the node and promotes it. The reverse default — assuming an old accepted block matured —
+     * would have made the back-fill itself the payment decision, which is exactly the conflation
+     * this migration exists to undo.
+     *
+     * ## Blocks the node REFUSED are back-filled `orphaned`, not left `pending`
+     *
+     * A block `submitblock` rejected never entered the chain and never will, so it is not waiting
+     * for anything; leaving it `pending` would put a permanent row in the watcher's queue and in
+     * every "still maturing" count an operator reads. `orphaned` is literally accurate for it — not
+     * on the active chain — and the reason it is not on the active chain is preserved unchanged in
+     * `submit_status` and `submit_detail` beside it.
+     */
+    up: `
+      alter table pool_blocks
+        add column if not exists maturity_status      text not null default 'pending',
+        add column if not exists confirmations        integer,
+        add column if not exists maturity_detail      text,
+        add column if not exists maturity_checked_at  timestamptz,
+        add column if not exists matured_at           timestamptz;
+
+      -- Three values and no more. A payout path reads 'matured' and nothing else, so a fourth
+      -- spelling introduced later by a typo would be a block that is silently never paid; the
+      -- constraint turns that into a failed write at the moment it is made.
+      alter table pool_blocks
+        drop constraint if exists pool_blocks_maturity_ck;
+      alter table pool_blocks
+        add constraint pool_blocks_maturity_ck
+        check (maturity_status in ('pending', 'matured', 'orphaned'));
+
+      update pool_blocks
+         set maturity_status = 'orphaned',
+             maturity_detail = 'the node refused this block at submission; it was never on the chain'
+       where submit_status <> 'accepted' and maturity_status = 'pending';
+
+      -- The watcher's access path: the pending blocks of one chain, oldest first. Partial, because
+      -- the rows it excludes are the overwhelming majority once a pool has been running a while and
+      -- they are never selected by this query again.
+      create index if not exists pool_blocks_pending_maturity_idx
+        on pool_blocks (chain, found_at)
+        where maturity_status = 'pending';
+    `,
+  },
 ]
 
 /**

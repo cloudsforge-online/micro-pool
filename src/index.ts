@@ -256,8 +256,14 @@ const runner = new JobRunner({
 registerHandlers(runner, {
   sql: sql as unknown as Exec,
   logger,
+  metrics,
   chains: chainIds,
   retentionDays: env.shareRetentionDays,
+  // The same node client the templater and the block submission use, taken off the ChainService
+  // rather than constructed again. `chainservice.ts` says why the identity of the node matters for a
+  // maturity verdict, and it is not a detail: a second client pointed at a second node would answer
+  // about a different chain of blocks.
+  rpcFor: (chain) => chains.find((service) => service.chain === chain)?.node ?? null,
 })
 await seedRecurring(queue, chainIds)
 runner.start()

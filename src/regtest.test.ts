@@ -45,6 +45,7 @@ import { coinbaseTxId } from './coinbase.ts'
 import { meetsTarget, powHash, sha256d } from './pow.ts'
 import { NodeRpc, NodeRpcError } from './rpc.ts'
 import { payoutScriptFor, TemplateSource } from './template.ts'
+import { COINBASE_MATURITY, inspectBlock } from './maturity.ts'
 
 /**
  * The node this runs against, credential and all, or nothing — in which case every test here skips.
@@ -268,4 +269,68 @@ test('the pool mines a block a real litecoind accepts', { skip }, async () => {
   } finally {
     controller.abort()
   }
+})
+
+/* ------------------------------------------------------------------ the maturity watcher, against a real reorg */
+
+test('a real reorg is what `inspectBlock` calls orphaned, and 100 real confirmations is what it calls matured', { skip }, async () => {
+  /*
+   * `maturity.test.ts` fakes every one of these replies, and a fake reply is a claim about Core that
+   * this repository wrote down itself. Two of those claims are load-bearing and neither is obvious:
+   *
+   *   1. A block Core still holds but that is not on the active chain reports `confirmations: -1`.
+   *      Not absent, not zero, not an error. Everything in `maturity.ts` that detects an orphan at
+   *      all rests on that number, and if a Litecoin release changed it the unit tests would keep
+   *      passing while the watcher silently declared every orphan pending for ever.
+   *   2. `confirmations = tip - height + 1`, so a block needs exactly 100 of them to be spendable in
+   *      the next block. The unit test pins 99 against 100 on arithmetic this file also wrote.
+   *
+   * `invalidateblock` is the only way to produce a reorg on demand. It is a regtest-only move in
+   * practice and this file is the only place in the repository that runs against a disposable node.
+   */
+  assert.notEqual(PAYOUT_ADDRESS, '', 'POOL_REGTEST_PAYOUT_ADDRESS must be set alongside the node URL')
+  const node = rpc()
+  const generate = async (count: number): Promise<string[]> =>
+    node.call<string[]>('generatetoaddress', [count, PAYOUT_ADDRESS], { retryable: false })
+
+  const before = await node.call<number>('getblockcount')
+  const height = before + 1
+  const [loser] = await generate(1)
+  assert.ok(loser, 'generatetoaddress produced no block')
+
+  // One deep and on the chain: pending, and pending is not payable.
+  const young = await inspectBlock(node, { chain: 'ltc', hash: loser, height })
+  assert.equal(young.status, 'pending')
+  assert.equal(young.confirmations, 1)
+
+  // The reorg. `invalidateblock` rolls the tip back to the parent and leaves the block in the index,
+  // which is exactly the state a block that lost a race is in.
+  await node.call('invalidateblock', [loser], { retryable: false })
+  assert.equal(await node.call<number>('getblockcount'), before, 'the tip did not roll back')
+
+  // A different block takes the height, so BOTH of the watcher's questions have an orphan answer:
+  // the confirmation count and the identity of the block at that height.
+  const [winner] = await generate(1)
+  assert.ok(winner && winner !== loser)
+  assert.equal(await node.call<string>('getblockhash', [height]), winner)
+
+  const verdict = await inspectBlock(node, { chain: 'ltc', hash: loser, height })
+  assert.equal(verdict.status, 'orphaned', `a re-organised block was called ${verdict.status}`)
+  // The claim `maturity.ts` is built on, measured against the node rather than asserted about it.
+  assert.equal(verdict.confirmations, -1, 'Core no longer reports -1 for a block off the active chain')
+
+  // And the other end of it. 99 confirmations is one short — the coinbase is spendable in the block
+  // at height+100, which needs the tip at height+99, which reports 100.
+  await generate(COINBASE_MATURITY.ltc - 2)
+  assert.equal(await node.call<number>('getblockcount'), height + COINBASE_MATURITY.ltc - 2)
+  const short = await inspectBlock(node, { chain: 'ltc', hash: winner, height })
+  assert.equal(short.confirmations, COINBASE_MATURITY.ltc - 1)
+  assert.equal(short.status, 'pending')
+
+  await generate(1)
+  const mature = await inspectBlock(node, { chain: 'ltc', hash: winner, height })
+  assert.equal(mature.confirmations, COINBASE_MATURITY.ltc)
+  assert.equal(mature.status, 'matured')
+
+  console.log(`regtest: orphaned ${loser} at height ${height} in favour of ${winner}, which then matured`)
 })

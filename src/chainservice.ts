@@ -153,6 +153,17 @@ export function registerPoolMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['chain', 'verdict'],
     })
+    .register({
+      // The counter an orphan shows up on. `pool_blocks_found_total` says what the node said at
+      // submission and cannot be revised; this one says what became of the block, and the two
+      // diverging is the whole of micro-org#302. `pending` is counted as well as the two terminal
+      // verdicts, because a sweep that only ever reports `pending` is a sweep whose node stopped
+      // answering, and that is invisible if only the transitions are counted.
+      name: 'pool_block_maturity_total',
+      help: 'Maturity verdicts on blocks this pool found, re-read against the node',
+      kind: 'counter',
+      labels: ['chain', 'status'],
+    })
     .register({ name: 'pool_connections', help: 'Live stratum connections', kind: 'gauge', labels: ['chain'] })
     .register({ name: 'pool_template_height', help: 'Height of the current template', kind: 'gauge', labels: ['chain'] })
     .register({
@@ -311,6 +322,20 @@ export class ChainService {
 
   get chain(): string {
     return this.#deps.config.chain
+  }
+
+  /**
+   * The node client this chain templates and submits against.
+   *
+   * Exposed for exactly one caller — the maturity sweep in `jobs.ts`, which re-reads recorded blocks
+   * to decide whether they survived. It is a getter rather than a second `NodeRpc` constructed
+   * beside it because the identity is the point: `rpc.ts` explains that there is one endpoint per
+   * chain and no failover, since two nodes can disagree about the tip, and a maturity verdict taken
+   * from a node other than the one that issued the template and took the submission would be a
+   * verdict about a different chain of blocks than the one this pool mined on.
+   */
+  get node(): NodeRpc {
+    return this.#rpc
   }
 
   /** Whether this chain can currently serve work. Read by `/readyz`. */

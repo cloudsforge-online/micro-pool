@@ -337,7 +337,9 @@ Blocks this pool found, newest first. `limit` defaults to 50 and is clamped at 2
       "reward": "625000000",
       "networkDifficulty": 41234567.89,
       "submitStatus": "accepted",
-      "submitDetail": null
+      "submitDetail": null,
+      "maturityStatus": "pending",
+      "confirmations": 37
     }
   ]
 }
@@ -352,9 +354,25 @@ this service has and a pool that showed only its accepted blocks would be concea
 miners must know about. `submitDetail` is the node's own words, and is **null when there is nothing
 to say** — an accepted block, ordinarily.
 
-**Nothing re-checks the verdict afterwards.** A coinbase is unspendable for 100 blocks and a block
-can be orphaned well inside that window, so `submitStatus: "accepted"` means the node took it, not
-that it survived. That gap is micro-org#302 and it is not fixed here.
+`maturityStatus` is the **second, later verdict, and it is the one that says whether the reward
+exists.** `submitStatus: "accepted"` only ever meant the node took the block onto its tip; a coinbase
+is unspendable for 100 blocks on both these chains and a block can be orphaned well inside that
+window. So a leased job (`pool.check-maturity`, every ten minutes) re-reads each recorded block by
+hash against the same node the templater uses, and moves the row to one of three states:
+
+| `maturityStatus` | Meaning |
+| --- | --- |
+| `pending` | On the chain but not 100 deep yet — **or** the node could not be asked. Not payable. |
+| `matured` | On the active chain at 100 confirmations or more. The only payable state. |
+| `orphaned` | The node holds this block and it is not on the active chain. Terminal. |
+
+Every block starts `pending` and only a positive answer from the node moves it, so an unreachable
+node delays a payment rather than inventing or destroying one. `confirmations` is the node's own
+count — **negative** for a block off the active chain, and `null` before the watcher has managed to
+ask. `submitStatus` is never rewritten: the two facts sit beside each other, because the submission
+verdict is the only thing separating "the coinbase was built wrongly" from "we lost a race".
+
+An orphan is logged at `error` and counted in `pool_block_maturity_total{status="orphaned"}`.
 
 ### `GET /v1/pool/workers?chain=<chain>&account=<account>`
 
@@ -512,6 +530,7 @@ and nothing else, and the handshake timeout closes it.
 | `src/validate.ts` | Rebuilding the header from a submission and judging it against the share target and the block target. |
 | `src/blocks.ts` | What happens when a share is a block, in the order it has to happen in. |
 | `src/pplns.ts` | The sliding window, and the integer allocation that makes the parts sum to the whole. |
+| `src/maturity.ts` | Re-reading a found block against the node: still on the chain, and 100 deep? |
 | `src/payouts.ts` | The seam. Not implemented — see the top of this file. |
 | `src/store.ts` | Every SQL statement, each scoped to one chain. |
 | `src/server.ts` | `node:http`. `/livez`, `/readyz`, `/metrics`, and the public read API. |

@@ -150,3 +150,42 @@ test('the account link stores no estate identity beyond the id, and no ticket', 
     assert.ok(!link.includes(forbidden), `the account link stores "${forbidden}"`)
   }
 })
+
+/* ------------------------------------------------ block maturity (micro-org#302) */
+
+test('MATURITY IS A NEW COLUMN SET, AND `submit_status` WAS NOT REPURPOSED', () => {
+  // The tempting shape was to widen `submit_status` with `matured` and `orphaned` values, and it is
+  // wrong: they answer different questions at different times. `submit_status` is the node's verbatim
+  // reply at the one moment it could be observed, and it is the only thing that separates "we built
+  // the coinbase wrongly" from "we lost a race". A status rewritten in place would have destroyed
+  // that evidence in exactly the case somebody needed it.
+  const maturity = MIGRATIONS.find((m) => m.version === 4)
+  assert.equal(maturity?.name, 'block-maturity')
+  const up = maturity?.up ?? ''
+  for (const column of ['maturity_status', 'confirmations', 'maturity_detail', 'maturity_checked_at', 'matured_at']) {
+    assert.match(up, new RegExp(`add column if not exists\\s+${column}\\b`), `${column} is missing`)
+  }
+  assert.ok(!/drop column/i.test(up), 'the maturity migration drops a column')
+  assert.ok(!/alter column\s+submit_status/i.test(up), 'the maturity migration rewrites the submission verdict')
+})
+
+test('A BLOCK NOBODY HAS CHECKED DEFAULTS TO PENDING, NOT TO MATURED', () => {
+  // The direction that costs nothing to be wrong about. `pending` is not payable, so the failure mode
+  // of a column defaulting the other way — every block already recorded silently becoming eligible
+  // the moment the column appeared — is not available.
+  const up = MIGRATIONS.find((m) => m.version === 4)?.up ?? ''
+  assert.match(up, /maturity_status\s+text not null default 'pending'/)
+  assert.match(up, /check \(maturity_status in \('pending', 'matured', 'orphaned'\)\)/)
+})
+
+test('THE BACK-FILL ONLY TOUCHES BLOCKS THE NODE ALREADY REFUSED', () => {
+  // A rejected block was never on the chain, so `orphaned` is a fact about it rather than a guess,
+  // and it is the one class of existing row a migration may settle without asking a node. Every
+  // accepted block stays `pending` until the watcher has actually re-read it — including the ones
+  // this pool found before the watcher existed.
+  const up = MIGRATIONS.find((m) => m.version === 4)?.up ?? ''
+  const update = up.slice(up.indexOf('update pool_blocks'))
+  assert.match(update, /set maturity_status = 'orphaned'/)
+  assert.match(update, /where submit_status <> 'accepted'/)
+  assert.ok(!/set maturity_status = 'matured'/.test(up), 'a migration declared a block matured')
+})

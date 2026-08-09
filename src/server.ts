@@ -418,6 +418,16 @@ function buildRoutes(): Route[] {
               // displayed its accepted blocks would be hiding the one failure miners must know about.
               submitStatus: block.submitStatus,
               submitDetail: block.submitDetail,
+              // What the node said LATER, which is a different claim from `submitStatus` and the one
+              // that decides whether the reward exists. `maturity.ts`: a submission the node accepted
+              // onto its tip can still lose a reorg well inside the 100-block coinbase maturity
+              // window, so this is published beside the submission verdict rather than replacing it.
+              // `pending` until the watcher has re-read the block, which is also the state of every
+              // block for the first four hours (Litecoin) after it is found.
+              maturityStatus: block.maturityStatus,
+              // The node's own count, and negative when the node holds the block but it is off the
+              // active chain. Null when the watcher has not managed to ask yet.
+              confirmations: block.confirmations,
             })),
           },
         }

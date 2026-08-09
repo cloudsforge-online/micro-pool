@@ -214,6 +214,105 @@ export async function recordBlock(exec: Exec, block: BlockInput): Promise<number
   return Number(row.id)
 }
 
+export interface MaturityCandidate {
+  readonly hash: string
+  readonly height: number
+}
+
+/**
+ * The blocks on one chain whose fate is still unknown, oldest first.
+ *
+ * **`submit_status = 'accepted'` is in the predicate and is not decoration.** A block the node
+ * refused was never on the chain and asking the node about it once every ten minutes for ever would
+ * be asking a question that has already been answered — migration 4 back-fills those rows to
+ * `orphaned` for the same reason. Oldest first because the oldest pending block is the one closest
+ * to maturing, so a capped sweep makes progress from the end that is about to move.
+ */
+export async function blocksAwaitingMaturity(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<MaturityCandidate[]> {
+  const rows = await exec<{ hash: string; height: number }[]>`
+    select hash, height
+    from pool_blocks
+    where chain = ${args.chain}
+      and maturity_status = 'pending'
+      and submit_status = 'accepted'
+    order by found_at
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({ hash: row.hash, height: row.height }))
+}
+
+/**
+ * Record where a block stands, without ever touching what the node said at submission.
+ *
+ * `submit_status` is not in the update list and must never be: it is the node's verbatim verdict at
+ * the one moment it could be observed, and a row rewritten to say `orphaned` would have thrown away
+ * the only evidence distinguishing a coinbase built wrongly from bad luck. The two facts sit beside
+ * each other.
+ *
+ * The predicate carries `maturity_status = 'pending'` so an `orphaned` row cannot be walked back to
+ * `matured` by a later sweep — `maturity.ts` explains why orphaned is terminal — and so two replicas
+ * racing on the same block settle rather than flapping. `matured_at` is set only on the transition,
+ * which is what makes it the time the block matured rather than the time it was last looked at.
+ */
+export async function setBlockMaturity(
+  exec: Exec,
+  args: {
+    chain: PoolChainId
+    hash: string
+    status: 'pending' | 'matured' | 'orphaned'
+    confirmations: number | null
+    detail: string | null
+  },
+): Promise<void> {
+  await exec`
+    update pool_blocks
+       set maturity_status     = ${args.status},
+           confirmations       = ${args.confirmations},
+           maturity_detail     = ${args.detail},
+           maturity_checked_at = now(),
+           matured_at          = case when ${args.status} = 'matured' then now() else matured_at end
+     where chain = ${args.chain}
+       and hash = ${args.hash}
+       and maturity_status = 'pending'
+  `
+}
+
+/**
+ * The blocks on one chain whose rewards actually exist: accepted, re-read, and buried past maturity.
+ *
+ * **This is the one definition of "payable" in this service, and it is deliberately a query rather
+ * than a rule written down in prose.** Before micro-org#302 the only status a block carried was
+ * `submit_status`, and the obvious mistake an eventual payout path was going to make was to treat
+ * `accepted` as the eligibility test — which is a claim about what one node said once, not about
+ * what is in the chain. Anything that pays must read this and nothing else, so that adding a new
+ * disqualifying condition later is one edit here rather than a search for every place that
+ * remembered to check.
+ *
+ * `matured` is the only status that qualifies, and the asymmetry is the point: `pending` covers both
+ * a young block and a node that could not be reached, and both of those are "we do not know yet".
+ *
+ * Nothing calls this to pay anybody today — `payouts.ts` explains at length that no payout path
+ * exists — so its only consumer is the test that asserts a re-organised block leaves it empty.
+ */
+export async function payableBlocks(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<MaturityCandidate[]> {
+  const rows = await exec<{ hash: string; height: number }[]>`
+    select hash, height
+    from pool_blocks
+    where chain = ${args.chain}
+      and maturity_status = 'matured'
+      and submit_status = 'accepted'
+    order by height
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({ hash: row.hash, height: row.height }))
+}
+
 export interface WindowRow {
   readonly workerId: number
   readonly account: string
@@ -479,6 +578,12 @@ export interface BlockRecord {
   readonly networkDifficultyUnits: bigint
   readonly submitStatus: string
   readonly submitDetail: string | null
+  /**
+   * Whether the block survived, as `maturity.ts` last measured it — a different fact from
+   * `submitStatus`, which is what the node said once at submission and is never revised.
+   */
+  readonly maturityStatus: string
+  readonly confirmations: number | null
 }
 
 export async function recentBlocks(
@@ -494,9 +599,12 @@ export async function recentBlocks(
       network_difficulty_units: string
       submit_status: string
       submit_detail: string | null
+      maturity_status: string
+      confirmations: number | null
     }[]
   >`
-    select height, hash, found_at, reward::text, network_difficulty_units::text, submit_status, submit_detail
+    select height, hash, found_at, reward::text, network_difficulty_units::text, submit_status,
+           submit_detail, maturity_status, confirmations
     from pool_blocks
     where chain = ${args.chain}
     order by found_at desc
@@ -510,6 +618,8 @@ export async function recentBlocks(
     networkDifficultyUnits: BigInt(row.network_difficulty_units),
     submitStatus: row.submit_status,
     submitDetail: row.submit_detail,
+    maturityStatus: row.maturity_status,
+    confirmations: row.confirmations,
   }))
 }
 
