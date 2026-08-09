@@ -103,6 +103,9 @@ function chainStatus(over: Partial<ChainStatus> = {}): ChainStatus {
     networkDifficulty: 34_512_119.5,
     templateAgeSeconds: 4,
     ready: true,
+    // No aux chain, which is the estate's own configuration and the default everywhere. The
+    // configured-but-not-committed case has its own test below.
+    merged: null,
     ...over,
   }
 }
@@ -204,6 +207,75 @@ test('a published endpoint is reported as both halves together', async () => {
   )
 })
 
+test('A CONFIGURED MERGED CHAIN THAT IS NOT COMMITTING SAYS SO, RATHER THAN LOOKING LIKE ONE THAT IS', async () => {
+  // The failure this pins is the whole reason the field exists. A dogecoind in initial block
+  // download refuses `createauxblock`, the pool carries on mining Litecoin perfectly, and every
+  // number in this response — height, difficulty, hashrate, shares — is identical to the merge-
+  // mining case. If `merged` were reported as merely "configured", a page would render "mining
+  // DOGE" for a pool that has never committed to a Dogecoin block and never will until the node
+  // finishes syncing, and the first person to notice would be a miner who was not paid.
+  await withServer(
+    {
+      snapshot: snapshot({
+        chains: [
+          chainStatus({
+            merged: { chain: 'doge', name: 'Dogecoin', committed: false, unavailability: 'syncing', height: null, networkDifficulty: null },
+          }),
+        ],
+      }),
+    },
+    async (h) => {
+      const res = await fetch(`${h.url}/v1/pool`)
+      const body = (await res.json()) as { chains: { merged: Record<string, unknown> | null }[] }
+      const merged = body.chains[0]?.merged
+
+      assert.equal(merged?.committed, false, 'configured is not committed, and the response must not conflate them')
+      assert.equal(merged?.unavailability, 'syncing', 'the reason is the only actionable part of a false')
+      // Named, so a consumer can render "Dogecoin" and credit DOGE without a table of its own.
+      assert.equal(merged?.chain, 'doge')
+      assert.equal(merged?.name, 'Dogecoin')
+      assert.equal(merged?.asset, 'DOGE')
+    },
+  )
+})
+
+test('a merged chain that is committing reports the aux height and difficulty', async () => {
+  await withServer(
+    {
+      snapshot: snapshot({
+        chains: [
+          chainStatus({
+            merged: { chain: 'doge', name: 'Dogecoin', committed: true, unavailability: null, height: 5_015_467, networkDifficulty: 12_345_678.5 },
+          }),
+        ],
+      }),
+    },
+    async (h) => {
+      const res = await fetch(`${h.url}/v1/pool`)
+      const body = (await res.json()) as { chains: { merged: Record<string, unknown> | null; networkDifficulty: number }[] }
+      const chain = body.chains[0]
+      assert.equal(chain?.merged?.committed, true)
+      assert.equal(chain?.merged?.unavailability, null)
+      assert.equal(chain?.merged?.height, 5_015_467)
+      // The aux difficulty is its OWN number and not a copy of the parent's — the pair is the
+      // comparison a miner reads, and two equal numbers here would mean the wrong one was copied.
+      assert.equal(chain?.merged?.networkDifficulty, 12_345_678.5)
+      assert.notEqual(chain?.merged?.networkDifficulty, chain?.networkDifficulty)
+    },
+  )
+})
+
+test('a pool with no merged chain reports null, not an object saying nothing is happening', async () => {
+  // Null and `{committed: false}` are different claims: the first is "this pool does not merge-mine",
+  // the second is "it does, and is currently not". A consumer that saw an object either way would
+  // have to inspect a field to tell whether to render the section at all.
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool`)
+    const body = (await res.json()) as { chains: { merged: unknown }[] }
+    assert.equal(body.chains[0]?.merged, null)
+  })
+})
+
 test('a pool serving nothing reports no chains rather than failing', async () => {
   // `POOL_CHAINS` is per-deployment and a pool with none is a running service with nothing to mine.
   // The console renders that as a named hole; a 500 here would render it as an outage.
@@ -241,6 +313,10 @@ test('the pool summary carries the whole shape the console is written against', 
       'decimals',
       'hashrateEstimate',
       'height',
+      // Present even on a pool that merges nothing, holding null. A key that appeared only when
+      // merged mining was configured would make its absence and its falsity the same observation
+      // to a consumer reading `body.merged?.committed`.
+      'merged',
       'name',
       'networkDifficulty',
       'ready',

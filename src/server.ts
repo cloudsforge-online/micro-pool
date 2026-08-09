@@ -48,7 +48,7 @@ import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { bearerFrom, statusFor, type Principal } from '@cloudsforge/auth'
 import { hashesPerDifficulty } from './pow.ts'
 import { unitsToDifficulty } from './pplns.ts'
-import { algorithmFor, assetFor, decimalsFor, isPoolChainId, type PoolChainId } from './chains.ts'
+import { algorithmFor, assetFor, auxAssetFor, decimalsFor, isPoolChainId, type PoolChainId } from './chains.ts'
 import { chainActivity, recentBlocks, sharesForAccount, workersForAccount, type Exec } from './store.ts'
 import { accountForUser, newBrowserWorkerLabel, type MintedTicket } from './tickets.ts'
 import type { ChainStatus } from './chainservice.ts'
@@ -300,6 +300,27 @@ function buildRoutes(): Route[] {
               sharesInWindow: activity.shares,
               workersInWindow: activity.workers,
               hashrateEstimate: hashrateFrom(chain, activity.units, HASHRATE_WINDOW_SECONDS),
+              /**
+               * The merge-mined chain, or null. Copied field by field rather than spread, like
+               * everything else in this object, so that adding a field to `MergedChainStatus`
+               * cannot publish it by accident.
+               *
+               * `hashrateEstimate` is deliberately NOT repeated inside it. The hashrate that mines
+               * an aux block is the parent's, entire — it is the same shares, the same units and
+               * the number immediately above; a second copy under a Dogecoin heading would read as
+               * a second pool's worth of hashing.
+               */
+              merged: status.merged
+                ? {
+                    chain: status.merged.chain,
+                    name: status.merged.name,
+                    asset: auxAssetFor(status.merged.chain),
+                    committed: status.merged.committed,
+                    unavailability: status.merged.unavailability,
+                    height: status.merged.height,
+                    networkDifficulty: status.merged.networkDifficulty,
+                  }
+                : null,
             }
           }),
         )

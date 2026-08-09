@@ -44,11 +44,10 @@ import { StratumServer, type Wire } from './stratum.ts'
 import { browserInitialDifficulty, browserVardiff, DEFAULT_VARDIFF, type VardiffOptions } from './vardiff.ts'
 import { assertNodeNetwork, payoutScriptFor, TemplateSource, type BlockTemplate } from './template.ts'
 import { AddressChecker } from './payoutaddress.ts'
-import { AuxTemplateSource } from './auxtemplate.ts'
+import { AuxTemplateSource, type AuxUnavailability } from './auxtemplate.ts'
 import { submitFoundAuxBlock, submitFoundBlock } from './blocks.ts'
 import { insertShares, upsertWorker, type Exec } from './store.ts'
-import { algorithmFor, nameFor } from './chains.ts'
-import type { AuxChainId } from './chains.ts'
+import { algorithmFor, auxNameFor, nameFor, type AuxChainId } from './chains.ts'
 import { hashesPerDifficulty, networkDifficultyOf } from './pow.ts'
 import { EXTRANONCE2_BYTES } from './stratum.ts'
 import type { AcceptedShare } from './session.ts'
@@ -130,6 +129,43 @@ export interface ChainStatus {
   readonly networkDifficulty: number | null
   readonly templateAgeSeconds: number | null
   readonly ready: boolean
+  /**
+   * The chain merge-mined underneath this one, or `null` when none is configured.
+   *
+   * Null and "configured but not currently committed" are different answers and both are reported,
+   * because merged mining fails by ABSENCE and by nothing else. A dogecoind in initial block
+   * download, one with no peers, a `createauxblock` refused — every one of them leaves this pool
+   * mining Litecoin exactly as well as it did before, with no error anywhere a miner or an operator
+   * would look. `committed` is the one fact that distinguishes "we are merge-mining Dogecoin" from
+   * "we intended to", and it is here so that answering it does not require reading the log.
+   */
+  readonly merged: MergedChainStatus | null
+}
+
+/** What is known about the aux chain right now, for `GET /v1/pool` and for whatever renders it. */
+export interface MergedChainStatus {
+  readonly chain: AuxChainId
+  readonly name: string
+  /**
+   * **Whether the work being handed out right this moment commits to an aux block.**
+   *
+   * False is not an error state and is the expected one on a node that is still syncing; it is
+   * simply the truth, and a consumer that showed "merge-mining Dogecoin" while this was false would
+   * be telling a miner they are earning DOGE when they are not.
+   */
+  readonly committed: boolean
+  /** Why there is no commitment, in one word, or `null` when there is one. `auxtemplate.ts` names them. */
+  readonly unavailability: AuxUnavailability | null
+  readonly height: number | null
+  /**
+   * The aux chain's own network difficulty, on the PARENT's algorithm.
+   *
+   * Dogecoin is scrypt like its parent, so this is comparable to the `networkDifficulty` beside it
+   * and the comparison is the interesting one: it is roughly how much rarer an aux block is than a
+   * parent block for the same hashing, which is what a miner wants to know about a chain they are
+   * being paid in.
+   */
+  readonly networkDifficulty: number | null
 }
 
 /** Domain metrics for the pool. Declared, not inferred from a log line — AD-20. */
@@ -515,6 +551,29 @@ export class ChainService {
       networkDifficulty: template ? networkDifficultyOf(algorithmFor(chain), template.blockTarget) : null,
       templateAgeSeconds: template ? Math.round((Date.now() - template.fetchedAt.getTime()) / 1000) : null,
       ready: this.ready,
+      merged: this.#mergedStatus(),
+    }
+  }
+
+  #mergedStatus(): MergedChainStatus | null {
+    const config = this.#auxConfig
+    if (config === null) return null
+    const block = this.#aux?.current ?? null
+    return {
+      chain: config.chain,
+      name: auxNameFor(config.chain),
+      // The job registry's own answer, not the template source's. They differ for exactly one tick
+      // — a fresh aux block has arrived and the job carrying it has not been built yet — and the
+      // question this field asks is about the work miners hold, so the registry is the authority.
+      committed: this.#registry.current?.aux != null,
+      // Reported even when a block is present, because the two are not opposites: a source that has
+      // a stale block and a node that has since started refusing is a state worth seeing.
+      unavailability: this.#aux?.unavailability ?? (this.#auxUsable ? null : 'refused'),
+      height: block?.height ?? null,
+      // The PARENT's algorithm, deliberately. An aux block is won by the parent's proof of work, so
+      // its difficulty is only meaningful in the parent's units — `blocks.ts` passes the same
+      // algorithm to `networkDifficultyOf` when it records one.
+      networkDifficulty: block ? networkDifficultyOf(algorithmFor(this.#deps.config.chain), block.target) : null,
     }
   }
 
