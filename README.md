@@ -85,11 +85,17 @@ pnpm start
 curl -s localhost:4146/livez
 curl -s localhost:4146/readyz
 curl -s localhost:4146/metrics
-curl -s localhost:4146/v1/pool | jq          # chains, heights, difficulty, connections, fee
-curl -s "localhost:4146/v1/pool/blocks?chain=btc" | jq
-curl -s "localhost:4146/v1/pool/workers?chain=btc&account=<address>" | jq
-curl -s "localhost:4146/v1/pool/shares?chain=btc&account=<address>" | jq
+curl -s 'localhost:4146/v1/pool' | jq                                       # chains, heights, difficulty, connections, fee
+curl -s 'localhost:4146/v1/pool/blocks?chain=btc&limit=25' | jq            # blocks found, and the node's verdict on each
+curl -s 'localhost:4146/v1/pool/workers?chain=btc&account=<address>' | jq  # this account's workers, over the last 600s
+curl -s 'localhost:4146/v1/pool/shares?chain=btc&account=<address>' | jq   # this account's share history, share by share
 ```
+
+**The account is a query parameter and there are no path parameters anywhere in this service** —
+route matching is exact string equality on the pathname, so an address cannot appear in a path under
+any spelling. `/v1/workers/<address>`, which this file used to name, is not a route and answers the
+404 envelope (micro-org#284). `chain` may be omitted only while this pool serves exactly one chain.
+Every body these return is written out under [Routes](#routes) below.
 
 Point a miner at the stratum port — 3333 for BTC, 3334 for LTC by default. The username is
 `<payout-address>.<worker>` and the password is ignored:
@@ -148,6 +154,338 @@ docker build -t cloudsforge-pool \
   --build-context runtimepkgs=../runtime \
   --build-context contractspkgs=../contracts .
 ```
+
+---
+
+## Routes
+
+Everything on this port, with the body each one answers — micro-org#287. Until this section existed
+the only written description of this service's wire format lived in another repository, kept true by
+a test that reads this repository's source as text and skips itself when the two are not checked out
+side by side. A consumer had to read `src/server.ts` to find out what a field was called, which is
+the same as having no contract.
+
+Every route below is **public and unauthenticated** except `POST /v1/pool/ticket`, which is the only
+route on this port that writes anything. Why the reads are open is argued in `src/server.ts` and
+comes from §6 of the multi-chain document: a share history checkable only by people with an estate
+login is checkable by almost no miner.
+
+### What every response has
+
+| | |
+| --- | --- |
+| `content-type` | `application/json; charset=utf-8` on everything but `/metrics`, which is `text/plain; version=0.0.4; charset=utf-8` |
+| `content-length` | always set — no chunked replies, no streaming |
+| `x-request-id` | the `x-request-id` you sent if it is 64 characters or fewer of `[A-Za-z0-9_-]`, otherwise one this service generated. It is on the response headers **and** inside every error body |
+| `cache-control` | `no-store`, on all of them. Every answer here is a point-in-time fact, and a cached 200 from a replica that has since gone unready is exactly the lie it would be worst to tell |
+| body | JSON object, one trailing newline |
+
+**Anything that is not a 200 is this and only this:**
+
+```json
+{ "error": { "code": "bad_request", "message": "limit must be a positive whole number", "requestId": "…" } }
+```
+
+`code` is a stable token to branch on; `message` is prose for a human and may change. The codes are
+`bad_request` (400), `unauthenticated` (401), `forbidden` (403), `not_found` (404),
+`browser_mining_unavailable` (503), `identity_unavailable` (503) and `internal` (500).
+
+### Query parameters
+
+| Parameter | Where | Rules |
+| --- | --- | --- |
+| `chain` | `/blocks`, `/workers`, `/shares` | Lower-cased and trimmed. **Optional only when this pool serves exactly one chain**, in which case it defaults to that one; required otherwise. A chain this deployment does not serve is 400 and the message names the ones it does. |
+| `account` | `/workers`, `/shares` | Required. Trimmed. Up to 96 characters of `[A-Za-z0-9_:-]`. Anything else is 400 — the character set is the one this pool would have been willing to store, so a value it rejects here is a value it can never have recorded a share against. |
+| `limit` | `/blocks`, `/shares` | A positive whole number. Absent or empty means the default. |
+
+**`limit` is CLAMPED, not refused, and nothing in the response says so.** Ask `/blocks` for 5,000
+and you get 200 with 200 rows, not a 400. The ceiling is what keeps an unauthenticated endpoint from
+being a way to ask the database for every share ever recorded, and returning the ceiling is what the
+caller wanted anyway — but it means **a full page is not evidence that there are no more rows**, and
+a client that pages by asking for more must not conclude anything from getting fewer than it asked
+for. Zero, a negative number, a fraction and a non-number are all 400.
+
+| Route | `limit` default | `limit` ceiling |
+| --- | --- | --- |
+| `GET /v1/pool/blocks` | 50 | 200 |
+| `GET /v1/pool/shares` | 100 | 1000 |
+
+### Two fields are strings that look like numbers, on purpose
+
+`reward` on a block and `id` on a share are **strings**, and a consumer that runs them through
+`Number()` is writing a bug that will not show up for years.
+
+- `reward` is money, in the chain's smallest unit, and JSON has no integer wide enough for one.
+  `Number.MAX_SAFE_INTEGER` is about 9.007 × 10^15; a block reward in litoshi is comfortably inside
+  that today and the point is that nothing about the format promises it stays there. Estate
+  convention, from `contracts-chain`: **amounts cross a wire as text.** Divide by `10 ** decimals`,
+  which the same response gives you, and do it in a decimal library rather than a float.
+- `id` is a `bigserial`. Same reason, one table over.
+
+Everything else numeric is a genuine JSON number: heights, difficulties, hashrate estimates, counts.
+
+### `GET /livez`
+
+Static. 200, always, while the process is alive. It never consults the database, the node or
+anything else — for this service a restart drops every miner's TCP connection and loses whatever
+shares are still buffered, so a liveness probe that fails on a database blink is expensive.
+
+```json
+{ "ok": true, "state": "ready", "uptimeMs": 812345 }
+```
+
+`state` is one of `starting`, `ready`, `degraded`, `draining`, `stopped`.
+
+### `GET /readyz`
+
+**200 when ready, 503 when not**, with the same body either way. Readiness includes a hard probe per
+chain on template freshness: a replica whose miners are hashing against a template from before the
+last block looks perfect from outside and is worth nothing.
+
+```json
+{
+  "ready": true,
+  "state": "ready",
+  "uptimeMs": 812345,
+  "checks": [{ "name": "ltc-template", "kind": "hard", "state": "pass", "detail": "…" }]
+}
+```
+
+Each check's `state` is `pass`, `warn` or `fail`; `detail` is prose for an operator and is **absent**
+rather than null when there is nothing to add. A `hard` check that fails makes the whole report
+unready; a `soft` one degrades it and keeps the service serving.
+
+### `GET /metrics`
+
+Prometheus text exposition, `text/plain; version=0.0.4`. Not JSON. Sampled gauges — connection
+counts, template age — are refreshed as the scrape is served rather than on a timer, because a timer
+here would be the one `setInterval` in this repository.
+
+### `GET /v1/pool`
+
+What this pool is and what it is doing. No parameters. Every configured chain, always, whether or
+not it is ready.
+
+```json
+{
+  "network": "mainnet",
+  "feeBasisPoints": 100,
+  "pplnsWindowMultiplier": 2,
+  "payoutsImplemented": false,
+  "chains": [
+    {
+      "chain": "ltc",
+      "name": "Litecoin",
+      "asset": "LTC",
+      "decimals": 8,
+      "algorithm": "scrypt",
+      "stratumPort": 3334,
+      "stratumEndpoint": null,
+      "websocketEndpoint": null,
+      "connections": 0,
+      "height": 2985113,
+      "networkDifficulty": 41234567.89,
+      "templateAgeSeconds": 4.2,
+      "ready": true,
+      "windowSeconds": 600,
+      "sharesInWindow": 0,
+      "workersInWindow": 0,
+      "hashrateEstimate": 0
+    }
+  ]
+}
+```
+
+| Field | Null when | What the null means |
+| --- | --- | --- |
+| `stratumEndpoint` | either `POOL_STRATUM_PUBLIC_HOST` or this chain's `POOL_<CHAIN>_STRATUM_PUBLIC_PORT` is unset | **No endpoint has been published; ask an operator.** It is never the bind address, never the request's `Host`, never a derivation. Null is the ordinary answer on this estate — see the section above on why, and on the page that once derived one and printed an address that cannot connect |
+| `websocketEndpoint` | `POOL_WEBSOCKET_PUBLIC_ORIGIN` is unset, or this deployment serves no browsers | The same answer for the browser transport. One complete `wss://…` URL or nothing; there is no half of it to assemble |
+| `height` | this chain has never obtained a template | The node has not answered yet. Distinct from height 0, which no live chain is at |
+| `networkDifficulty` | as above | |
+| `templateAgeSeconds` | as above | Not "the template is fresh" — there is no template |
+
+`ready` is per chain and is the same hard probe `/readyz` aggregates. `stratumPort` is the port the
+listener **binds**: a true fact about this process, the inside of whatever port mapping the deploy
+wrote, and not half of a connection string. `connections` counts both transports.
+
+`hashrateEstimate` is hashes per second implied by the difficulty credited over `windowSeconds`, and
+it is computed with **that chain's own** difficulty-1 constant — 2^32 hashes per unit of difficulty
+on SHA-256d, 2^16 on scrypt. A single formula would report every Litecoin miner as 65,536 times
+faster than they are, and it would be believed, because the number carries no unit that would look
+wrong. `sharesInWindow` and `workersInWindow` come from the same window. All three are 0 for a chain
+nobody is mining, which is not the same as absent.
+
+`payoutsImplemented` is `false` and is in the body rather than only in this file, so that a page
+built against this API cannot accidentally imply a payment that will not arrive. **It appears here
+and on `/v1/pool/blocks`, and nowhere else** — in particular it is not part of the ticket reply.
+
+### `GET /v1/pool/blocks?chain=<chain>&limit=<n>`
+
+Blocks this pool found, newest first. `limit` defaults to 50 and is clamped at 200.
+
+```json
+{
+  "chain": "ltc",
+  "asset": "LTC",
+  "decimals": 8,
+  "payoutsImplemented": false,
+  "blocks": [
+    {
+      "height": 2985101,
+      "hash": "b1946ac9…",
+      "foundAt": "2026-08-09T11:02:41.318Z",
+      "reward": "625000000",
+      "networkDifficulty": 41234567.89,
+      "submitStatus": "accepted",
+      "submitDetail": null
+    }
+  ]
+}
+```
+
+`foundAt` is ISO 8601 with milliseconds, UTC, from `Date#toISOString`. Same for every timestamp
+below.
+
+`submitStatus` is `accepted` or `rejected` — **the node's verdict at the moment of submission**, and
+a rejected block is published rather than hidden, because it is the single most useful diagnostic
+this service has and a pool that showed only its accepted blocks would be concealing the one failure
+miners must know about. `submitDetail` is the node's own words, and is **null when there is nothing
+to say** — an accepted block, ordinarily.
+
+**Nothing re-checks the verdict afterwards.** A coinbase is unspendable for 100 blocks and a block
+can be orphaned well inside that window, so `submitStatus: "accepted"` means the node took it, not
+that it survived. That gap is micro-org#302 and it is not fixed here.
+
+### `GET /v1/pool/workers?chain=<chain>&account=<account>`
+
+Every worker seen under one account, with its recent contribution. No `limit`: the list is bounded
+by how many workers an account has, and an account with an unreasonable number of them has a problem
+a page size would hide.
+
+```json
+{
+  "chain": "ltc",
+  "account": "ltc1qexampleaddress",
+  "windowSeconds": 600,
+  "workers": [
+    {
+      "worker": "rig1",
+      "lastSeenAt": "2026-08-09T11:14:02.004Z",
+      "difficulty": 512,
+      "sharesInWindow": 37,
+      "hashrateEstimate": 4093.2
+    }
+  ]
+}
+```
+
+`difficulty` is the difficulty this worker was last **issued**, and it is **null when the pool has
+never set one for it** — a worker row created by an authorisation that never received a job, or one
+predating any vardiff decision. Null is not zero: zero would say the pool set a difficulty of zero,
+which it cannot do. `sharesInWindow` and `hashrateEstimate` cover `windowSeconds` and are 0 for a
+worker that has been idle throughout, which *is* different from `difficulty` being null.
+
+**`worker` is the empty string for a miner that authorised with a bare address and no dot**, which
+is an ordinary configuration and not a fault: `bc1qexample` is one worker named "", `bc1qexample.rig1`
+is one named `rig1`. Consumers render `""` as a blank cell and their operators read it as a bug, so
+show something — "(unnamed)" — rather than nothing. It is never null; the field is always present
+and always a string.
+
+### `GET /v1/pool/shares?chain=<chain>&account=<account>&limit=<n>`
+
+One account's share history, share by share, newest first. `limit` defaults to 100 and is clamped at
+1000.
+
+This is the route §6 exists for. It returns the job each share was against, the difficulty it was
+**credited** at and the difficulty it actually **achieved**, which is exactly what a miner's own log
+records — so the two reconcile line for line. A count would be checkable against nothing.
+
+```json
+{
+  "chain": "ltc",
+  "account": "ltc1qexampleaddress",
+  "shares": [
+    {
+      "id": "48291",
+      "worker": "rig1",
+      "jobId": "1f",
+      "height": 2985113,
+      "creditedDifficulty": 512,
+      "achievedDifficulty": 1043.77,
+      "isBlock": false,
+      "createdAt": "2026-08-09T11:14:02.004Z"
+    }
+  ]
+}
+```
+
+`creditedDifficulty` is what the share is worth for PPLNS; `achievedDifficulty` is what the header
+actually hashed to and is always at least the credited value. `isBlock` is true for a share that was
+also a block — it stays a share, and both rows exist, because losing the share accounting for the
+most valuable submission a pool will ever receive is not an acceptable trade for tidiness. No field
+here is nullable.
+
+### `POST /v1/pool/ticket`
+
+The one authenticated route and the one route that writes. Sixty seconds, one connection, one use.
+
+```
+POST /v1/pool/ticket
+Authorization: Bearer <estate access token>
+
+200 { "ticket": "<opaque>", "account": "cf-…", "worker": "web-…", "expiresInMs": 60000 }
+```
+
+No request body is read; sending one is harmless and ignored. The chain is not named here, because a
+ticket is worth one authorisation on one connection and which chain that connection is for is
+already in the WebSocket path — naming it twice would create a pair that can disagree.
+
+**`expiresInMs`, not `expiresAt`, and this is the corrected contract.** An earlier written
+description of this route specified `expiresAt` plus `ttlSeconds` plus `payoutsImplemented`. The
+service has never sent any of those and it is the service that is right: elapsed milliseconds is the
+one clock a browser and this process reliably share, and an absolute timestamp compared against a
+laptop forty seconds out produces a ticket that looks expired the instant it arrives.
+`payoutsImplemented` belongs on `GET /v1/pool`, where it is. A client has already shipped against
+`expiresInMs`; the document was wrong, not the code.
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Minted. `ticket` appears here and nowhere else — it is never logged, never counted by value, and never stored beyond the in-memory ticket table |
+| 401 `unauthenticated` | No bearer token, or one identity did not accept. The reason is deliberately not echoed: a verification failure names key ids, issuers and clock skews, and repeating that to an unauthenticated caller builds a token oracle |
+| 403 `forbidden` | A **service** principal. A mining ticket belongs to a person; there is no user id to credit work to. 403 rather than 401 because the credential was perfectly good and a better one will not help |
+| 503 `identity_unavailable` | Identity could not be reached. Explicitly not 401 — answering 401 because the identity service is having a bad minute signs every user in the estate out of the miner |
+| 503 `browser_mining_unavailable` | This deployment has no `IDENTITY_JWKS_URL`. It is a TCP-only pool, which is a complete and supported configuration |
+
+`account` and `worker` are the **server's** labels, generated here, and are what the work will be
+credited to. Neither is anything the client asked for. See the browser-mining section below.
+
+### `mining.subscribe` is MANDATORY, and skipping it fails silently
+
+Not a route, but it belongs with the contract, because it is the failure that costs the most time to
+diagnose.
+
+A connection that sends `mining.authorize` without having sent `mining.subscribe` **is answered
+`true`**, is sent a `mining.set_difficulty`, and is then **sent no work at all, ever**. Not an error,
+not a close — silence, on a healthy socket, indefinitely. If it eventually submits something it is
+refused with error **25 (`NOT_SUBSCRIBED`)**, which is the first and only hint it gets, and a client
+that never submits because it was never given a job never sees even that.
+
+So: **subscribe, then authorize, then wait for `mining.notify`.**
+
+```
+{"id":1,"method":"mining.subscribe","params":["your-client/1.0"]}
+{"id":2,"method":"mining.authorize","params":["<address-or-empty>","<password-or-ticket>"]}
+```
+
+The other order — authorize first, then subscribe — does work: the authorisation succeeds and the
+next template broadcast reaches the connection normally. That is why this is documented rather than
+refused. Rejecting an `authorize` that arrives before a `subscribe` would break clients that are
+behaving legitimately, so the honest fix is a warning rather than a refusal, and `session.ts` has no
+logger to warn through today. It is called out here so that nobody has to find it from a browser.
+
+Everything a job depends on is withheld until both have happened: no `mining.notify`, no usable
+extranonce and no difficulty band. An unauthenticated WebSocket upgrade therefore gets you a socket
+and nothing else, and the handshake timeout closes it.
 
 ---
 
