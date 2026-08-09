@@ -1,0 +1,96 @@
+name: CI
+
+# The whole file. Every service in the estate calls the ONE reusable workflow in micro-org rather
+# than carrying its own copy — the measured target in docs/ecosystem/03 §5 is zero bespoke CI files.
+# If this repository ever needs a job of its own, that is the signal the reusable workflow needs an
+# input, not that this repository needs a fork of it.
+#
+# `service-ci.yml` typechecks, runs the suite against a real Postgres `ci_test` container, and FAILS
+# the build if the database-backed suite skipped — which is why `store.test.ts` reads
+# POOL_TEST_DATABASE_URL spelled exactly as the workflow exports it. It also enforces the estate
+# rules (one database, no cross-service imports, the three health endpoints, no unleased timers).
+
+on:
+  push:
+    branches: [main, 'release/**', 'feat/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: pool
+      database-env-var: POOL_DATABASE_URL
+      port: 4146
+      # Match production rather than the workflow's default: the estate's compose files pin
+      # postgres:17-alpine, and a suite that passes on a version nobody runs proves less.
+      postgres-version: '17'
+      # THE IMAGE SMOKE TEST BOOTS THE REAL SERVICE, and `src/env.ts` validates its configuration at
+      # import — so the container needs every variable this service declares as required, or it exits
+      # before it can serve /livez. These are CI-only NON-secrets.
+      #
+      # There is deliberately no `@generate` line here and no identity URL, and both absences are
+      # this service's shape rather than an omission. Nothing in this release publishes an event, so
+      # there is no OUTBOX_SIGNING_SECRET to generate; the HTTP surface is public, so there is no
+      # JWKS to point at. See src/env.ts, which says the same in more detail.
+      #
+      # THE NODE URL CARRIES NO CREDENTIAL, on purpose. Everywhere else in the estate this variable
+      # holds HTTP Basic userinfo, and writing a plausible-looking `rpcuser:rpcpassword@` into a
+      # workflow file is how a string that looks like a credential ends up committed and then copied
+      # somewhere it matters. Nothing dials it in CI anyway, which is the second half of the point:
+      # 127.0.0.1:8332 has nothing listening under `--network host`, so the chain gets a
+      # NodeUnavailableError, retries in the background with its stratum port shut, and /livez
+      # answers 200. That is exactly the behaviour `chainservice.ts` documents for a node that is not
+      # there yet, and the smoke test is the only place in CI where it runs end to end.
+      #
+      # The payout address is never validated for the same reason — validation is an RPC call to a
+      # node that does not answer — so it only has to be a non-empty string.
+      smoke-env: |
+        POOL_CHAINS=btc
+        POOL_FEE_BASIS_POINTS=100
+        POOL_BTC_NODE_URL=http://127.0.0.1:8332/
+        POOL_BTC_PAYOUT_ADDRESS=bc1qexampleexampleexampleexampleexampleexam
+    secrets:
+      # @cloudsforge/* is resolved by link:../runtime and link:../contracts, so CI checks out
+      # micro-runtime and micro-contracts as siblings — both private, so the workflow needs a
+      # contents:read token.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
+
+  hygiene:
+    uses: cloudsforge-online/micro-org/.github/workflows/secret-hygiene.yml@main
+    permissions:
+      contents: read
+
+  # ──────────────────────────────────────────────────────────────────────────────────────────────
+  # THE IMAGE, PUBLISHED. `cfctl release` writes a manifest naming ghcr.io/cloudsforge-online/<repo>
+  # at this repository's package.json version, `cfctl release --verify` runs `docker manifest
+  # inspect` on every entry, and deploy/scripts/release-deploy.sh refuses to change anything until
+  # all of them pull. A service whose CI builds an image and throws it away cannot be released.
+  #
+  # `packages: write` IS GRANTED HERE rather than asked for inside the shared CI workflow, and that
+  # is forced rather than stylistic: a called workflow's GITHUB_TOKEN can only be maintained or
+  # reduced, never elevated, so a reusable workflow asking for a permission its caller withheld
+  # fails the whole run at STARTUP — before a step runs, on pull requests as well as on main.
+  # ──────────────────────────────────────────────────────────────────────────────────────────────
+  publish:
+    needs: [ci, hygiene]
+    # A green push, and only from a ref this list names. An image tag a release manifest pins has to
+    # name something that passed, on the branch it will be deployed from.
+    if: >-
+      github.event_name == 'push' && (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/feat/'))
+    uses: cloudsforge-online/micro-org/.github/workflows/publish-image.yml@main
+    with:
+      kind: service
+    secrets:
+      # The same sibling checkouts the Dockerfile's named build contexts need: the image cannot be
+      # built without micro-runtime and micro-contracts beside it.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: write
