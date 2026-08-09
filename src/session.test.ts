@@ -22,7 +22,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { JobRegistry, type Job } from './work.ts'
 import { parseTemplate } from './template.ts'
-import { fakeTemplateReply, FAKE_PAYOUT_SCRIPT, REGTEST_BITS } from './faketemplate.ts'
+import { fakeTemplateReply, fakeHashHex, FAKE_PAYOUT_SCRIPT, REGTEST_BITS } from './faketemplate.ts'
 import { DEFAULT_VARDIFF } from './vardiff.ts'
 import { STRATUM_ERROR } from './validate.ts'
 import type { AddressVerdict } from './payoutaddress.ts'
@@ -253,7 +253,29 @@ test('a valid share is accepted, credited once, and reported', () => {
   assert.ok(nonceHex.length === 8)
 })
 
-test('a share against an unknown job is stale, not dishonest', () => {
+test('A SHARE AGAINST A JOB THIS POOL RETIRED IS STALE, NOT DISHONEST', () => {
+  const h = harness()
+  const job = h.pushTemplate()
+  connect(h)
+  // A new tip retires everything built on the old parent — see `work.ts`. The miner was mid-attempt
+  // on work that was valid when it started it, and the answer to that is code 21, which every miner
+  // displays as "stale" and none of them counts as a fault.
+  h.pushTemplate({ previousBlockHashHex: fakeHashHex('a-new-tip') })
+  h.session.handle({
+    id: 10,
+    method: 'mining.submit',
+    params: ['w', job.id, '00000001', '00000000', '00000000'],
+  })
+  const reply = h.sent.find((m) => m.id === 10)
+  assert.equal((reply?.error as [number, string, unknown])[0], STRATUM_ERROR.JOB_NOT_FOUND)
+  assert.match((reply?.error as [number, string, unknown])[1], /stale/)
+  assert.equal(h.shares.length, 0)
+})
+
+test('A SHARE AGAINST AN ID THIS POOL NEVER ISSUED IS NOT STALE — micro-org#237', () => {
+  // The other half of the same fix. Answering this "stale, fetch fresh work" is the cheap version
+  // and it tells a client that fabricates job ids, or that is pointed at the wrong pool, to carry
+  // on. Code 20 is what a malformed `mining.submit` gets, which is the right company for it.
   const h = harness()
   h.pushTemplate()
   connect(h)
@@ -263,8 +285,10 @@ test('a share against an unknown job is stale, not dishonest', () => {
     params: ['w', 'no-such-job', '00000001', '00000000', '00000000'],
   })
   const reply = h.sent.find((m) => m.id === 10)
-  assert.equal((reply?.error as [number, string, unknown])[0], STRATUM_ERROR.JOB_NOT_FOUND)
-  assert.match((reply?.error as [number, string, unknown])[1], /stale/)
+  assert.equal((reply?.error as [number, string, unknown])[0], STRATUM_ERROR.OTHER)
+  assert.match((reply?.error as [number, string, unknown])[1], /not issued by this pool/)
+  assert.doesNotMatch((reply?.error as [number, string, unknown])[1], /fetch fresh work/)
+  assert.equal(h.shares.length, 0)
 })
 
 test('the same solution submitted twice is a duplicate', () => {
@@ -327,11 +351,18 @@ test('a share that is a block is reported as both a share and a block', () => {
 })
 
 test('every outcome is reported to the counter callback with its code', () => {
+  // The specific code, not merely "rejected". An operator reading the counter has to be able to see
+  // stale work and a broken client as two different lines, which is micro-org#237 one layer out.
   const h = harness()
-  h.pushTemplate()
+  const job = h.pushTemplate()
   connect(h)
-  h.session.handle({ id: 40, method: 'mining.submit', params: ['w', 'nope', '00000001', '00000000', '00000000'] })
-  assert.deepEqual(h.outcomes, [{ outcome: 'rejected', code: STRATUM_ERROR.JOB_NOT_FOUND }])
+  h.pushTemplate({ previousBlockHashHex: fakeHashHex('a-new-tip') })
+  h.session.handle({ id: 40, method: 'mining.submit', params: ['w', job.id, '00000001', '00000000', '00000000'] })
+  h.session.handle({ id: 41, method: 'mining.submit', params: ['w', 'nope', '00000001', '00000000', '00000000'] })
+  assert.deepEqual(h.outcomes, [
+    { outcome: 'rejected', code: STRATUM_ERROR.JOB_NOT_FOUND },
+    { outcome: 'rejected', code: STRATUM_ERROR.OTHER },
+  ])
 })
 
 /* ------------------------------------------------------------------ version rolling */

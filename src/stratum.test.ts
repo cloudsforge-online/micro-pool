@@ -28,7 +28,7 @@ import { createConnection, type Socket } from 'node:net'
 import { StratumServer, EXTRANONCE2_BYTES, MAX_LINE_BYTES, type StratumServerOptions } from './stratum.ts'
 import { JobRegistry, type Job } from './work.ts'
 import { parseTemplate } from './template.ts'
-import { fakeTemplateReply, FAKE_PAYOUT_SCRIPT, MAINNET_BITS, REGTEST_BITS } from './faketemplate.ts'
+import { fakeTemplateReply, fakeHashHex, FAKE_PAYOUT_SCRIPT, MAINNET_BITS, REGTEST_BITS } from './faketemplate.ts'
 import { DEFAULT_VARDIFF } from './vardiff.ts'
 import { validateShare } from './validate.ts'
 import type { AcceptedShare, FoundBlock } from './session.ts'
@@ -616,14 +616,35 @@ test('a stale job id is refused with 21 and the connection stays up', async () =
   const h = await harness()
   const c = await h.connect()
   await connect(c)
+  const job = h.push()
+  // Retire it under the miner, the way a new block does. Submitting an id that was never issued is
+  // a different answer since micro-org#237 — see below — so this has to be a job the pool really
+  // handed out for the 21 to mean what the test name says it means.
+  h.push({ previousBlockHashHex: fakeHashHex('a-new-tip') })
+
+  c.send({ id: 4, method: 'mining.submit', params: ['w', job.id, '00000001', '68e7a900', '00000000'] })
+  const reply = await c.await((m) => m['id'] === 4, 'the submit reply')
+
+  const error = reply['error'] as [number, string, unknown]
+  assert.equal(error[0], 21)
+  assert.ok(!c.closed(), 'a rejected share is a normal event, not a protocol violation')
+})
+
+test('a job id this pool never issued is refused with 20, and the connection stays up too', async () => {
+  // Over a real socket rather than through the state machine, because the code a miner's firmware
+  // prints is the whole point of micro-org#237 and it reaches the miner through the framing.
+  const h = await harness()
+  const c = await h.connect()
+  await connect(c)
   h.push()
 
   c.send({ id: 4, method: 'mining.submit', params: ['w', 'deadbeef', '00000001', '68e7a900', '00000000'] })
   const reply = await c.await((m) => m['id'] === 4, 'the submit reply')
 
   const error = reply['error'] as [number, string, unknown]
-  assert.equal(error[0], 21)
-  assert.ok(!c.closed(), 'a rejected share is a normal event, not a protocol violation')
+  assert.equal(error[0], 20)
+  assert.match(error[1], /not issued by this pool/)
+  assert.ok(!c.closed(), 'a refused share is still not a protocol violation')
 })
 
 /* ------------------------------------------------------------------ the flush */
