@@ -228,6 +228,7 @@ async function record(args: {
 }): Promise<number> {
   return recordBlock(db(), {
     chain: 'ltc',
+    shareChain: 'ltc',
     height: args.height,
     hash: args.hash,
     foundByWorkerId: null,
@@ -392,6 +393,7 @@ test('THE SWEEP IS SCOPED TO ONE CHAIN', { skip }, async () => {
   await record({ hash: HASH, height: HEIGHT })
   await recordBlock(db(), {
     chain: 'btc',
+    shareChain: 'btc',
     height: 900_000,
     hash: '00000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     foundByWorkerId: null,

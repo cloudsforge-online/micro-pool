@@ -34,7 +34,8 @@
  */
 
 import type { Sql } from 'postgres'
-import type { PoolChainId } from './chains.ts'
+import { isPoolChainId } from './chains.ts'
+import type { MinedChainId, PoolChainId } from './chains.ts'
 
 /** The pool, or a transaction inside it. */
 export type Exec = Sql
@@ -190,7 +191,17 @@ export async function insertShares(exec: Exec, shares: readonly ShareInput[]): P
 }
 
 export interface BlockInput {
-  readonly chain: PoolChainId
+  /** The network this block is on. Dogecoin for a merge-mined block, whose work was Litecoin's. */
+  readonly chain: MinedChainId
+  /**
+   * The network whose `pool_shares` the recorded window is drawn from — the parent chain for a
+   * merge-mined block, and the block's own chain otherwise.
+   *
+   * Separate from `chain` and not derivable from it. Migration 7 has the argument in full; the short
+   * version is that a Dogecoin block allocated against `pool_shares where chain = 'doge'` selects
+   * zero rows, pays nobody, and raises nothing.
+   */
+  readonly shareChain: PoolChainId
   readonly height: number
   readonly hash: string
   readonly foundByWorkerId: number | null
@@ -212,11 +223,11 @@ export interface BlockInput {
 export async function recordBlock(exec: Exec, block: BlockInput): Promise<number> {
   const rows = await exec<{ id: string }[]>`
     insert into pool_blocks (
-      chain, height, hash, found_by_worker_id, network_difficulty_units, reward,
+      chain, share_chain, height, hash, found_by_worker_id, network_difficulty_units, reward,
       submit_status, submit_detail, window_first_share_id, window_last_share_id
     )
     values (
-      ${block.chain}, ${block.height}, ${block.hash}, ${block.foundByWorkerId},
+      ${block.chain}, ${block.shareChain}, ${block.height}, ${block.hash}, ${block.foundByWorkerId},
       ${param(block.networkDifficultyUnits)}, ${param(block.reward)},
       ${block.submitStatus}, ${block.submitDetail},
       ${param(block.windowFirstShareId)}, ${param(block.windowLastShareId)}
@@ -345,6 +356,12 @@ export async function payableBlocks(
 export interface PayableBlockRow {
   readonly hash: string
   readonly height: number
+  /**
+   * The chain whose shares this block's window names. Carried out of the row rather than assumed to
+   * be the chain the caller asked for, because on a merge-mined block those are two different
+   * chains — see migration 7, and the read site in `rewards.ts`.
+   */
+  readonly shareChain: PoolChainId
   /** The whole coinbase value, fees included, in the chain's smallest unit. The pool fee comes out of it. */
   readonly reward: bigint
   readonly windowFirstShareId: bigint | null
@@ -373,9 +390,16 @@ export async function blocksAwaitingCredit(
   args: { chain: PoolChainId; limit: number },
 ): Promise<PayableBlockRow[]> {
   const rows = await exec<
-    { hash: string; height: number; reward: string; first_id: string | null; last_id: string | null }[]
+    {
+      hash: string
+      height: number
+      reward: string
+      share_chain: string
+      first_id: string | null
+      last_id: string | null
+    }[]
   >`
-    select hash, height, reward::text,
+    select hash, height, reward::text, share_chain,
            window_first_share_id::text as first_id,
            window_last_share_id::text  as last_id
     from pool_blocks
@@ -390,9 +414,22 @@ export async function blocksAwaitingCredit(
     hash: row.hash,
     height: row.height,
     reward: BigInt(row.reward),
+    // Narrowed rather than cast. `share_chain` is `text` in the schema and migration 7 says why it
+    // carries no check constraint; the row therefore has to be believed or refused here, and a row
+    // naming a chain this build does not serve shares for is one whose allocation cannot be
+    // computed at all. Refusing stops the sweep on that block, which leaves it unmarked and
+    // retryable — the same handling every other unallocatable block gets.
+    shareChain: asPoolChainId(row.share_chain, row.hash),
     windowFirstShareId: row.first_id === null ? null : BigInt(row.first_id),
     windowLastShareId: row.last_id === null ? null : BigInt(row.last_id),
   }))
+}
+
+function asPoolChainId(value: string, hash: string): PoolChainId {
+  if (!isPoolChainId(value)) {
+    throw new Error(`block ${hash} records share_chain '${value}', which this build serves no shares for`)
+  }
+  return value
 }
 
 /**

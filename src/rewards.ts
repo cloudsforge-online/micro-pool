@@ -152,7 +152,12 @@ export async function creditMaturedBlocks(deps: RewardCreditDeps): Promise<Rewar
       block.windowFirstShareId === null || block.windowLastShareId === null
         ? []
         : await windowShares(deps.sql, {
-            chain: deps.chain,
+            // The block's OWN `share_chain`, not `deps.chain`. They are the same for every solo-mined
+            // block and they differ for every merge-mined one, and reading the sweep's chain here
+            // would allocate a Dogecoin block against Dogecoin shares — of which this pool writes
+            // none, so the window would come back empty and the finder would be paid nothing with no
+            // error anywhere. Migration 7 records the whole argument.
+            chain: block.shareChain,
             firstShareId: block.windowFirstShareId,
             lastShareId: block.windowLastShareId,
           })

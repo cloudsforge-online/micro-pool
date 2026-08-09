@@ -31,7 +31,7 @@ import { parseTemplate } from './template.ts'
 import { fakeTemplateReply, fakeHashHex, FAKE_PAYOUT_SCRIPT, MAINNET_BITS, REGTEST_BITS } from './faketemplate.ts'
 import { DEFAULT_VARDIFF } from './vardiff.ts'
 import { validateShare } from './validate.ts'
-import type { AcceptedShare, FoundBlock } from './session.ts'
+import type { AcceptedShare, FoundAuxBlock, FoundBlock, SpoiledAuxBlock } from './session.ts'
 
 /** See `session.test.ts`: 0.001 would put a test share four million hashes away. */
 const TEST_VARDIFF = { ...DEFAULT_VARDIFF, minDifficulty: 1 / 65536 }
@@ -51,6 +51,8 @@ interface Harness {
   /** Every batch handed to `persistShares`, kept as batches so buffering is visible. */
   readonly batches: AcceptedShare[][]
   readonly blocks: FoundBlock[]
+  readonly auxBlocks: FoundAuxBlock[]
+  readonly auxSpoiled: SpoiledAuxBlock[]
   readonly persisted: () => AcceptedShare[]
   push(options?: Parameters<typeof fakeTemplateReply>[0]): Job
   connect(): Promise<Client>
@@ -79,6 +81,8 @@ async function harness(overrides: Partial<StratumServerOptions> = {}): Promise<H
   const logs: LogLine[] = []
   const batches: AcceptedShare[][] = []
   const blocks: FoundBlock[] = []
+  const auxBlocks: FoundAuxBlock[] = []
+  const auxSpoiled: SpoiledAuxBlock[] = []
   let failPersist = false
 
   const registry = new JobRegistry({
@@ -107,6 +111,8 @@ async function harness(overrides: Partial<StratumServerOptions> = {}): Promise<H
       batches.push([...shares])
     },
     onBlock: (block) => blocks.push(block),
+    onAuxBlock: (block) => auxBlocks.push(block),
+    onAuxSpoiled: (spoiled) => auxSpoiled.push(spoiled),
     log: (level, message, fields) => logs.push({ level, message, fields }),
     ...overrides,
   })
@@ -118,6 +124,8 @@ async function harness(overrides: Partial<StratumServerOptions> = {}): Promise<H
     logs,
     batches,
     blocks,
+    auxBlocks,
+    auxSpoiled,
     persisted: () => batches.flat(),
     push(options) {
       return registry.push(parseTemplate(fakeTemplateReply({ bitsHex: REGTEST_BITS, ...options })))
@@ -730,6 +738,8 @@ test('listen rejects rather than resolving when the port is taken', async () => 
     vardiff: TEST_VARDIFF,
     persistShares: async () => {},
     onBlock: () => {},
+    onAuxBlock: () => {},
+    onAuxSpoiled: () => {},
     log: () => {},
   })
 

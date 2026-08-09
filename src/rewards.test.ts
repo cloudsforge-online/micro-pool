@@ -191,6 +191,7 @@ async function block(
   const bounds = { first: args.from ?? all.first, last: all.last }
   await recordBlock(db(), {
     chain: 'ltc',
+    shareChain: 'ltc',
     height: args.height ?? HEIGHT,
     hash,
     foundByWorkerId: null,
@@ -394,6 +395,7 @@ test('A BLOCK WITH NO SHARES BEHIND IT PAYS NOBODY AND IS NOT WALKED AGAIN', { s
   // the row must not come back every ten minutes for ever.
   await recordBlock(db(), {
     chain: 'ltc',
+    shareChain: 'ltc',
     height: HEIGHT,
     hash: HASH,
     foundByWorkerId: null,

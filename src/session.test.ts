@@ -35,8 +35,10 @@ import {
   Session,
   VERSION_ROLLING_MASK,
   type AcceptedShare,
+  type FoundAuxBlock,
   type FoundBlock,
   type OutgoingMessage,
+  type SpoiledAuxBlock,
   type SessionDeps,
 } from './session.ts'
 
@@ -48,6 +50,8 @@ interface Harness {
   readonly sent: OutgoingMessage[]
   readonly shares: AcceptedShare[]
   readonly blocks: FoundBlock[]
+  readonly auxBlocks: FoundAuxBlock[]
+  readonly auxSpoiled: SpoiledAuxBlock[]
   readonly registry: JobRegistry
   readonly outcomes: { outcome: string; code: number | null }[]
   advance(ms: number): void
@@ -70,6 +74,8 @@ function harness(overrides: Partial<SessionDeps> = {}): Harness {
   const sent: OutgoingMessage[] = []
   const shares: AcceptedShare[] = []
   const blocks: FoundBlock[] = []
+  const auxBlocks: FoundAuxBlock[] = []
+  const auxSpoiled: SpoiledAuxBlock[] = []
   const outcomes: { outcome: string; code: number | null }[] = []
   let nowMs = START_MS
 
@@ -98,6 +104,8 @@ function harness(overrides: Partial<SessionDeps> = {}): Harness {
     send: (message) => sent.push(message),
     onAcceptedShare: (share) => shares.push(share),
     onBlock: (block) => blocks.push(block),
+    onAuxBlock: (block) => auxBlocks.push(block),
+    onAuxSpoiled: (spoiled) => auxSpoiled.push(spoiled),
     onOutcome: (outcome, code) => outcomes.push({ outcome, code }),
     ...overrides,
   })
@@ -107,6 +115,8 @@ function harness(overrides: Partial<SessionDeps> = {}): Harness {
     sent,
     shares,
     blocks,
+    auxBlocks,
+    auxSpoiled,
     registry,
     outcomes,
     advance(ms) {

@@ -310,6 +310,7 @@ test('a block is recorded once however many times it is submitted', { skip }, as
   const workerId = await seedShares('btc', 'acct', 'rig', 1)
   const block = {
     chain: 'btc' as const,
+    shareChain: 'btc' as const,
     height: 800_000,
     hash: 'a'.repeat(64),
     foundByWorkerId: workerId,
@@ -332,6 +333,7 @@ test('a block the node rejected is recorded with what it said', { skip }, async 
   // node liked has no record of the ones it did not.
   await recordBlock(db(), {
     chain: 'btc',
+    shareChain: 'btc',
     height: 800_000,
     hash: 'b'.repeat(64),
     foundByWorkerId: null,
@@ -363,8 +365,8 @@ test('the same block hash on two chains is two rows', { skip }, async () => {
     windowFirstShareId: null,
     windowLastShareId: null,
   }
-  const btc = await recordBlock(db(), { ...base, chain: 'btc' })
-  const ltc = await recordBlock(db(), { ...base, chain: 'ltc' })
+  const btc = await recordBlock(db(), { ...base, chain: 'btc', shareChain: 'btc' })
+  const ltc = await recordBlock(db(), { ...base, chain: 'ltc', shareChain: 'ltc' })
   assert.notEqual(btc, ltc)
 })
 
@@ -415,6 +417,7 @@ test('pruning removes old shares and stops at the oldest window a block depends 
   const fifth = BigInt(ids[4]?.share_id ?? '0')
   await recordBlock(db(), {
     chain: 'btc',
+    shareChain: 'btc',
     height: 800_000,
     hash: 'd'.repeat(64),
     foundByWorkerId: workerId,
