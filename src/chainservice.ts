@@ -48,6 +48,7 @@ import { AuxTemplateSource } from './auxtemplate.ts'
 import { submitFoundAuxBlock, submitFoundBlock } from './blocks.ts'
 import { insertShares, upsertWorker, type Exec } from './store.ts'
 import { algorithmFor, nameFor } from './chains.ts'
+import type { AuxChainId } from './chains.ts'
 import { hashesPerDifficulty, networkDifficultyOf } from './pow.ts'
 import { EXTRANONCE2_BYTES } from './stratum.ts'
 import type { AcceptedShare } from './session.ts'
@@ -453,6 +454,27 @@ export class ChainService {
    */
   get node(): NodeRpc {
     return this.#rpc
+  }
+
+  /** The chain merge-mined underneath this one, or null when none is configured. */
+  get auxChain(): AuxChainId | null {
+    return this.#auxConfig?.chain ?? null
+  }
+
+  /**
+   * The aux chain's node client, or null when there is no aux chain.
+   *
+   * Exposed for the same one caller and by the same argument as `node` above, and the argument is if
+   * anything stronger here: this is the node that answered the `submitauxblock`, and it is the only
+   * node in the estate that has ever heard of the Dogecoin hash the block row records. The parent's
+   * node would answer `-5` to every `getblock` for one, which `maturity.ts` reads as "not the node
+   * that took the submission" and leaves pending — so a maturity sweep pointed at the wrong one of
+   * these two would never mature a single merge-mined block and would never say why.
+   *
+   * Non-null whenever `auxChain` is, and the two are read together for exactly that reason.
+   */
+  get auxNode(): NodeRpc | null {
+    return this.#auxRpc
   }
 
   /** Whether this chain can currently serve work. Read by `/readyz`. */

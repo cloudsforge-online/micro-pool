@@ -717,7 +717,7 @@ test('a node configured for an aux chain nobody merged refuses, rather than neve
     (err: unknown) => {
       assert.ok(err instanceof EnvError)
       assert.match((err as Error).message, /POOL_LTC_AUX_CHAINS=doge/)
-      assert.match((err as Error).message, /never call that node/)
+      assert.match((err as Error).message, /never win a block on that chain/)
       return true
     },
   )
@@ -770,23 +770,36 @@ test('an empty aux list is the same as no aux list', () => {
   assert.deepEqual(loaded.chains[0]?.aux, [])
 })
 
-test('a payout minimum for an aux chain is refused while nothing can credit it', () => {
-  // Temporary and deliberately loud: a share does not yet record which chain it was credited for,
-  // so a minimum accepted here would be read, stored, logged as configured, and paid to nobody.
-  // The refusal goes away in the commit that adds `share_chain`.
+test('an aux chain is paid on its own minimum, independently of its parent', () => {
+  // The whole point of keying `minimums` on the mined chain rather than the share chain. These are
+  // amounts of two different assets — 1 DOGE is not 1 LTC and never will be — so one number cannot
+  // stand for both, and either may be set without the other. Here the parent has none at all and
+  // Dogecoin is still paid, which is the asymmetric case a shared threshold would have made
+  // impossible to express.
+  const loaded = loadEnv({
+    ...BASE,
+    ...LTC,
+    ...DOGE,
+    ...IDENTITY,
+    LEDGER_URL: 'http://ledger:4000',
+    POOL_IDENTITY_CREDENTIAL: CREDENTIAL,
+    POOL_CHAINS: 'ltc',
+    POOL_LTC_AUX_CHAINS: 'doge',
+    POOL_DOGE_MINIMUM_PAYOUT: '100000000',
+  })
+  assert.equal(loaded.payouts?.minimums.get('doge'), 100_000_000n)
+  assert.equal(loaded.payouts?.minimums.has('ltc'), false)
+})
+
+test('a payout minimum for an aux chain nobody merges refuses, like one for an unmined parent', () => {
+  // The same mistake as `POOL_BTC_MINIMUM_PAYOUT` with btc absent from POOL_CHAINS, and it deserves
+  // the same answer: the variable says "pay these miners" for a chain this pool will never win a
+  // block on, so there is nobody it could ever pay.
   assert.throws(
-    () =>
-      loadEnv({
-        ...BASE,
-        ...LTC,
-        ...DOGE,
-        POOL_CHAINS: 'ltc',
-        POOL_LTC_AUX_CHAINS: 'doge',
-        POOL_DOGE_MINIMUM_PAYOUT: '100000',
-      }),
+    () => loadEnv({ ...BASE, ...LTC, ...DOGE, POOL_CHAINS: 'ltc', POOL_DOGE_MINIMUM_PAYOUT: '100000' }),
     (err: unknown) => {
       assert.ok(err instanceof EnvError)
-      assert.match((err as Error).message, /does not\n?\s*yet pay out|does not yet pay out/)
+      assert.match((err as Error).message, /no chain merges it/)
       return true
     },
   )

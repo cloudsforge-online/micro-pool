@@ -63,6 +63,7 @@ import {
   POOL_CHAIN_IDS,
   REFUSED_CHAINS,
   type AuxChainId,
+  type MinedChainId,
   type PoolChainId,
 } from './chains.ts'
 import { STRATUM_WS_PATH } from './wsstratum.ts'
@@ -387,8 +388,13 @@ export interface PayoutConfig {
    * no minimum is not paid at all and that is a supported configuration: an estate that pays
    * Litecoin miners and has not decided what to do about Bitcoin is a decision, not a half-made one.
    * `bigint` because these are compared against amounts that do not fit a double.
+   *
+   * Keyed on the MINED chain, so a merge-mined one is in here on exactly the same terms as a parent
+   * — `POOL_DOGE_MINIMUM_PAYOUT` beside `POOL_LTC_MINIMUM_PAYOUT`, either or both or neither. The
+   * two are genuinely independent: they are amounts of different assets, in different units, at
+   * different prices, and a Dogecoin block pays its finder in DOGE however the LTC threshold is set.
    */
-  readonly minimums: ReadonlyMap<PoolChainId, bigint>
+  readonly minimums: ReadonlyMap<MinedChainId, bigint>
 }
 
 /**
@@ -807,10 +813,18 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
    * Each is a state somebody started and did not finish, and each would otherwise produce a pool
    * that pays nobody while its operator believes it pays everybody. Nothing here falls back.
    */
-  const minimums = new Map<PoolChainId, bigint>()
+  const minimums = new Map<MinedChainId, bigint>()
   for (const chain of chains) {
     const minimum = optionalUnits(source, `POOL_${chain.chain.toUpperCase()}_MINIMUM_PAYOUT`)
     if (minimum !== null) minimums.set(chain.chain, minimum)
+    // A merge-mined chain's minimum is read on exactly the same terms as its parent's, and is
+    // INDEPENDENT of it. Paying Litecoin miners in LTC and not in DOGE is a real configuration —
+    // the amounts are in different units of different assets at different prices, and one number
+    // cannot stand for both — so the two are read separately and either may be absent.
+    for (const aux of chain.aux) {
+      const auxMinimum = optionalUnits(source, `POOL_${aux.chain.toUpperCase()}_MINIMUM_PAYOUT`)
+      if (auxMinimum !== null) minimums.set(aux.chain, auxMinimum)
+    }
   }
   // A minimum for a chain this pool does not mine is a variable that does nothing, typed by somebody
   // who believes that chain is being paid. Checked against POOL_CHAINS rather than against the two
@@ -826,43 +840,25 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     }
   }
   /*
-   * An aux chain's minimum is refused OUTRIGHT for now, and the refusal is temporary by design.
+   * A node URL, a payout address or a minimum for an aux chain nobody merged is the other half of
+   * the same mistake, and it is the likelier one: a deploy that sets `POOL_DOGE_NODE_URL` and
+   * forgets `POOL_LTC_AUX_CHAINS` has a dogecoind running, reachable, configured — and never called.
+   * Nothing fails, no log line is written, and the pool mines Litecoin exactly as it did before.
    *
-   * Crediting a DOGE block needs a share to say which chain it was counted for — `share_chain`, the
-   * migration this branch has not written yet — and the credit and flush jobs key on a chain the
-   * handlers still validate with `isPoolChainId`. So a `POOL_DOGE_MINIMUM_PAYOUT` accepted today
-   * would be read, stored, logged as configured, and then paid to nobody, which is the one outcome
-   * every refusal in this block exists to prevent. **Delete this loop in the commit that wires aux
-   * payouts, and widen `minimums` to `MinedChainId` in the same change** — the union type and
-   * `MINED_CHAIN_IDS` are already in `chains.ts` waiting for it.
-   */
-  for (const name of AUX_CHAIN_IDS) {
-    const variable = `POOL_${name.toUpperCase()}_MINIMUM_PAYOUT`
-    if (source[variable]?.trim()) {
-      throw new EnvError(
-        `${variable} sets a payout minimum for ${name}, which this pool merge-mines but does not ` +
-          'yet pay out: a share does not record which chain it was credited for. Mining Dogecoin ' +
-          'works without it — the blocks are won and recorded — but nobody is credited, so setting ' +
-          'this now would say otherwise. Remove the variable.',
-      )
-    }
-  }
-  /*
-   * A node URL or a payout address for an aux chain nobody merged is the other half of the same
-   * mistake, and it is the likelier one: a deploy that sets `POOL_DOGE_NODE_URL` and forgets
-   * `POOL_LTC_AUX_CHAINS` has a dogecoind running, reachable, configured — and never called. Nothing
-   * fails, no log line is written, and the pool mines Litecoin exactly as it did before.
+   * `MINIMUM_PAYOUT` is in the list for the same reason it is checked against `POOL_CHAINS` above:
+   * it is the variable that says "pay these miners", and a pool that is not merging the chain will
+   * never win a block on it to pay anyone for.
    */
   const merged = new Set<AuxChainId>(chains.flatMap((chain) => chain.aux.map((aux) => aux.chain)))
   for (const name of AUX_CHAIN_IDS) {
     if (merged.has(name)) continue
-    for (const suffix of ['NODE_URL', 'PAYOUT_ADDRESS'] as const) {
+    for (const suffix of ['NODE_URL', 'PAYOUT_ADDRESS', 'MINIMUM_PAYOUT'] as const) {
       const variable = `POOL_${name.toUpperCase()}_${suffix}`
       if (!source[variable]?.trim()) continue
       throw new EnvError(
         `${variable} configures ${name} and no chain merges it. Set ` +
           `POOL_${AUX_PARENT[name].toUpperCase()}_AUX_CHAINS=${name} to mine it, or remove the ` +
-          'variable — as it stands this pool would never call that node.',
+          'variable — as it stands this pool would never win a block on that chain.',
       )
     }
   }

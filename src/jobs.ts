@@ -40,7 +40,7 @@ import type { Network } from '@cloudsforge/contracts-chain'
 import { pruneShares, type Exec } from './store.ts'
 import { sweepMaturity } from './maturity.ts'
 import { creditMaturedBlocks } from './rewards.ts'
-import { assetFor, isPoolChainId, type PoolChainId } from './chains.ts'
+import { isMinedChainId, isPoolChainId, minedAssetFor, type AuxChainId, type MinedChainId, type PoolChainId } from './chains.ts'
 import type { PayoutSink } from './payouts.ts'
 import type { NodeRpc } from './rpc.ts'
 
@@ -123,7 +123,13 @@ export interface JobDeps {
   readonly sql: Exec
   readonly logger: Logger
   readonly metrics: Metrics
-  readonly chains: readonly PoolChainId[]
+  /*
+   * There is deliberately no chain LIST here. Which chains have work is `recurringFor`'s question,
+   * asked once at boot when the queue is seeded; a handler is given the chain in its own payload and
+   * validates it there. A second list on this interface would be a second answer to the same
+   * question, and the failure it invites is the quiet one — a chain seeded and not handled, or
+   * handled and not seeded, with nothing in either log to say so.
+   */
   readonly retentionDays: number
   /**
    * The node client for one chain, or null when that chain has none configured.
@@ -134,7 +140,7 @@ export interface JobDeps {
    * disagree about the tip, and a verdict from a different node is a verdict about a different chain
    * of blocks than the one this pool mined on.
    */
-  readonly rpcFor: (chain: PoolChainId) => NodeRpc | null
+  readonly rpcFor: (chain: MinedChainId) => NodeRpc | null
   /**
    * Which network this pool mines. Part of every credit key, so it cannot be defaulted or guessed:
    * a testnet credit under a mainnet key would be the same movement to the ledger.
@@ -149,7 +155,7 @@ export interface JobDeps {
    * writes nothing at all rather than writing `() => null` to satisfy a type. Absence and "no sink
    * for this chain" are the same answer here and both mean neither payout handler is registered.
    */
-  readonly payoutSinkFor?: (chain: PoolChainId) => JobPayoutSink | null
+  readonly payoutSinkFor?: (chain: MinedChainId) => JobPayoutSink | null
 }
 
 /**
@@ -160,41 +166,66 @@ export interface JobDeps {
  * `LedgerPayoutSink`.
  */
 export interface JobPayoutSink extends PayoutSink {
-  flushPending(chain: PoolChainId, limit: number): Promise<number>
+  flushPending(chain: MinedChainId, limit: number): Promise<number>
 }
 
 /**
  * The recurring set for a given chain list. One row per chain per kind, seeded at boot.
  *
- * `payoutChains` is a SUBSET of `chains` and defaults to none, which is what keeps
+ * `payoutChains` is a SUBSET of `chains ∪ aux` and defaults to none, which is what keeps
  * `pool.flush-payouts` out of the queue entirely on a deployment with payouts off. It is a separate
  * argument rather than a flag on each chain because the caller that knows the answer is `index.ts`,
  * which reads `env.payouts`, and this module deliberately imports nothing from `env.ts`.
+ *
+ * ## Why an aux chain gets two of the four kinds and not four
+ *
+ * `aux` is the merge-mined chains — Dogecoin under Litecoin — and they are listed separately rather
+ * than folded into `chains` because the four kinds do not divide the same way:
+ *
+ *   - **The prune is per SHARE chain, so an aux chain never gets one.** `pool_shares` has no
+ *     Dogecoin rows and never will; the shares that won a Dogecoin block are Litecoin's, and they
+ *     are pruned by Litecoin's row. A `pool.prune-shares` keyed `chain:doge` would run for ever,
+ *     delete nothing, log `pruned 0` every hour, and read as a prune that has quietly stopped
+ *     working.
+ *   - **Maturity and credit are per BLOCK chain, so an aux chain gets both.** A Dogecoin block is in
+ *     Dogecoin's chain, matures on Dogecoin's schedule and pays in DOGE. `maturity.ts` sets out why
+ *     the two chains' fates are independent, and there is no sense in which Litecoin's sweep could
+ *     answer for it.
  */
 export function recurringFor(
   chains: readonly PoolChainId[],
-  payoutChains: readonly PoolChainId[] = [],
+  payoutChains: readonly MinedChainId[] = [],
+  aux: readonly AuxChainId[] = [],
 ): ReadonlyArray<{ kind: string; key: string; everyMs: number }> {
-  const paid = new Set(payoutChains)
-  return chains.flatMap((chain) => [
-    { kind: PRUNE_KIND, key: `chain:${chain}`, everyMs: PRUNE_EVERY_MS },
-    { kind: MATURITY_KIND, key: `chain:${chain}`, everyMs: MATURITY_EVERY_MS },
-    ...(paid.has(chain)
+  const paid = new Set<string>(payoutChains)
+  const credit = (chain: MinedChainId) =>
+    paid.has(chain)
       ? [
           { kind: CREDIT_KIND, key: `chain:${chain}`, everyMs: CREDIT_EVERY_MS },
           { kind: PAYOUT_FLUSH_KIND, key: `chain:${chain}`, everyMs: PAYOUT_FLUSH_EVERY_MS },
         ]
-      : []),
-  ])
+      : []
+  return [
+    ...chains.flatMap((chain) => [
+      { kind: PRUNE_KIND, key: `chain:${chain}`, everyMs: PRUNE_EVERY_MS },
+      { kind: MATURITY_KIND, key: `chain:${chain}`, everyMs: MATURITY_EVERY_MS },
+      ...credit(chain),
+    ]),
+    ...aux.flatMap((chain) => [
+      { kind: MATURITY_KIND, key: `chain:${chain}`, everyMs: MATURITY_EVERY_MS },
+      ...credit(chain),
+    ]),
+  ]
 }
 
 /** Enqueue the recurring set at boot. `keep` means N replicas booting together produce one row. */
 export async function seedRecurring(
   queue: JobQueue,
   chains: readonly PoolChainId[],
-  payoutChains: readonly PoolChainId[] = [],
+  payoutChains: readonly MinedChainId[] = [],
+  aux: readonly AuxChainId[] = [],
 ): Promise<void> {
-  for (const job of recurringFor(chains, payoutChains)) {
+  for (const job of recurringFor(chains, payoutChains, aux)) {
     await queue.enqueue({ kind: job.kind, key: job.key, payload: { chain: job.key.slice('chain:'.length) }, onConflict: 'keep' })
   }
 }
@@ -214,13 +245,14 @@ export function rescheduleRecurring(
   queue: JobQueue,
   logger: Logger,
   chains: readonly PoolChainId[],
-  payoutChains: readonly PoolChainId[] = [],
+  payoutChains: readonly MinedChainId[] = [],
+  aux: readonly AuxChainId[] = [],
 ): (event: RunnerEvent) => void {
   // Keyed on kind and key together, joined by NUL: the runner's events carry both, and a job kind
   // is only unique per key. The separator is spelled as the escape `\0` rather than as the byte —
   // see the note in `chainservice.ts`; a literal NUL in the source aborts the estate-wide
   // `conformance` sweep, which reads every `.ts` file in every checkout as UTF-8 text.
-  const byKey = new Map(recurringFor(chains, payoutChains).map((r) => [`${r.kind}\0${r.key}`, r]))
+  const byKey = new Map(recurringFor(chains, payoutChains, aux).map((r) => [`${r.kind}\0${r.key}`, r]))
   return (event) => {
     if (event.type !== 'completed') return
     const recurring = event.kind && event.key ? byKey.get(`${event.kind}\0${event.key}`) : undefined
@@ -258,8 +290,11 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
 
   runner.register<{ chain?: string }>(MATURITY_KIND, async (job, ctx) => {
     const chain = job.payload.chain
-    if (typeof chain !== 'string' || !isPoolChainId(chain)) {
-      throw new Error(`${MATURITY_KIND} requires a payload naming a chain this pool serves`)
+    // `isMinedChainId`, not `isPoolChainId`: a block can be won on a merge-mined chain and it is
+    // asked about on that chain's own node. The prune above stays narrow for the opposite reason —
+    // `recurringFor` sets out which kinds divide by block chain and which by share chain.
+    if (typeof chain !== 'string' || !isMinedChainId(chain)) {
+      throw new Error(`${MATURITY_KIND} requires a payload naming a chain this pool mines`)
     }
     if (ctx.signal.aborted) return
     const rpc = deps.rpcFor(chain)
@@ -294,8 +329,8 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
   if (sinkFor) {
     runner.register<{ chain?: string }>(CREDIT_KIND, async (job, ctx) => {
       const chain = job.payload.chain
-      if (typeof chain !== 'string' || !isPoolChainId(chain)) {
-        throw new Error(`${CREDIT_KIND} requires a payload naming a chain this pool serves`)
+      if (typeof chain !== 'string' || !isMinedChainId(chain)) {
+        throw new Error(`${CREDIT_KIND} requires a payload naming a chain this pool mines`)
       }
       if (ctx.signal.aborted) return
       const sink = sinkFor(chain)
@@ -311,7 +346,9 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
         // Read from the chain table rather than passed in, for the reason `chains.ts` gives about
         // every number that exists in `contracts-chain`: a second copy of "ltc means LTC" is a
         // second thing that can be wrong, and this one would credit a miner in the wrong asset.
-        asset: assetFor(chain),
+        // The BLOCK's chain, which for a merge-mined block is the aux one — a miner who found a
+        // Dogecoin block is owed DOGE, whatever the shares that won it were hashed for.
+        asset: minedAssetFor(chain),
         feeBasisPoints: deps.feeBasisPoints,
         log: (level, message, fields) => deps.logger[level](message, fields),
         onOutcome: (outcome) => deps.metrics.increment('pool_payout_claim_total', { chain, outcome }),
@@ -324,8 +361,8 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
 
     runner.register<{ chain?: string }>(PAYOUT_FLUSH_KIND, async (job, ctx) => {
       const chain = job.payload.chain
-      if (typeof chain !== 'string' || !isPoolChainId(chain)) {
-        throw new Error(`${PAYOUT_FLUSH_KIND} requires a payload naming a chain this pool serves`)
+      if (typeof chain !== 'string' || !isMinedChainId(chain)) {
+        throw new Error(`${PAYOUT_FLUSH_KIND} requires a payload naming a chain this pool mines`)
       }
       if (ctx.signal.aborted) return
       const sink = sinkFor(chain)

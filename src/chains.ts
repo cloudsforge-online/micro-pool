@@ -245,6 +245,19 @@ export function auxNameFor(chain: AuxChainId): string {
   return chainSpec(auxAssetFor(chain)).name
 }
 
+/**
+ * The asset a block on ANY mined chain pays in — the one place the two lookups above are joined.
+ *
+ * For the callers downstream of a found block: maturity, allocation, the payout sink. They hold a
+ * `MinedChainId` because a block can be won on either kind of chain, and they have no business
+ * knowing which kind this one is; what they need is the asset the reward is denominated in, and
+ * that question has the same answer for both. Written here rather than as a ternary at each call
+ * site, because a ternary at each call site is where one of them eventually gets it backwards.
+ */
+export function minedAssetFor(chain: MinedChainId): AssetCode {
+  return isPoolChainId(chain) ? assetFor(chain) : auxAssetFor(chain)
+}
+
 export function isPoolChainId(value: string): value is PoolChainId {
   return (POOL_CHAIN_IDS as readonly string[]).includes(value)
 }

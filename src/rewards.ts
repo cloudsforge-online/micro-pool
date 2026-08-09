@@ -79,12 +79,18 @@ import {
   windowShares,
   type Exec,
 } from './store.ts'
-import type { PoolChainId } from './chains.ts'
+import type { MinedChainId } from './chains.ts'
 
 export interface RewardCreditDeps {
   readonly sql: Exec
   readonly sink: PayoutSink
-  readonly chain: PoolChainId
+  /**
+   * The chain whose matured blocks this sweep allocates — which for a merge-mined chain is NOT the
+   * chain the shares are on. Every use of it below is about the BLOCK: which rows to read, which
+   * asset the reward is denominated in, which credit key the movement gets. The shares come from
+   * `block.shareChain` and from nowhere else; see the read site, and migration 7.
+   */
+  readonly chain: MinedChainId
   readonly network: Network
   readonly asset: AssetCode
   /** `POOL_FEE_BASIS_POINTS`, required with no default. `pplns.ts` says why there is no default. */

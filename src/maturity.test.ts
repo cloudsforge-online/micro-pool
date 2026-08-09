@@ -14,7 +14,7 @@ import {
   type Exec,
 } from './store.ts'
 import { difficultyUnits } from './pplns.ts'
-import { MATURITY_KIND, recurringFor } from './jobs.ts'
+import { MATURITY_KIND, PRUNE_KIND, recurringFor } from './jobs.ts'
 
 /**
  * The watcher, in two tiers, for the same reason `store.test.ts` is.
@@ -74,7 +74,7 @@ function fakeRpc(script: {
 const HASH = '0000000000000000000000009f2b1a4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6a'
 const HEIGHT = 2_912_004
 
-test('COINBASE MATURITY IS 100 ON BOTH CHAINS AND IS NOT THE DEPOSIT CONFIRMATION DEPTH', () => {
+test('COINBASE MATURITY IS EACH CHAIN\'S OWN CONSENSUS RULE, NOT THE DEPOSIT CONFIRMATION DEPTH', () => {
   // Pinned against being "tidied up" into `chainSpec().confirmations` later. Those are 12 for LTC and
   // 6 for BTC and they are the estate's DEPOSIT credit depths — a risk judgement about somebody
   // else's incoming payment. `COINBASE_MATURITY` is not a judgement: it is a consensus rule, and a
@@ -82,6 +82,34 @@ test('COINBASE MATURITY IS 100 ON BOTH CHAINS AND IS NOT THE DEPOSIT CONFIRMATIO
   // for the other would make this pool declare a reward spendable roughly eight times too early.
   assert.equal(COINBASE_MATURITY.btc, 100)
   assert.equal(COINBASE_MATURITY.ltc, 100)
+  // And pinned against the OTHER tidy-up, which is the likelier one now that there are three chains:
+  // making them all 100 because two of them are. Dogecoin's is 240 from height 145000 — read from
+  // `chainparams.cpp` at v1.14.9, and `maturity.ts` carries the provenance. A Dogecoin block
+  // declared mature at 100 would be allocated and credited 140 blocks before its coinbase could be
+  // spent, which is a payout the pool cannot fund.
+  assert.equal(COINBASE_MATURITY.doge, 240)
+  assert.notEqual(COINBASE_MATURITY.doge, COINBASE_MATURITY.ltc)
+})
+
+test('A MERGE-MINED BLOCK IS JUDGED ON ITS OWN CHAIN AND ITS OWN NUMBER', async () => {
+  // The whole reason `chain` here is a `MinedChainId`. 100 confirmations matures a Litecoin block
+  // and leaves a Dogecoin one pending, and the sweep for `doge` puts this `getblock` to dogecoind —
+  // the node that answered the `submitauxblock` — because it is the only node in the estate that has
+  // ever heard of the hash.
+  const young = fakeRpc({
+    getblock: () => ({ hash: HASH, confirmations: 100, height: HEIGHT }),
+    getblockhash: () => HASH,
+  })
+  const pending = await inspectBlock(young.rpc, { chain: 'doge', hash: HASH, height: HEIGHT })
+  assert.equal(pending.status, 'pending')
+  assert.match(pending.detail ?? '', /100 of 240 confirmations/)
+
+  const buried = fakeRpc({
+    getblock: () => ({ hash: HASH, confirmations: 240, height: HEIGHT }),
+    getblockhash: () => HASH,
+  })
+  const matured = await inspectBlock(buried.rpc, { chain: 'doge', hash: HASH, height: HEIGHT })
+  assert.equal(matured.status, 'matured')
 })
 
 test('A BLOCK THE NODE REPORTS AS OFF THE ACTIVE CHAIN IS ORPHANED', async () => {
@@ -205,6 +233,16 @@ test('THE SWEEP IS SCHEDULED PER CHAIN, AND RE-ARMS UNDER THE SAME KEY IT WAS EN
   assert.deepEqual(
     maturity.map((job) => job.key),
     ['chain:btc', 'chain:ltc'],
+  )
+  // A merge-mined chain gets a sweep of its own and NOT a prune of its own. `pool_shares` has no
+  // Dogecoin rows — the shares that won a Dogecoin block are Litecoin's — so a `pool.prune-shares`
+  // keyed `chain:doge` would run hourly for ever, delete nothing, and read as a prune that has
+  // quietly stopped working. The maturity sweep is the opposite case: the block is Dogecoin's, it is
+  // orphaned by a Dogecoin reorg, and no Litecoin sweep could answer for it.
+  const merged = recurringFor(['ltc'], [], ['doge'])
+  assert.deepEqual(
+    merged.map((job) => `${job.kind} ${job.key}`),
+    [`${PRUNE_KIND} chain:ltc`, `${MATURITY_KIND} chain:ltc`, `${MATURITY_KIND} chain:doge`],
   )
   // The lease names the contended resource. Both chains' sweeps are independent work against
   // independent nodes, and one key for both would make the Bitcoin sweep wait behind the Litecoin one.

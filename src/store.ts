@@ -261,7 +261,7 @@ export interface MaturityCandidate {
  */
 export async function blocksAwaitingMaturity(
   exec: Exec,
-  args: { chain: PoolChainId; limit: number },
+  args: { chain: MinedChainId; limit: number },
 ): Promise<MaturityCandidate[]> {
   const rows = await exec<{ hash: string; height: number }[]>`
     select hash, height
@@ -291,7 +291,7 @@ export async function blocksAwaitingMaturity(
 export async function setBlockMaturity(
   exec: Exec,
   args: {
-    chain: PoolChainId
+    chain: MinedChainId
     hash: string
     status: 'pending' | 'matured' | 'orphaned'
     confirmations: number | null
@@ -332,7 +332,7 @@ export async function setBlockMaturity(
  */
 export async function payableBlocks(
   exec: Exec,
-  args: { chain: PoolChainId; limit: number },
+  args: { chain: MinedChainId; limit: number },
 ): Promise<MaturityCandidate[]> {
   const rows = await exec<{ hash: string; height: number }[]>`
     select hash, height
@@ -387,7 +387,7 @@ export interface PayableBlockRow {
  */
 export async function blocksAwaitingCredit(
   exec: Exec,
-  args: { chain: PoolChainId; limit: number },
+  args: { chain: MinedChainId; limit: number },
 ): Promise<PayableBlockRow[]> {
   const rows = await exec<
     {
@@ -447,7 +447,7 @@ function asPoolChainId(value: string, hash: string): PoolChainId {
  */
 export async function markBlockPayoutsCredited(
   exec: Exec,
-  args: { chain: PoolChainId; hash: string },
+  args: { chain: MinedChainId; hash: string },
 ): Promise<boolean> {
   const rows = await exec<{ id: string }[]>`
     update pool_blocks
@@ -499,7 +499,7 @@ export async function windowShares(
 }
 
 export interface PayoutCreditInput {
-  readonly chain: PoolChainId
+  readonly chain: MinedChainId
   readonly network: string
   readonly blockHash: string
   readonly blockHeight: number
@@ -552,7 +552,7 @@ export async function claimPayoutCredit(exec: Exec, credit: PayoutCreditInput): 
  */
 export async function markPayoutCredited(
   exec: Exec,
-  args: { chain: PoolChainId; id: number; ledgerEntryId: string },
+  args: { chain: MinedChainId; id: number; ledgerEntryId: string },
 ): Promise<boolean> {
   const rows = await exec<{ id: string }[]>`
     update pool_payout_credits
@@ -588,7 +588,7 @@ export interface PendingPayoutCredit {
  */
 export async function pendingPayoutCredits(
   exec: Exec,
-  args: { chain: PoolChainId; limit: number },
+  args: { chain: MinedChainId; limit: number },
 ): Promise<PendingPayoutCredit[]> {
   const rows = await exec<
     {

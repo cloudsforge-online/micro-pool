@@ -38,7 +38,7 @@ import { ChainService, registerPoolMetrics } from './chainservice.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
 import { CUSTODY_BACKING_CLOSED, LedgerPayoutSink } from './payouts.ts'
 import { httpLedgerClient, LEDGER_SCOPES } from './ledgerclient.ts'
-import type { PoolChainId } from './chains.ts'
+import type { MinedChainId } from './chains.ts'
 import type { Exec } from './store.ts'
 
 // 1. Environment. Importing `./env.ts` validated it; a missing variable has already exited with a
@@ -174,7 +174,19 @@ if (env.payouts !== null) {
     )
   }
 }
-const payoutChains = env.chains.map((chain) => chain.chain).filter((chain) => payoutSinks.has(chain))
+/**
+ * Every chain a block can be won on here: the parents, then whatever each one merge-mines.
+ *
+ * Derived from the environment rather than from `MINED_CHAIN_IDS`, because the question is not
+ * "what could this build mine" but "what is this process actually mining" — a deployment with no
+ * `POOL_LTC_AUX_CHAINS` must not seed a Dogecoin maturity sweep against a node it has no client for.
+ */
+const minedChainIds: readonly MinedChainId[] = [
+  ...env.chains.map((chain) => chain.chain),
+  ...env.chains.flatMap((chain) => chain.aux.map((aux) => aux.chain)),
+]
+const auxChainIds = env.chains.flatMap((chain) => chain.aux.map((aux) => aux.chain))
+const payoutChains = minedChainIds.filter((chain) => payoutSinks.has(chain))
 logger.info('payouts', {
   // Both facts, every boot, because they are different and an operator who confused them would be
   // wrong in the expensive direction. `configured` says somebody set the variables. `enabled` says
@@ -290,7 +302,7 @@ attachStratumWebSocket({
 //    claiming before it stops serving — `shouldClaim` is wired to the Lifecycle for exactly that.
 const queue = new JobQueue(sql as unknown as JobsSql, { owner: env.instanceId })
 const chainIds = env.chains.map((chain) => chain.chain)
-const reschedule = rescheduleRecurring(queue, logger, chainIds, payoutChains)
+const reschedule = rescheduleRecurring(queue, logger, chainIds, payoutChains, auxChainIds)
 const runner = new JobRunner({
   queue,
   concurrency: 2,
@@ -317,13 +329,21 @@ registerHandlers(runner, {
   sql: sql as unknown as Exec,
   logger,
   metrics,
-  chains: chainIds,
   retentionDays: env.shareRetentionDays,
   // The same node client the templater and the block submission use, taken off the ChainService
   // rather than constructed again. `chainservice.ts` says why the identity of the node matters for a
   // maturity verdict, and it is not a detail: a second client pointed at a second node would answer
   // about a different chain of blocks.
-  rpcFor: (chain) => chains.find((service) => service.chain === chain)?.node ?? null,
+  //
+  // The aux arm is the same rule applied to a chain that has no `ChainService` of its own: a
+  // Dogecoin block was submitted through the dogecoind that its parent's service holds, so that is
+  // the client that has to answer for it. Searched second, and it can only ever match once: an aux
+  // chain has exactly one parent in `AUX_PARENT` and `loadAuxChains` refuses any other pairing, so
+  // no two services can hold a client for the same aux chain.
+  rpcFor: (chain) =>
+    chains.find((service) => service.chain === chain)?.node ??
+    chains.find((service) => service.auxChain === chain)?.auxNode ??
+    null,
   // Both are part of a credit rather than of a job: the network is inside every credit key and the
   // fee comes off the top of every block reward. Passed from the environment that already validated
   // them, so `rewards.ts` never reads configuration and stays testable without any.
@@ -332,9 +352,9 @@ registerHandlers(runner, {
   // Omitted entirely when payouts are off, which is what keeps `pool.credit-blocks` and
   // `pool.flush-payouts` unregistered rather than registered-and-skipping. Spread rather than a
   // ternary yielding `undefined`, so the property is absent under `exactOptionalPropertyTypes`.
-  ...(payoutSinks.size > 0 ? { payoutSinkFor: (chain: PoolChainId) => payoutSinks.get(chain) ?? null } : {}),
+  ...(payoutSinks.size > 0 ? { payoutSinkFor: (chain: MinedChainId) => payoutSinks.get(chain) ?? null } : {}),
 })
-await seedRecurring(queue, chainIds, payoutChains)
+await seedRecurring(queue, chainIds, payoutChains, auxChainIds)
 runner.start()
 
 // 9. Start the chains. This is where the node is contacted, the payout address is validated and the
