@@ -14,7 +14,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { JOBS_SCHEMA_SQL } from '@cloudsforge/jobs'
-import { BASELINE_VERSION, MIGRATIONS, SCHEMA_VERSION } from './migrations.ts'
+import { BASELINE_VERSION, MIGRATIONS, POOL_CHAIN_TABLES, POOL_TABLES, SCHEMA_VERSION } from './migrations.ts'
 
 test('versions are unique, positive and strictly increasing', () => {
   const versions = MIGRATIONS.map((m) => m.version)
@@ -95,4 +95,58 @@ test('migrations are idempotent in shape', () => {
   const pool = MIGRATIONS.find((m) => m.version === 2)?.up ?? ''
   const creates = pool.match(/create table (?!if not exists)/g)
   assert.equal(creates, null, 'a table is created without `if not exists`')
+})
+
+/* ------------------------------------------------ the account link (micro-org#289) */
+
+test('THE ACCOUNT LINK IS A NEW TABLE, AND `pool_workers` DID NOT GROW A USER COLUMN', () => {
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // The property migration 2 wrote down and this change had to preserve: there is no join from a
+  // worker to an estate user, because a miner points hardware at a port and gives an address, and
+  // requiring an account first would exclude every miner who already has one.
+  //
+  // The obvious implementation of browser mining — a nullable `user_id` on `pool_workers` — would
+  // have retired that sentence quietly. It is not made. This test fails if anybody makes it later.
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  const workers = MIGRATIONS.find((m) => m.version === 2)?.up ?? ''
+  const body = workers.slice(workers.indexOf('create table if not exists pool_workers'))
+  assert.ok(!/\buser_id\b/.test(body.slice(0, body.indexOf(');'))), 'pool_workers grew a user column')
+  // And no later migration added one either, which is the version of this check that keeps working.
+  const later = MIGRATIONS.filter((m) => m.version > 2)
+    .map((m) => m.up.replace(/--[^\n]*/g, ''))
+    .join('\n')
+  assert.ok(!/alter table\s+pool_workers/i.test(later), 'a later migration altered pool_workers')
+
+  const link = MIGRATIONS.find((m) => m.version === 3)
+  assert.equal(link?.name, 'account-links')
+  assert.match(link?.up ?? '', /create table if not exists pool_account_links/)
+})
+
+test('one user has one account and one account has one user', () => {
+  // Both halves are load-bearing and neither is decoration. Without the first, two ticket requests
+  // racing on first use produce two labels and split a share history in half with no way to put it
+  // back together. Without the second, one person's work can be credited into another's page.
+  const link = MIGRATIONS.find((m) => m.version === 3)?.up ?? ''
+  assert.match(link, /user_id\s+text\s+primary key/)
+  assert.match(link, /unique \(account\)/)
+})
+
+test('the account link is not chain-scoped, and the scoping sweep knows it', () => {
+  // The one table here whose rows do not belong to a chain, because a person does not. If it were
+  // in `POOL_CHAIN_TABLES` the sweep in `store.test.ts` would demand a `chain` filter on a statement
+  // that has no chain to filter by, and the fix somebody reached for would be a column.
+  assert.ok(!POOL_CHAIN_TABLES.includes('pool_account_links'))
+  assert.ok(POOL_TABLES.includes('pool_account_links'))
+  // Every chain-scoped table is still in the full list, so the sweep and the teardown stay in step.
+  for (const table of POOL_CHAIN_TABLES) assert.ok(POOL_TABLES.includes(table), `${table} is missing`)
+})
+
+test('the account link stores no estate identity beyond the id, and no ticket', () => {
+  // A ticket lives for sixty seconds in memory; a row lives for ever. A handle or an email here
+  // would make a browser miner's estate identity a permanent property of the pool's database, and
+  // `GET /v1/pool/shares?account=` is public.
+  const link = (MIGRATIONS.find((m) => m.version === 3)?.up ?? '').replace(/--[^\n]*/g, '').toLowerCase()
+  for (const forbidden of ['email', 'handle', 'ticket', 'token', 'secret']) {
+    assert.ok(!link.includes(forbidden), `the account link stores "${forbidden}"`)
+  }
 })

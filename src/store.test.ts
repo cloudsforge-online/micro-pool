@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
-import { MIGRATIONS, POOL_TABLES } from './migrations.ts'
+import { MIGRATIONS, POOL_CHAIN_TABLES, POOL_TABLES } from './migrations.ts'
 import { difficultyUnits } from './pplns.ts'
 import {
   chainActivity,
@@ -16,8 +16,11 @@ import {
   sharesForAccount,
   upsertWorker,
   workersForAccount,
+  findAccountLink,
+  insertAccountLink,
   type Exec,
 } from './store.ts'
+import { accountForUser } from './tickets.ts'
 
 /**
  * The store, in two tiers.
@@ -69,8 +72,12 @@ test('every statement that touches a pool table filters on the chain', () => {
   // and a query that reads both chains' shares as one.
   const source = code(readFileSync(new URL('./store.ts', import.meta.url), 'utf8'))
   const literals = source.match(/`[^`]*`/g) ?? []
+  // Driven by the CHAIN-scoped tables, not by every table this service owns. `pool_account_links`
+  // maps an estate user to their pool account label and carries no chain column at all — migration 3
+  // explains why a person is not per chain — so sweeping it here would demand a filter on a column
+  // that does not exist, and the only way to satisfy that would be to add one.
   const statements = literals.filter((literal) =>
-    POOL_TABLES.some((table) => new RegExp(`\\b${table}\\b`).test(literal)),
+    POOL_CHAIN_TABLES.some((table) => new RegExp(`\\b${table}\\b`).test(literal)),
   )
   assert.ok(statements.length >= 8, `expected the store's statements, found ${statements.length}`)
   for (const statement of statements) {
@@ -444,4 +451,70 @@ test('pruning respects its batch limit, so one call cannot lock the table for a 
   await sql`update pool_shares set created_at = now() - interval '90 days'`
   assert.equal(await pruneShares(db(), { chain: 'btc', retentionDays: 30, limit: 3 }), 3)
   assert.equal(await pruneShares(db(), { chain: 'btc', retentionDays: 30, limit: 3 }), 3)
+})
+
+/* ------------------------------------------------ the account link (micro-org#289) */
+
+test('a first ticket request creates the link, and every later one finds it', { skip }, async () => {
+  assert.equal(await findAccountLink(db(), 'user-1'), null)
+  assert.equal(await insertAccountLink(db(), { userId: 'user-1', account: 'cf-00112233445566aa' }), 'cf-00112233445566aa')
+  assert.equal(await findAccountLink(db(), 'user-1'), 'cf-00112233445566aa')
+  // The label is minted once and never re-minted. A user whose account label changed between two
+  // ticket requests would have their share history split across two accounts with nothing joining
+  // them, and no way to put it back together after the fact.
+  assert.equal(await accountForUser(db(), 'user-1'), 'cf-00112233445566aa')
+})
+
+test('the loser of a race gets no row back rather than overwriting the winner', { skip }, async () => {
+  // The whole reason the statement is `do nothing` and not `do update`. A React effect running twice
+  // in development fires two ticket requests with no row yet; both must end up with ONE label.
+  await insertAccountLink(db(), { userId: 'user-2', account: 'cf-1111111111111111' })
+  assert.equal(await insertAccountLink(db(), { userId: 'user-2', account: 'cf-2222222222222222' }), null)
+  assert.equal(await findAccountLink(db(), 'user-2'), 'cf-1111111111111111')
+})
+
+test('two users cannot end up sharing one account label', { skip }, async () => {
+  // The second half of the constraint. Collision is astronomically unlikely — the label is sixteen
+  // hex characters of `randomBytes` — but the failure it would cause is one person's work appearing
+  // in another person's page, so the database refuses rather than trusting the entropy.
+  await insertAccountLink(db(), { userId: 'user-3', account: 'cf-3333333333333333' })
+  await assert.rejects(() => insertAccountLink(db(), { userId: 'user-4', account: 'cf-3333333333333333' }))
+})
+
+test('accountForUser is safe to call concurrently and yields one label', { skip }, async () => {
+  const results = await Promise.all(Array.from({ length: 8 }, () => accountForUser(db(), 'user-5')))
+  assert.equal(new Set(results).size, 1, `${new Set(results).size} labels were minted for one user`)
+  const rows = await sql<{ n: string }[]>`select count(*)::text as n from pool_account_links`
+  assert.equal(rows[0]?.n, '1')
+})
+
+test('finding a link touches last_used_at, so a dormant account is visible as one', { skip }, async () => {
+  await insertAccountLink(db(), { userId: 'user-6', account: 'cf-6666666666666666' })
+  await sql`update pool_account_links set last_used_at = now() - interval '30 days'`
+  await findAccountLink(db(), 'user-6')
+  const [row] = await sql<{ stale: boolean }[]>`
+    select last_used_at < now() - interval '1 minute' as stale from pool_account_links where user_id = 'user-6'
+  `
+  assert.equal(row?.stale, false, 'a redeemed link did not record that it was used')
+})
+
+test('a browser account is a pool account like any other, and joins to its shares', { skip }, async () => {
+  // The end of the chain: the label in `pool_account_links` is an ordinary `pool_workers.account`,
+  // which is what makes the public read routes work for a browser miner with no change at all.
+  const account = await accountForUser(db(), 'user-7')
+  await seedShares('ltc', account, 'web-abc123', 3)
+  const shares = await sharesForAccount(db(), { chain: 'ltc', account, limit: 10 })
+  assert.equal(shares.length, 3)
+  const workers = await workersForAccount(db(), { chain: 'ltc', account, sinceSeconds: 3_600 })
+  assert.deepEqual(workers.map((w) => w.worker), ['web-abc123'])
+})
+
+test('the account link survives a chain being pruned out from under it', { skip }, async () => {
+  // The link is not chain-scoped and nothing chain-scoped may delete it. Losing it would mint the
+  // same user a SECOND label on their next ticket and orphan every share under the first.
+  const account = await accountForUser(db(), 'user-8')
+  await seedShares('btc', account, 'web-aaaaaa', 4)
+  await sql`update pool_shares set created_at = now() - interval '90 days'`
+  await pruneShares(db(), { chain: 'btc', retentionDays: 30, limit: 1000 })
+  assert.equal(await findAccountLink(db(), 'user-8'), account)
 })

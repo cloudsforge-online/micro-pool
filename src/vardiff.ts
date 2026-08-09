@@ -80,6 +80,81 @@ export const DEFAULT_VARDIFF: VardiffOptions = Object.freeze({
 })
 
 /**
+ * ═══ THE DIFFICULTY BAND IS PER TRANSPORT, AND THE UNIT CHANGES WITH IT ═══════════════════════
+ *
+ * Everything above is tuned for the miner this pool was written for: a machine on the raw TCP
+ * listener, doing between a megahash and a terahash. `minDifficulty: 0.001` and the per-chain
+ * starting difficulties in `env.ts` (btc 65,536, ltc 512) are all chosen against that.
+ *
+ * micro-org#289 adds a second transport — Stratum v1 over WebSocket — whose only client is a
+ * browser tab running scrypt in JavaScript, which the issue measures at "a few hundred hashes per
+ * second per core" (2026-08-09). Handing that connection the hardware band produces the one failure
+ * mode `vardiff.ts` exists to prevent, by a road the idle ratchet is too slow to close:
+ *
+ *   - At ltc's starting difficulty of 512, one share costs 512 × 2^16 ≈ 33.6 million scrypt hashes.
+ *     At 250 H/s that is **37 hours**. The connection submits nothing.
+ *   - The ratchet then divides by `maxStepFactor` once per 90-second window. Walking 512 down to
+ *     something a browser can hit takes eight or nine windows — the better part of a quarter of an
+ *     hour of a spinning fan, an empty share list and no way to tell a mis-set difficulty from a
+ *     broken miner. §6 of `docs/ecosystem/36-multi-chain-and-mining-pool.md` is exactly about that
+ *     confusion.
+ *
+ * ## Why the band is expressed in HASHES and not in difficulty
+ *
+ * Because `minDifficulty: 0.001` does not mean one thing. Difficulty is a unit whose size depends on
+ * the algorithm — `hashesPerDifficulty` is ~2^32 for SHA-256d and ~2^16 for scrypt — so the same
+ * floor asks a Litecoin miner for 66 hashes and a Bitcoin miner for 4.3 million. A factor of 65,536
+ * between two chains is fine when the client is an ASIC that does either number instantly, and it is
+ * not fine when the client is a browser: 4.3 million SHA-256d hashes in JavaScript is seconds, and
+ * 66 scrypt hashes is a flood.
+ *
+ * So the browser band names the thing that is actually constant across chains — **how much work one
+ * share should cost** — and converts through `hashesPerDifficulty` at the call site. The same two
+ * numbers then mean the same wait on both algorithms, which is what "a floor set for the transport"
+ * has to mean.
+ *
+ * The values, and the arithmetic behind them at the issue's 250 H/s per core:
+ *
+ *   - **1,024 hashes to start.** ~4 seconds to the first share on one core, and under a second on a
+ *     machine running the `hardwareConcurrency - 1` workers the client defaults to. The first share
+ *     is the whole point: it is the evidence that turns "possibly broken" into "mining".
+ *   - **256 hashes as the floor.** One share per second per core, which is the fastest this pool is
+ *     willing to be asked to hash-check and store per browser. It is also low enough for the slow
+ *     end that matters — a single duty-cycled core on battery at 50 H/s still lands a share every
+ *     five seconds, which is the target rate exactly.
+ *
+ * Vardiff does the rest in both directions from there, unchanged. The ceiling is NOT lowered: a
+ * connection only reaches a high difficulty by sustaining the share rate that justifies it, and a
+ * browser on a fast machine that can do so should be allowed to.
+ */
+export const BROWSER_INITIAL_HASHES_PER_SHARE = 1_024
+export const BROWSER_MIN_HASHES_PER_SHARE = 256
+
+/**
+ * The starting difficulty for a browser connection on a chain with this hashes-per-difficulty.
+ *
+ * Rounded through `roundDifficulty` for the reason that function gives: the number is sent to the
+ * miner in `mining.set_difficulty` and printed on both sides, and two spellings of one difficulty is
+ * a reconciliation the miner cannot complete.
+ */
+export function browserInitialDifficulty(hashesPerDifficulty: number): number {
+  return roundDifficulty(BROWSER_INITIAL_HASHES_PER_SHARE / hashesPerDifficulty)
+}
+
+/**
+ * The hardware band with its floor replaced by the browser one.
+ *
+ * Only `minDifficulty` moves. Target rate, window, dead band, step clamp, sample count and the idle
+ * factor are properties of the CONTROLLER rather than of the client, and they are as right for a tab
+ * as for a rig — a browser that stops hashing when it is backgrounded needs the same ratchet, on the
+ * same clock, as a rig whose fans have failed.
+ */
+export function browserVardiff(base: VardiffOptions, hashesPerDifficulty: number): VardiffOptions {
+  const floor = roundDifficulty(BROWSER_MIN_HASHES_PER_SHARE / hashesPerDifficulty)
+  return Object.freeze({ ...base, minDifficulty: Math.min(floor, base.maxDifficulty) })
+}
+
+/**
  * The difficulty implied by an observed share rate, with every guard applied.
  *
  * Pure. Returns the current difficulty unchanged when nothing should move, so a caller can compare

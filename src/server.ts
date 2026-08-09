@@ -5,35 +5,52 @@
  * and the single error shape. Rule 4 of docs/ecosystem/03 §2: `/livez`, `/readyz` and `/metrics` on
  * every service, or it does not pass CI.
  *
- * ## Everything here is public, and that is a decision rather than an omission
+ * ## Every READ here is public, and that is a decision rather than an omission
  *
- * The template's `@cloudsforge/auth` wiring is gone, and none of these routes takes a bearer token.
- * The reason is in `env.ts` at more length, and it comes from 36 §6: **"the share history has to be
- * checkable by the miner against their own machine, which is a product requirement and not a
- * nicety."** The only identity a miner has at this service is the stratum username they typed into
- * their own firmware — there is no estate account behind it, and there cannot be, because the whole
- * point is that a stranger with an ASIC can point it here and be paid. Gating the share history
- * behind an estate login would make it checkable by nobody.
+ * None of the routes that answer a question about work already done takes a bearer token. The reason
+ * is in `env.ts` at more length, and it comes from 36 §6: **"the share history has to be checkable by
+ * the miner against their own machine, which is a product requirement and not a nicety."** The only
+ * identity a miner has at this service is the stratum username they typed into their own firmware —
+ * there is no estate account behind it, and there cannot be, because the whole point is that a
+ * stranger with an ASIC can point it here and be paid. Gating the share history behind an estate
+ * login would make it checkable by nobody.
  *
  * What follows from that, and is enforced below rather than assumed:
  *
  *   - **`account` is a query parameter, not an authenticated subject.** Anybody may read anybody's
  *     shares. That is the same posture as every public pool and as a block explorer: the data is a
  *     record of work done against a public chain, and it is already visible in the coinbase.
- *   - **Nothing here writes.** There is no POST, no PUT and no DELETE on this port. The only thing
- *     that mutates state in this service is a share arriving on the stratum port, and that path does
- *     not pass through this file.
  *   - **Every list is bounded** by a `limit` that is clamped rather than trusted, because an
  *     unauthenticated caller asking for a million rows is a database load-generator otherwise.
+ *
+ * ## There is now exactly ONE authenticated route, and it is the only thing here that writes
+ *
+ * `POST /v1/pool/ticket`, added by micro-org#289. This file used to say "nothing here writes"; that
+ * is no longer true and the exception is narrow enough to state completely. The route verifies an
+ * estate access token, finds or creates the caller's opaque pool account, and mints a sixty-second
+ * single-use ticket that a browser spends on the WebSocket mining transport. It exists because the
+ * browser `WebSocket` constructor cannot set request headers — `tickets.ts` holds that argument.
+ *
+ * Three properties of it are load-bearing and are enforced below:
+ *
+ *   - **A token fault is 401, a verifier fault is 503.** `statusFor` from `@cloudsforge/auth` makes
+ *     that decision, and the difference matters: answering 401 because the identity service is having
+ *     a bad minute signs every user in the estate out of the miner.
+ *   - **Users only.** A service token is refused with 403. There is no operator use for a mining
+ *     ticket, and a service principal has no user id to credit work to.
+ *   - **The response is the only place the ticket ever appears.** It is not logged, not counted by
+ *     value and not stored beyond `TicketStore`'s map.
  */
 
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
+import { bearerFrom, statusFor, type Principal } from '@cloudsforge/auth'
 import { hashesPerDifficulty } from './pow.ts'
 import { unitsToDifficulty } from './pplns.ts'
 import { algorithmFor, assetFor, decimalsFor, isPoolChainId, type PoolChainId } from './chains.ts'
 import { chainActivity, recentBlocks, sharesForAccount, workersForAccount, type Exec } from './store.ts'
+import { accountForUser, newBrowserWorkerLabel, type MintedTicket } from './tickets.ts'
 import type { ChainStatus } from './chainservice.ts'
 
 export interface PoolSnapshot {
@@ -58,6 +75,27 @@ export interface ServerDeps {
    * 8 exists to keep out. A scrape is already periodic, so the scrape is when to sample.
    */
   readonly beforeScrape?: () => Promise<void>
+  /**
+   * Browser mining, or `undefined` when this deployment has no estate identity configured.
+   *
+   * Optional because identity is optional (`env.ts` says why at length): a pool run by somebody with
+   * no estate at all is the ordinary case for this software, and it must start. When this is absent
+   * the ticket route still EXISTS and answers 503 with a reason, rather than 404 — the difference is
+   * the one a browser client can act on. A 404 says "you are talking to something that is not a
+   * pool"; a 503 says "this pool does not offer browser mining", which is a true statement about a
+   * correctly deployed service and is exactly what `GET /v1/pool`'s null endpoint already implies.
+   */
+  readonly browserMining?: BrowserMiningDeps | undefined
+}
+
+export interface BrowserMiningDeps {
+  /**
+   * Turn a bearer token into a principal, or throw. `Verifier.principal` in production; the shape is
+   * structural so a test can supply one without a JWKS server.
+   */
+  readonly principal: (token: string) => Promise<Principal>
+  /** Mint a ticket for an account. The secret is returned to the caller and never logged. */
+  readonly mint: (identity: { account: string; worker: string }) => MintedTicket
 }
 
 /**
@@ -228,6 +266,15 @@ function buildRoutes(): Route[] {
        * not the `Host` header, not the bind address, not the bound port. A consumer renders the
        * absence. `stratumPort` remains beside it and is the BIND: honest about itself, useless as
        * half of a connection string, and named as such in `ChainStatus`.
+       *
+       * ## `websocketEndpoint` is reported the same way, and for the same reason
+       *
+       * micro-org#289 added a second transport a browser can reach, and it gets the treatment #285
+       * settled rather than a second answer to the same question: it is a complete URL taken from
+       * `POOL_WEBSOCKET_PUBLIC_ORIGIN` with this service's own path appended, or **null**. It is
+       * never assembled from the request `Host`, never defaulted from `PORT`, and there is no
+       * fallback for it to be quietly wrong in. Null means no operator has published one — a page
+       * renders the absence instead of dialling an address nobody promised.
        */
       handle: async (_ctx, deps) => {
         const snapshot = deps.snapshot()
@@ -243,6 +290,7 @@ function buildRoutes(): Route[] {
               algorithm: status.algorithm,
               stratumPort: status.stratumPort,
               stratumEndpoint: status.stratumEndpoint,
+              websocketEndpoint: status.websocketEndpoint,
               connections: status.connections,
               height: status.height,
               networkDifficulty: status.networkDifficulty,
@@ -264,6 +312,82 @@ function buildRoutes(): Route[] {
             // Named, not implied. See `payouts.ts`.
             payoutsImplemented: false,
             chains,
+          },
+        }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/v1/pool/ticket',
+      /**
+       * Mint one mining ticket for the authenticated user. The only write on this port.
+       *
+       * The request carries no body and none is read — everything this route needs is in the
+       * `Authorization` header, and a body would be a second place for a client to say who it is.
+       * The chain is not named here either: a ticket is worth one authorisation on one connection,
+       * and WHICH chain that connection is for is already in the WebSocket path. Scoping it twice
+       * would create a pair that can disagree.
+       *
+       * The response carries the account and the worker label so a page can show them before a share
+       * has ever been submitted — both are the SERVER's, generated here, and neither is anything the
+       * client asked for. `expiresInMs` rather than an absolute time, because the one clock a browser
+       * and this process reliably share is the elapsed one; a `Date` here would be compared against a
+       * laptop that is forty seconds out and produce a ticket that looks expired on arrival.
+       */
+      handle: async (ctx, deps) => {
+        // Nothing reads the body, and an unread request body keeps a keep-alive connection from
+        // being reusable. Draining it is one line and costs nothing.
+        ctx.req.resume()
+
+        const browser = deps.browserMining
+        if (browser === undefined) {
+          return errorReply(
+            503,
+            'browser_mining_unavailable',
+            'this pool is not configured for browser mining; point mining firmware at the stratum port instead',
+            ctx.requestId,
+          )
+        }
+
+        const token = bearerFrom(headerOf(ctx.req, 'authorization'))
+        if (token === null) {
+          return errorReply(401, 'unauthenticated', 'a bearer token is required to mine from a browser', ctx.requestId)
+        }
+
+        let principal: Principal
+        try {
+          principal = await browser.principal(token)
+        } catch (err) {
+          const status = statusFor(err)
+          if (status === null) throw err
+          // The reason is not echoed. A verification failure's message names key ids, issuers and
+          // clock skews, and repeating it to an unauthenticated caller is how a token oracle is
+          // built. The log line below carries what an operator needs.
+          ctx.log.warn('a ticket request was refused', { status })
+          return status === 503
+            ? errorReply(503, 'identity_unavailable', 'identity could not be reached; try again shortly', ctx.requestId)
+            : errorReply(status, 'unauthenticated', 'that token was not accepted', ctx.requestId)
+        }
+
+        if (principal.kind !== 'user') {
+          // A service principal has no user id, so there is nothing to credit the work to, and there
+          // is no operator task that needs a mining ticket. 403 rather than 401: the credential was
+          // perfectly good and presenting a better one will not help.
+          return errorReply(403, 'forbidden', 'a mining ticket belongs to a person, not to a service', ctx.requestId)
+        }
+
+        const account = await accountForUser(deps.sql, principal.userId)
+        const ticket = browser.mint({ account, worker: newBrowserWorkerLabel() })
+        // The account and the worker, never the secret. This line is the audit trail for browser
+        // mining and it must stay safe to keep.
+        ctx.log.info('minted a mining ticket', { account, worker: ticket.worker })
+        return {
+          status: 200,
+          body: {
+            ticket: ticket.secret,
+            account: ticket.account,
+            worker: ticket.worker,
+            expiresInMs: Math.max(0, ticket.expiresAtMs - Date.now()),
           },
         }
       },

@@ -23,15 +23,30 @@
  * is not implemented (`payouts.ts`). Declaring a secret it does not use would be a variable the
  * deploy has to provide for nothing, which is what rule 9 exists to stop.
  *
- * **No `IDENTITY_JWKS_URL` and no auth.** The read API is public, because the only identity a miner
- * has here is the stratum username they chose and there is no estate account behind it. A miner must
- * be able to check their own share history — 36 §6 makes that a product requirement — and gating it
- * behind an estate login would exclude every miner who does not have one, which is all of them.
+ * **No signing secret and no `@cloudsforge/secrets`, still.** The mining ticket added by
+ * micro-org#289 is a random opaque value matched by equality, not a MAC, so there is no key to
+ * fetch. Nothing in this service signs anything until payouts exist.
+ *
+ * ## `IDENTITY_JWKS_URL` arrived, and it did NOT make the read API private
+ *
+ * This file used to say there was no auth here at all. That is no longer true and the change is
+ * narrower than it sounds: **exactly one route verifies a token**, `POST /v1/pool/ticket`, which
+ * mints the credential a browser miner presents on the WebSocket transport. Every route that
+ * answers a question about work already done is still public, for the reason it always was — 36 §6
+ * makes a miner's share history checkable by the miner a product requirement, the only identity a
+ * miner has here is the stratum username they typed into their own firmware, and gating that behind
+ * an estate login would make it checkable by nobody.
+ *
+ * And identity is **optional**. Unset is a supported, tested mode: the WebSocket transport is not
+ * attached, the ticket route answers 503, no endpoint is advertised, and raw TCP is untouched. A
+ * pool run by somebody who has no estate at all is the ordinary case for this software, and making
+ * a JWKS mandatory would have made the whole service unstartable for them.
  */
 
 import { hostname } from 'node:os'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { isPoolChainId, REFUSED_CHAINS, type PoolChainId } from './chains.ts'
+import { STRATUM_WS_PATH } from './wsstratum.ts'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository, not
@@ -118,14 +133,15 @@ function decimal(source: Source, name: string, fallback: number, min: number, ma
 }
 
 /**
- * An RPC endpoint, checked for shape but never echoed.
+ * An http or https endpoint, checked for shape but never echoed.
  *
  * The check is on the URL's structure only. **The value is not repeated in the error**, because a
  * node RPC URL in this estate carries HTTP Basic userinfo and an error message is the most reliably
  * logged string in any process. `rpc.ts` holds the same line: host and port may be logged, the URL
- * never is.
+ * never is. `IDENTITY_JWKS_URL` goes through the same helper — it carries no credential, but a
+ * second, laxer URL check would be a second answer to a question this file has already answered.
  */
-function nodeUrl(source: Source, name: string): string {
+function httpUrl(source: Source, name: string): string {
   const value = required(source, name)
   let parsed: URL
   try {
@@ -165,6 +181,64 @@ function publicHost(source: Source, name: string): string | null {
     )
   }
   return value
+}
+
+/**
+ * The origin a BROWSER dials, or `null` when nobody has published one.
+ *
+ * The same posture as `publicHost` above and for the same reason (micro-org#285), with one shape
+ * difference that is forced by the client rather than chosen: a browser is handed a complete URL,
+ * not a host and a port, and the SCHEME is part of what it needs — a page served over https may
+ * only open `wss:`, and a developer on localhost needs `ws:`. So this is one variable carrying one
+ * absolute origin, which also means there is no half-answer for it to be in.
+ *
+ * What is checked is that it is an ORIGIN and nothing more. A path is refused rather than accepted
+ * and ignored, because the path is this service's own (`STRATUM_WS_PATH`) and an operator who typed
+ * one has written down a second, unversioned copy of a contract that this repository changes — the
+ * two would diverge and the divergence would be invisible until a miner could not connect. Query,
+ * fragment and userinfo are refused for the ordinary reasons: none of them survives being appended
+ * to, and a credential in a URL that this service PUBLISHES would be a credential in every log that
+ * records the response.
+ */
+function publicWebsocketOrigin(source: Source, name: string): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new EnvError(`${name} is not a valid URL — it is the origin a browser dials, such as wss://pool.example.com`)
+  }
+  if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+    throw new EnvError(`${name} must begin ws:// or wss:// (got ${parsed.protocol}//)`)
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new EnvError(`${name} must not carry credentials; it is published to every caller of GET /v1/pool`)
+  }
+  if (parsed.search !== '' || parsed.hash !== '') {
+    throw new EnvError(`${name} is an origin, not a URL with a query or a fragment`)
+  }
+  if (parsed.pathname !== '' && parsed.pathname !== '/') {
+    throw new EnvError(
+      `${name} is an origin and must have no path: the path is ${STRATUM_WS_PATH}/<chain>, which this ` +
+        'service owns and appends itself. A path typed here is a second copy of a contract that moves.',
+    )
+  }
+  // Normalised to the origin, so `wss://host/` and `wss://host` compose the same endpoint. `URL`
+  // renders `origin` without the trailing slash and with the default port elided.
+  return parsed.origin
+}
+
+/**
+ * Verifying an estate access token needs both halves, so both or neither.
+ *
+ * A JWKS with no issuer verifies a signature and then accepts a token minted by anybody who can
+ * serve that key set; an issuer with no JWKS verifies nothing at all. Neither half is a
+ * configuration somebody meant to write.
+ */
+export interface IdentityConfig {
+  readonly jwksUrl: string
+  readonly issuer: string
 }
 
 export interface ChainConfig {
@@ -208,6 +282,20 @@ export function stratumEndpointOf(host: string | null, chain: ChainConfig): Stra
   return { host, port: chain.stratumPublicPort }
 }
 
+/**
+ * The complete URL a browser passes to `new WebSocket(...)` for one chain, or `null`.
+ *
+ * Composed here rather than by a consumer, which is the whole lesson of micro-org#285: the last
+ * time this service published half of a connection string, micro-pool-web supplied the other half
+ * out of `window.location.hostname` and produced an address that could not connect. So the service
+ * either publishes an endpoint that works in full or publishes nothing, and `null` is a real answer
+ * that a client renders as an absence.
+ */
+export function websocketEndpointOf(origin: string | null, chain: PoolChainId): string | null {
+  if (origin === null) return null
+  return `${origin}${STRATUM_WS_PATH}/${chain}`
+}
+
 export interface Env {
   readonly port: number
   readonly env: string
@@ -244,6 +332,29 @@ export interface Env {
    * outage they will blame on their own hardware, and that is strictly worse than an absent one.
    */
   readonly stratumPublicHost: string | null
+  /**
+   * The origin a browser dials for the WebSocket transport, or `null` when none is published.
+   *
+   * Exactly the posture of `stratumPublicHost` and for the same reason (micro-org#285): it is not
+   * the `Host` header of whoever asked, not `stratumBind`, and not a name this container can observe
+   * about itself. `websocketEndpointOf` appends the path; nothing else composes it.
+   *
+   * One variable rather than two because a browser needs one absolute URL, scheme included — a page
+   * served over https may open only `wss:`, and a developer on localhost needs `ws:` — so there is
+   * no half-published state for this one to be in.
+   */
+  readonly websocketPublicOrigin: string | null
+  /**
+   * How to verify an estate access token, or `null` when this pool has no estate behind it.
+   *
+   * **Optional, and unset is a supported, tested mode**, not a degraded one. Most of what this
+   * service does is answer questions about work already done, and none of it needs an identity — see
+   * the file header and `server.ts`. Unset means `POST /v1/pool/ticket` answers 503, the WebSocket
+   * transport is never attached, no websocket endpoint is advertised, and the stratum port behaves
+   * exactly as it always has. Making a JWKS mandatory would have made this service unstartable for
+   * anybody running the pool on its own, which is the ordinary case for pool software.
+   */
+  readonly identity: IdentityConfig | null
   /**
    * Bytes written into every coinbase this pool builds, identifying it on the chain.
    *
@@ -290,7 +401,7 @@ function loadChain(source: Source, chain: PoolChainId): ChainConfig {
   const upper = chain.toUpperCase()
   return {
     chain,
-    nodeUrl: nodeUrl(source, `POOL_${upper}_NODE_URL`),
+    nodeUrl: httpUrl(source, `POOL_${upper}_NODE_URL`),
     payoutAddress: required(source, `POOL_${upper}_PAYOUT_ADDRESS`),
     stratumPort: integer(source, `POOL_${upper}_STRATUM_PORT`, DEFAULT_STRATUM_PORT[chain], 1, 65_535),
     stratumPublicPort: optionalInteger(source, `POOL_${upper}_STRATUM_PUBLIC_PORT`, 1, 65_535),
@@ -377,6 +488,49 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     )
   }
 
+  /*
+   * Identity, and the browser transport it gates.
+   *
+   * Three variables, all optional, and two refusals — each of which is a state somebody started and
+   * did not finish, and each of which would otherwise produce a pool that quietly serves no browser
+   * while its operator believes it does.
+   *
+   *   - **A JWKS with no issuer, or an issuer with no JWKS.** The first verifies a signature and
+   *     then accepts any token minted by whoever can serve that key set; the second verifies
+   *     nothing at all. Neither is a configuration anybody meant to write.
+   *   - **A published websocket origin with no identity.** The endpoint would be advertised on
+   *     `GET /v1/pool`, a browser would dial it, the upgrade would be refused because no transport
+   *     is attached, and the page would show a miner that cannot start with nothing to point at.
+   *     Publishing an address that cannot work is the defect micro-org#285 is about, arriving by a
+   *     different road.
+   *
+   * Identity WITHOUT an origin is allowed and quiet: the transport is attached and works for anybody
+   * who knows the URL, and `GET /v1/pool` reports null because nobody has published one. That is the
+   * same all-or-nothing treatment `stratumEndpoint` gets, and null is a real answer there too.
+   */
+  const jwksUrl = source['IDENTITY_JWKS_URL']?.trim()
+  const issuer = source['IDENTITY_ISSUER']?.trim()
+  if (jwksUrl && !issuer) {
+    throw new EnvError(
+      'IDENTITY_JWKS_URL is set and IDENTITY_ISSUER is not. A key set with no issuer verifies a ' +
+        'signature and then accepts a token minted by anybody who can serve those keys.',
+    )
+  }
+  if (issuer && !jwksUrl) {
+    throw new EnvError('IDENTITY_ISSUER is set and IDENTITY_JWKS_URL is not, so there are no keys to verify against')
+  }
+  const identity: IdentityConfig | null =
+    jwksUrl && issuer ? { jwksUrl: httpUrl(source, 'IDENTITY_JWKS_URL'), issuer } : null
+
+  const websocketPublicOrigin = publicWebsocketOrigin(source, 'POOL_WEBSOCKET_PUBLIC_ORIGIN')
+  if (websocketPublicOrigin !== null && identity === null) {
+    throw new EnvError(
+      'POOL_WEBSOCKET_PUBLIC_ORIGIN publishes a browser mining endpoint and IDENTITY_JWKS_URL is ' +
+        'unset, so no browser transport is attached and every upgrade to that address would be ' +
+        'refused. Browser mining needs an estate account: see POST /v1/pool/ticket.',
+    )
+  }
+
   const coinbaseTag = optional(source, 'POOL_COINBASE_TAG', '/cloudsforge/')
   if (Buffer.byteLength(coinbaseTag, 'utf8') > 32) {
     throw new EnvError('POOL_COINBASE_TAG must be at most 32 bytes — the coinbase scriptSig it shares is capped at 100')
@@ -399,6 +553,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // The name to advertise, which is a different question from the interface to listen on and is
     // answered by nothing this process can observe about itself. See the field's own note.
     stratumPublicHost,
+    // The browser's endpoint gets exactly the treatment the miner's does, for the reason
+    // micro-org#285 gave: a published address is configuration or it is nothing. Never assembled
+    // from the request `Host`, never defaulted from `PORT`.
+    websocketPublicOrigin,
+    identity,
     coinbaseTag,
     feeBasisPoints: requiredInteger(source, 'POOL_FEE_BASIS_POINTS', 0, 10_000),
     pplnsMultiplier: decimal(source, 'POOL_PPLNS_WINDOW_MULTIPLIER', 2, 0.1, 100),

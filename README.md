@@ -167,6 +167,9 @@ docker build -t cloudsforge-pool \
 | `src/work.ts` | A template becomes a job: the `mining.notify` parameters and the job history a submit can still name. |
 | `src/stratum.ts` | The TCP listener and the line framing. Timeouts, back-pressure, the share buffer. |
 | `src/session.ts` | The Stratum v1 state machine: subscribe, authorize, configure, notify, submit. No socket in it. |
+| `src/wsframe.ts` | RFC 6455 server framing, hand-rolled. Masking, the three length forms, continuation, ping/pong, the caps. |
+| `src/wsstratum.ts` | The WebSocket transport: the `upgrade` handler on the HTTP port, and why the keepalive is application-level. |
+| `src/tickets.ts` | Mining tickets and the opaque pool account an estate user's browser work is credited to. |
 | `src/vardiff.ts` | Per-connection difficulty retargeting toward a steady share rate. |
 | `src/validate.ts` | Rebuilding the header from a submission and judging it against the share target and the block target. |
 | `src/blocks.ts` | What happens when a share is a block, in the order it has to happen in. |
@@ -234,10 +237,11 @@ MWEB does **not** touch the coinbase: its commitment lives in the HogEx's witnes
 alone, and asking it for `mweb` would be asking for a rule it has never heard of. Measured against
 litecoind 0.21.5.6 on 2026-08-09; see micro-org#277 and `scripts/regtest-mweb.sh`.
 
-**The read API is public and there is no `@cloudsforge/auth` here.** The only identity a miner has is
-the stratum username they chose; there is no estate account behind it. §6 makes a checkable share
-history a product requirement, and gating it behind an estate login would exclude every miner who does
-not have one, which is all of them.
+**The read API is public.** The only identity a miner has is the stratum username they chose; there
+is no estate account behind it. §6 makes a checkable share history a product requirement, and gating
+it behind an estate login would exclude every miner who does not have one, which is nearly all of
+them. `@cloudsforge/auth` arrived with browser mining and verifies a token on **exactly one route** —
+`POST /v1/pool/ticket`. Every route that answers a question about work already done is untouched.
 
 **The pool fee has no default anywhere.** `POOL_FEE_BASIS_POINTS` is required and the service refuses
 to start without it. §7.1 records that the fee has not been chosen; a default of 0 would be choosing
@@ -276,6 +280,93 @@ side is a literal, and the service's environment does not set that variable at a
 
 ---
 
+## Browser mining (micro-org#289)
+
+A tab can mine. The same protocol, the same jobs, the same validation and the same share table — the
+only thing that differs is the pipe the lines travel down and the difficulty band they travel at.
+
+It is **off by default**. Unset `IDENTITY_JWKS_URL` and this is a pool that serves mining hardware
+over raw TCP and nothing else, which is a complete and tested configuration; a pool run by somebody
+with no estate at all has to start.
+
+**Raw TCP is unchanged by any of it.** A miner on the stratum port authorises with a free-text
+username, has no account and no authentication, and gets the hardware difficulty band, exactly as
+before. Everything below is reachable only through the WebSocket transport.
+
+### The wire
+
+| | |
+| --- | --- |
+| Endpoint | `wss://<origin>/v1/pool/stratum/<chain>` — one complete URL, reported as `websocketEndpoint` per chain on `GET /v1/pool`, `null` when unpublished |
+| Subprotocol | none — none is sent and none is negotiated |
+| Frames | text only; one WebSocket message is one newline-terminated Stratum line, and a binary frame closes the connection |
+| Keepalive | server pings every 20 s, declares a connection dead after 70 s of silence |
+
+```
+POST /v1/pool/ticket
+Authorization: Bearer <estate access token>
+
+200 { "ticket": "<opaque>", "account": "cf-…", "worker": "web-…", "expiresInMs": 60000 }
+```
+
+Then open the WebSocket and spend the ticket as the **password**:
+
+```
+{"id":1,"method":"mining.subscribe","params":["cloudsforge-web/1.0"]}
+{"id":2,"method":"mining.authorize","params":["","<ticket>"]}
+```
+
+The username is ignored on this transport and the label the work is credited to is the server's
+answer, never the client's claim.
+
+### Why it is shaped like that
+
+**The ticket exists because the browser `WebSocket` constructor cannot set headers.** `new
+WebSocket(url, protocols)` takes a URL and a subprotocol list and nothing else, so an estate access
+token could only reach this service in the query string or smuggled through
+`Sec-WebSocket-Protocol` — and a URL is written to every access log between the tab and here, while
+the estate's token is good against every service in the estate for ten minutes. So the token is
+presented once over ordinary HTTP, and what comes back is worth exactly one authorisation, on one
+connection, for sixty seconds, once. It is spent in the `mining.authorize` password field because
+that is the one string in this protocol that has never been read, stored or logged.
+
+**The account label is opaque and generated, not the estate user id.** `GET /v1/pool/shares?account=`
+is public, so an account label is a public identifier; crediting browser work to a user id would
+make mining in a tab cost you a stable estate identifier anybody can enumerate work against. A new
+table maps user id → `cf-<16 hex>`, created on the first ticket and stable after. The worker label is
+per ticket, `web-<6 hex>`, so two tabs are two rows rather than one row with the sum of two machines.
+
+**The link is a new table, and `pool_workers` still has no join to an estate user.** That property is
+stated in `src/migrations.ts` and is deliberate: mining hardware has no estate account and the share
+table must not imply one. Migration 3 is additive and opt-in, and nothing about the existing tables
+changed.
+
+**The difficulty band is per transport.** Pure-JS scrypt(1024,1,1) does a few hundred hashes per
+second per core; at Litecoin's hardware start of 512 one share is on the order of 37 hours. A browser
+that cannot produce a single share is indistinguishable from a broken miner — it produces *no
+evidence of work at all* — so the WebSocket transport starts around 1,024 hashes per share and its
+vardiff floor is 256, while the TCP transport keeps the band silicon needs. See `src/vardiff.ts`.
+
+**The keepalive is application-level because nothing below can do it.** Traefik has no per-router idle
+timeout — `respondingTimeouts` is static on an entrypoint — Go's `net/http` clears both deadlines the
+moment a connection is hijacked, and Cloudflare's edge closes an idle WebSocket at roughly a hundred
+seconds and is not configurable on the plan this estate runs. So the ping interval is chosen against
+that hundred seconds, and death is declared after **three** missed pings rather than one, so a laptop
+waking from sleep does not lose a miner mid-share. Same numbers, same reasoning, as Hearth's
+`HEARTH_P2P_WS`.
+
+**The upgrade itself is unauthenticated**, and it gets you nothing: `session.ts` hands out no job, no
+difficulty and no usable extranonce until `mining.authorize` succeeds, and a connection that does not
+authorise is closed by the handshake timeout.
+
+**Tickets live in memory, and that assumes one replica.** A ticket minted by replica A is unknown to
+replica B. The pool is single-replica for reasons that predate this — a connection-oriented listener
+with per-connection extranonce state does not fan out behind a load balancer — so the constraint is
+not new, but it is stated rather than discovered. `src/tickets.ts` records why a database table and a
+signed stateless ticket were both rejected.
+
+---
+
 ## The three rules this service is unusual about
 
 Everything in [docs/ecosystem/03 §2](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
@@ -287,9 +378,12 @@ applies as normal. Three are worth pointing at:
 - **Rule 8 (no unleased timers).** There is no `setInterval` in this repository. The template poll and
   the share flush are self-rescheduling timeouts, so a slow one delays the next rather than stacking;
   pruning and stats are leased jobs; the gauges are sampled at scrape time.
-- **Rule 9 (declare only what you read).** No `OUTBOX_SIGNING_SECRET`, no `IDENTITY_*`, no
-  `@cloudsforge/secrets` and no `@cloudsforge/auth`. Nothing here publishes an event or verifies a
-  token, and the first event this service must emit is the payout — which is not implemented.
+- **Rule 9 (declare only what you read).** No `OUTBOX_SIGNING_SECRET` and no `@cloudsforge/secrets`.
+  Nothing here publishes an event or signs anything, and the first event this service must emit is
+  the payout — which is not implemented. The mining ticket is a random opaque value matched by
+  equality, not a MAC, so it needs no key either. `IDENTITY_JWKS_URL`, `IDENTITY_ISSUER` and
+  `POOL_WEBSOCKET_PUBLIC_ORIGIN` are declared because they are read; all three are optional and
+  unset is a supported, tested mode.
 
 ---
 

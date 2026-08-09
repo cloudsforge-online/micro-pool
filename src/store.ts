@@ -3,10 +3,16 @@
  *
  * Two rules hold across the file:
  *
- *   1. **Every statement filters on `chain`.** A pool serving two chains has two independent
- *      accounting universes, and a query that spans them would divide a Bitcoin block's reward
- *      among Litecoin miners. `store.test.ts` greps this file for a statement that names a pool
- *      table without naming the column.
+ *   1. **Every statement against a chain-scoped table filters on `chain`.** A pool serving two
+ *      chains has two independent accounting universes, and a query that spans them would divide a
+ *      Bitcoin block's reward among Litecoin miners. `store.test.ts` greps this file for a statement
+ *      that names one of `POOL_CHAIN_TABLES` without naming the column.
+ *
+ *      There is exactly one table that is not in that list, and it is `pool_account_links` — the
+ *      map from an estate user to their pool account label, added by micro-org#289. A person is not
+ *      per chain: one user has one label and mines whatever they point a tab at. The exception is
+ *      declared in `migrations.ts` and honoured by the sweep, rather than being an argument that
+ *      has to be had again at every call site.
  *
  *   2. **Nothing here decides anything.** These functions record what happened and answer questions
  *      about what was recorded. The share validation lives in `validate.ts`, the allocation lives in
@@ -68,6 +74,50 @@ export async function upsertWorker(
   const row = rows[0]
   if (!row) throw new Error(`upsertWorker returned no row for ${identity.chain}/${identity.account}`)
   return Number(row.id)
+}
+
+/**
+ * The pool account label for an estate user, if this service has ever minted one.
+ *
+ * An `update … returning` rather than a `select`, so the read and the "this account is in use"
+ * timestamp are one statement and one round trip. `last_used_at` is what tells an operator the
+ * difference between an account somebody mined from last week and one minted by a page that was
+ * opened once, which is the only question this table exists to answer beyond the label itself.
+ *
+ * Not chain-scoped, and the only statement in this file that is not. Migration 3 says why: a person
+ * is not per chain, and `store.test.ts` drives its scoping sweep from `POOL_CHAIN_TABLES` so that
+ * this exception is declared once rather than argued about at every call site.
+ */
+export async function findAccountLink(exec: Exec, userId: string): Promise<string | null> {
+  const rows = await exec<{ account: string }[]>`
+    update pool_account_links
+       set last_used_at = now()
+     where user_id = ${userId}
+    returning account
+  `
+  return rows[0]?.account ?? null
+}
+
+/**
+ * Claim a pool account label for a user, or lose the race and return null.
+ *
+ * `on conflict do nothing` on the primary key means a caller that loses gets no row back, which is
+ * the signal `tickets.ts` reads to go and fetch the winner's label. A `do update` would have been
+ * shorter and would have been wrong: it would overwrite one of two concurrently-minted labels, and a
+ * user whose account label changed between two ticket requests would have their share history split
+ * across two accounts with nothing joining them.
+ */
+export async function insertAccountLink(
+  exec: Exec,
+  link: { userId: string; account: string },
+): Promise<string | null> {
+  const rows = await exec<{ account: string }[]>`
+    insert into pool_account_links (user_id, account)
+    values (${link.userId}, ${link.account})
+    on conflict (user_id) do nothing
+    returning account
+  `
+  return rows[0]?.account ?? null
 }
 
 export interface ShareInput {

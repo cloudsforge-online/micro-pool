@@ -21,7 +21,18 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { DEFAULT_VARDIFF, nextDifficulty, roundDifficulty, Vardiff, type VardiffOptions } from './vardiff.ts'
+import {
+  BROWSER_INITIAL_HASHES_PER_SHARE,
+  BROWSER_MIN_HASHES_PER_SHARE,
+  browserInitialDifficulty,
+  browserVardiff,
+  DEFAULT_VARDIFF,
+  nextDifficulty,
+  roundDifficulty,
+  Vardiff,
+  type VardiffOptions,
+} from './vardiff.ts'
+import { hashesPerDifficulty } from './pow.ts'
 
 /** Options with the defaults' shape but easier numbers to reason about in an assertion. */
 function options(overrides: Partial<VardiffOptions> = {}): VardiffOptions {
@@ -381,4 +392,84 @@ test('the defaults are the ones the service ships with', () => {
   assert.equal(DEFAULT_VARDIFF.minSamples, 6)
   assert.equal(DEFAULT_VARDIFF.idleFactor, 8)
   assert.ok(Object.isFrozen(DEFAULT_VARDIFF))
+})
+
+/* ------------------------------------------------------------ the browser band (micro-org#289) */
+
+test('a browser starts at a difficulty a browser can actually reach', () => {
+  // The whole reason this band exists. Pure-JS scrypt(1024,1,1) does a few hundred hashes a second
+  // per core; Litecoin's hardware start of 512 is 512 × 2^16 = 33.5 million hashes for ONE share,
+  // which at 250 H/s is around 37 hours. A browser worker that cannot produce a single share
+  // produces no evidence of work at all and is indistinguishable from a miner that is broken.
+  const scrypt = hashesPerDifficulty('scrypt')
+  const start = browserInitialDifficulty(scrypt)
+  assert.ok(start * scrypt <= BROWSER_INITIAL_HASHES_PER_SHARE, 'a first share must be seconds away, not hours')
+  assert.ok(start > 0)
+
+  // And the point of restating it per algorithm rather than picking one number: difficulty 1 is 2^32
+  // hashes on SHA-256d and 2^16 on scrypt, so one constant would be 65,536 times wrong on one of
+  // them. The BAND is stated in hashes and the difficulty follows from the algorithm.
+  const sha = hashesPerDifficulty('sha256d')
+  assert.ok(browserInitialDifficulty(sha) * sha <= BROWSER_INITIAL_HASHES_PER_SHARE)
+  assert.notEqual(browserInitialDifficulty(sha), browserInitialDifficulty(scrypt))
+})
+
+test('the floor is a constant amount of WORK, so it moves in both directions', () => {
+  // The point of expressing the band in hashes rather than in difficulty, and the assertion that
+  // catches anyone who "simplifies" it back to a number. `minDifficulty: 0.001` does not mean one
+  // thing: it asks a Litecoin miner for 66 scrypt hashes and a Bitcoin miner for 4.3 million
+  // SHA-256d ones. So the browser floor comes DOWN on SHA-256d, where the hardware floor is more
+  // work than a tab should have to do for one share, and UP on scrypt, where the hardware floor is
+  // 66 hashes and a browser at 250 H/s would flood this pool with four shares a second.
+  const scrypt = browserVardiff(DEFAULT_VARDIFF, hashesPerDifficulty('scrypt')).minDifficulty
+  const sha = browserVardiff(DEFAULT_VARDIFF, hashesPerDifficulty('sha256d')).minDifficulty
+  assert.ok(sha < DEFAULT_VARDIFF.minDifficulty, 'the SHA-256d floor must come down')
+  assert.ok(scrypt > DEFAULT_VARDIFF.minDifficulty, 'the scrypt floor must come up')
+
+  // And the same wait on both, which is what "a floor set for the transport" has to mean.
+  assert.ok(scrypt * hashesPerDifficulty('scrypt') <= BROWSER_MIN_HASHES_PER_SHARE * 1.01)
+  assert.ok(sha * hashesPerDifficulty('sha256d') <= BROWSER_MIN_HASHES_PER_SHARE * 1.01)
+})
+
+test('the browser band moves the floor and nothing else', () => {
+  const base = DEFAULT_VARDIFF
+  const browser = browserVardiff(base, hashesPerDifficulty('scrypt'))
+
+  // Target rate, window, dead band, step clamp, sample count and the idle ratchet are properties of
+  // the CONTROLLER, not of the client. A tab that stops hashing when it is backgrounded needs the
+  // same ratchet, on the same clock, as a rig whose fans have failed.
+  assert.equal(browser.targetSharesPerMinute, base.targetSharesPerMinute)
+  assert.equal(browser.retargetMs, base.retargetMs)
+  assert.equal(browser.variance, base.variance)
+  assert.equal(browser.maxStepFactor, base.maxStepFactor)
+  assert.equal(browser.minSamples, base.minSamples)
+  assert.equal(browser.idleFactor, base.idleFactor)
+  // The ceiling is NOT lowered. A connection only reaches a high difficulty by sustaining the share
+  // rate that justifies it, and a browser on a fast machine that can do so should be allowed to.
+  assert.equal(browser.maxDifficulty, base.maxDifficulty)
+})
+
+test('the browser floor is honoured by the controller, not merely declared', () => {
+  const browser = browserVardiff(DEFAULT_VARDIFF, hashesPerDifficulty('scrypt'))
+  // A miner submitting far too slowly is ratcheted down; it must stop at the browser floor rather
+  // than at the hardware one, or the band would be decoration.
+  let difficulty = browserInitialDifficulty(hashesPerDifficulty('scrypt'))
+  for (let i = 0; i < 50; i += 1) difficulty = nextDifficulty(difficulty, 0.01, browser)
+  assert.equal(difficulty, browser.minDifficulty)
+  assert.notEqual(difficulty, DEFAULT_VARDIFF.minDifficulty)
+
+  // The same run on the hardware band goes somewhere else, which is the only way to tell a floor
+  // that is being applied from one that is being declared and ignored.
+  let hardware = browserInitialDifficulty(hashesPerDifficulty('scrypt'))
+  for (let i = 0; i < 50; i += 1) hardware = nextDifficulty(hardware, 0.01, DEFAULT_VARDIFF)
+  assert.equal(hardware, DEFAULT_VARDIFF.minDifficulty)
+})
+
+test('the browser band is frozen and the hardware one is untouched by asking for it', () => {
+  const before = { ...DEFAULT_VARDIFF }
+  const browser = browserVardiff(DEFAULT_VARDIFF, hashesPerDifficulty('scrypt'))
+  assert.ok(Object.isFrozen(browser))
+  // Raw TCP behaviour is unchanged by this change, and that includes the object every TCP connection
+  // is built from. A shared mutable band would make one browser's floor every rig's floor.
+  assert.deepEqual({ ...DEFAULT_VARDIFF }, before)
 })

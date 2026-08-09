@@ -28,7 +28,7 @@ const BASE: Record<string, string> = {
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
-const { EnvError, SERVICE, env, loadEnv, stratumEndpointOf } = await import('./env.ts')
+const { EnvError, SERVICE, env, loadEnv, stratumEndpointOf, websocketEndpointOf } = await import('./env.ts')
 
 const LTC: Record<string, string> = {
   POOL_LTC_NODE_URL: 'http://rpcuser:rpcpassword@litecoin:9332/',
@@ -369,6 +369,15 @@ test('no refusal anywhere in this file echoes a configured value that could be a
     { POOL_BTC_STRATUM_PUBLIC_PORT: '3333' },
     { POOL_STRATUM_PUBLIC_HOST: 'http://alice:s3cr3t@stratum.example.com' },
     { POOL_STRATUM_PUBLIC_HOST: 'stratum.example.com', POOL_BTC_STRATUM_PUBLIC_PORT: '70000' },
+    // micro-org#289's own paths into this sweep. `IDENTITY_JWKS_URL` carries no credential today,
+    // but it goes through the same URL helper as the node endpoints and the day somebody puts Basic
+    // auth in front of a key set is not the day to discover that the refusal prints it.
+    { IDENTITY_JWKS_URL: 'https://alice:s3cr3t@identity.example.com/jwks' },
+    { IDENTITY_ISSUER: 'https://identity.example.com' },
+    { IDENTITY_JWKS_URL: 'ftp://alice:s3cr3t@identity.example.com/jwks', IDENTITY_ISSUER: 'https://id.example' },
+    { POOL_WEBSOCKET_PUBLIC_ORIGIN: 'wss://alice:s3cr3t@pool.example.com' },
+    { POOL_WEBSOCKET_PUBLIC_ORIGIN: 'https://pool.example.com' },
+    { POOL_WEBSOCKET_PUBLIC_ORIGIN: 'wss://pool.example.com' },
   ]
   let raised = 0
   for (const breakage of breakages) {
@@ -382,4 +391,96 @@ test('no refusal anywhere in this file echoes a configured value that could be a
     }
   }
   assert.equal(raised, breakages.length)
+})
+
+/* ------------------------------------------------ browser mining (micro-org#289) */
+
+const IDENTITY: Record<string, string> = {
+  IDENTITY_JWKS_URL: 'https://identity.cloudsforge.online/.well-known/jwks.json',
+  IDENTITY_ISSUER: 'https://identity.cloudsforge.online',
+}
+
+test('identity is optional, and its absence is a supported mode rather than a degraded one', () => {
+  // The estate's own pool ran with no identity at all from 2.5.7 until this change, and anybody who
+  // runs this pool outside an estate has no identity to configure. Unset must therefore load, serve
+  // and mine over raw TCP exactly as before — not warn, not fail, not half-enable anything.
+  const loaded = loadEnv(BASE)
+  assert.equal(loaded.identity, null)
+  assert.equal(loaded.websocketPublicOrigin, null)
+})
+
+test('identity is both halves or neither', () => {
+  // A key set with no issuer verifies a signature and then accepts a token minted by anybody who can
+  // serve that key set. An issuer with no key set verifies nothing at all. Neither is a
+  // configuration somebody meant to write, so neither is inferred from the other.
+  assert.throws(() => loadEnv({ ...BASE, IDENTITY_JWKS_URL: IDENTITY['IDENTITY_JWKS_URL'] as string }), EnvError)
+  assert.throws(() => loadEnv({ ...BASE, IDENTITY_ISSUER: IDENTITY['IDENTITY_ISSUER'] as string }), EnvError)
+  const loaded = loadEnv({ ...BASE, ...IDENTITY })
+  assert.deepEqual(loaded.identity, {
+    jwksUrl: IDENTITY['IDENTITY_JWKS_URL'],
+    issuer: IDENTITY['IDENTITY_ISSUER'],
+  })
+})
+
+test('a published websocket origin with no identity is refused rather than advertised', () => {
+  // The failure it prevents is the worst-reading one available: `GET /v1/pool` advertises an
+  // endpoint, a page connects to it, the upgrade succeeds, and then every `mining.authorize` is
+  // refused because no ticket can be minted. Refusing at boot is one line in a log an operator is
+  // already watching.
+  assert.throws(
+    () => loadEnv({ ...BASE, POOL_WEBSOCKET_PUBLIC_ORIGIN: 'wss://pool.example.com' }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match((err as Error).message, /IDENTITY_JWKS_URL/)
+      return true
+    },
+  )
+})
+
+test('the published origin is an origin, and a path typed into it is refused', () => {
+  // Refused rather than accepted-and-ignored. The path is `STRATUM_WS_PATH`, which this repository
+  // owns and changes; an operator who typed one has written a second copy of a contract that moves,
+  // and the two would diverge invisibly until a browser could not connect.
+  for (const bad of [
+    'wss://pool.example.com/v1/pool/stratum',
+    'wss://pool.example.com/anything',
+    'https://pool.example.com',
+    'pool.example.com',
+    'wss://pool.example.com?x=1',
+    'wss://pool.example.com#frag',
+    'wss://alice:hunter2@pool.example.com',
+    'not a url',
+  ]) {
+    assert.throws(
+      () => loadEnv({ ...BASE, ...IDENTITY, POOL_WEBSOCKET_PUBLIC_ORIGIN: bad }),
+      (err: unknown) => {
+        assert.ok(err instanceof EnvError, `${bad} raised something else`)
+        assert.ok(!(err as Error).message.includes('hunter2'), 'a credential leaked')
+        return true
+      },
+      `${bad} was accepted`,
+    )
+  }
+})
+
+test('a valid origin is normalised, so a trailing slash cannot produce a doubled one', () => {
+  const withSlash = loadEnv({ ...BASE, ...IDENTITY, POOL_WEBSOCKET_PUBLIC_ORIGIN: 'wss://pool.example.com/' })
+  const without = loadEnv({ ...BASE, ...IDENTITY, POOL_WEBSOCKET_PUBLIC_ORIGIN: 'wss://pool.example.com' })
+  assert.equal(withSlash.websocketPublicOrigin, 'wss://pool.example.com')
+  assert.equal(without.websocketPublicOrigin, 'wss://pool.example.com')
+  // A non-default port survives, because a pool reached on one is the ordinary case off an estate.
+  assert.equal(
+    loadEnv({ ...BASE, ...IDENTITY, POOL_WEBSOCKET_PUBLIC_ORIGIN: 'ws://127.0.0.1:4146' }).websocketPublicOrigin,
+    'ws://127.0.0.1:4146',
+  )
+})
+
+test('websocketEndpointOf publishes a whole URL or nothing at all', () => {
+  // The lesson of micro-org#285, applied before the same mistake can be made a second time. Half an
+  // address is worse than none: the last time this service published one, the console filled the
+  // rest in from `window.location.hostname` and produced something that could not connect.
+  assert.equal(websocketEndpointOf(null, 'ltc'), null)
+  assert.equal(websocketEndpointOf('wss://pool.example.com', 'ltc'), 'wss://pool.example.com/v1/pool/stratum/ltc')
+  // The chain is IN the path, so a page reads one field and connects — it never assembles anything.
+  assert.equal(websocketEndpointOf('wss://pool.example.com', 'btc'), 'wss://pool.example.com/v1/pool/stratum/btc')
 })
