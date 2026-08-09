@@ -864,3 +864,36 @@ test('a draining pool refuses a browser rather than handing it work it will not 
   assert.equal(h.server.attachWebSocket(fake.wire), false)
   assert.equal(h.server.connectionCount, 0)
 })
+
+/* -------------------------- the payout address check reaches a real connection (micro-org#286) */
+
+test('A MINER ON A REAL SOCKET IS REFUSED WHEN THE NODE DOES NOT RECOGNISE ITS ADDRESS', async () => {
+  // `session.test.ts` proves the state machine refuses; this proves the refusal is REACHABLE. The
+  // check is configuration on `StratumServer` and it is handed to every session it builds, so a
+  // wiring that quietly dropped it would leave every test in `session.test.ts` green and every
+  // miner in production unchecked. That is the whole failure mode micro-org#286 is about, one layer
+  // up: a guard nothing calls.
+  const asked: string[] = []
+  const h = await harness({
+    checkPayoutAddress: (address) => {
+      asked.push(address)
+      return Promise.resolve(address === 'bc1qexampleaddress' ? 'valid' : 'invalid')
+    },
+  })
+  h.push()
+
+  const refused = await h.connect()
+  refused.send({ id: 1, method: 'mining.subscribe', params: [] })
+  await refused.await((m) => m['id'] === 1, 'the subscribe reply')
+  refused.send({ id: 2, method: 'mining.authorize', params: ['1SomeoneElsesChainAddress.rig', 'x'] })
+  const reply = await refused.await((m) => m['id'] === 2, 'the authorize reply')
+  assert.equal(reply['result'], false)
+  assert.equal((reply['error'] as [number, string, unknown])[0], 24)
+
+  // And a good address still gets all the way to work, over the same socket path.
+  const accepted = await h.connect()
+  await connect(accepted)
+  await accepted.await((m) => m['method'] === 'mining.notify', 'the first job')
+
+  assert.deepEqual(asked, ['1SomeoneElsesChainAddress', 'bc1qexampleaddress'])
+})

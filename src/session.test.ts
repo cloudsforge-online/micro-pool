@@ -25,6 +25,7 @@ import { parseTemplate } from './template.ts'
 import { fakeTemplateReply, FAKE_PAYOUT_SCRIPT, REGTEST_BITS } from './faketemplate.ts'
 import { DEFAULT_VARDIFF } from './vardiff.ts'
 import { STRATUM_ERROR } from './validate.ts'
+import type { AddressVerdict } from './payoutaddress.ts'
 import {
   parseWorkerName,
   Session,
@@ -576,4 +577,196 @@ test('without a redeemer the username path is untouched, and no ticket can be pr
   h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'anything-at-all'] })
   assert.equal(h.sent.find((m) => m.id === 2)?.result, true)
   assert.equal(h.session.account, 'bc1qexampleaddress')
+})
+
+/* ------------------------------- the payout address, checked with the node (micro-org#286) */
+
+/**
+ * A `checkPayoutAddress` that answers from a table and records what it was asked.
+ *
+ * Deliberately a plain function and not an `AddressChecker`: the caching, the bounding and the
+ * three-way verdict are `payoutaddress.test.ts`'s business, and what is under test here is only what
+ * the session DOES with each of the three answers.
+ */
+function addressCheck(
+  verdicts: Record<string, AddressVerdict>,
+  fallback: AddressVerdict = 'invalid',
+): { readonly asked: string[]; readonly check: (address: string) => Promise<AddressVerdict> } {
+  const asked: string[] = []
+  return {
+    asked,
+    check: (address: string): Promise<AddressVerdict> => {
+      asked.push(address)
+      return Promise.resolve(verdicts[address] ?? fallback)
+    },
+  }
+}
+
+test('THE ACCOUNT HALF OF THE USERNAME IS PUT TO THE NODE, AND THE WORKER HALF IS NOT', async () => {
+  // A stratum username on raw TCP IS a payout address, and `parseWorkerName` only ever decided what
+  // could be STORED. `.rig1` is a label the miner's owner typed; asking a node to validate it as an
+  // address would refuse every miner with a worker name.
+  const checker = addressCheck({ bc1qexampleaddress: 'valid' })
+  const h = harness({ checkPayoutAddress: checker.check })
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'x'] })
+  await Promise.resolve()
+
+  assert.deepEqual(checker.asked, ['bc1qexampleaddress'])
+  assert.equal(h.sent.find((m) => m.id === 2)?.result, true)
+  assert.equal(h.session.account, 'bc1qexampleaddress')
+  assert.equal(h.session.worker, 'rig1')
+})
+
+test('AN ADDRESS THE NODE DOES NOT RECOGNISE IS REFUSED, AND NOTHING IS CREDITED TO IT', async () => {
+  // The defect micro-org#286 records. Before this, a miner who pasted a Bitcoin address into the
+  // Litecoin pool, or fat-fingered one character of a bech32 string, mined for as long as they left
+  // it running and every share was recorded against something that can never be paid.
+  const checker = addressCheck({}, 'invalid')
+  const h = harness({ checkPayoutAddress: checker.check })
+  const job = h.pushTemplate()
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['1BitcoinAddressOnALitecoinPool.rig', 'x'] })
+  await Promise.resolve()
+
+  const reply = h.sent.find((m) => m.id === 2)
+  assert.equal(reply?.result, false)
+  assert.equal((reply?.error as [number, string, unknown])[0], STRATUM_ERROR.UNAUTHORIZED)
+  assert.ok(!h.session.authorised)
+
+  // No job, and no credit. A refused connection that still received work would be a miner hashing
+  // for nothing and never being told.
+  h.session.pushJob(job, true)
+  assert.equal(h.sent.filter((m) => m.method === 'mining.notify').length, 0)
+  h.session.handle({ id: 3, method: 'mining.submit', params: ['w', job.id, '00000001', job.ntimeHex, '00000000'] })
+  assert.equal(h.shares.length, 0)
+})
+
+test('the refusal says what the field is for, because that is what the miner has got wrong', async () => {
+  const checker = addressCheck({}, 'invalid')
+  const h = harness({ checkPayoutAddress: checker.check })
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['nonsense.rig', 'x'] })
+  await Promise.resolve()
+
+  const message = (h.sent.find((m) => m.id === 2)?.error as [number, string, unknown])[1]
+  // Names the chain, so somebody who pointed a Litecoin miner at the Bitcoin port can see it, and
+  // says what the username is FOR, which is the second commonest cause of getting here.
+  assert.match(message, /Bitcoin/)
+  assert.match(message, /\.worker/)
+})
+
+test('A NODE THAT CANNOT BE ASKED LETS THE MINER THROUGH — FAILING OPEN, ON PURPOSE', async () => {
+  // The deliberate choice, argued in `payoutaddress.ts`. The stratum listener stays up while the
+  // node is away by design; refusing here would disconnect every rig that reconnects during an
+  // operator's node problem, for a fault that is not the miner's, and each would then retry at once.
+  // Letting them through costs a share row against an address that is re-checked on their next
+  // connection and that cannot be paid before it is checked — measured 2026-08-09,
+  // `payoutsImplemented` is false and there is no payout path in this repository at all.
+  const checker = addressCheck({ bc1qexampleaddress: 'unavailable' })
+  const h = harness({ checkPayoutAddress: checker.check })
+  h.pushTemplate()
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'x'] })
+  await Promise.resolve()
+
+  assert.equal(h.sent.find((m) => m.id === 2)?.result, true)
+  assert.ok(h.session.authorised)
+  assert.equal(h.session.account, 'bc1qexampleaddress')
+  // And it is a whole authorisation, not a half one: difficulty then work, in that order.
+  const methods = h.sent.filter((m) => m.method !== undefined).map((m) => m.method)
+  assert.ok(methods.indexOf('mining.set_difficulty') < methods.indexOf('mining.notify'))
+})
+
+test('a username the pool would not store never reaches the node', async () => {
+  // `parseWorkerName` still runs first and is unchanged, which is what micro-org#286 asks for. It is
+  // also the cheaper guard: an unbounded string of control characters is refused here rather than
+  // being posted to a node as an RPC parameter.
+  const checker = addressCheck({}, 'valid')
+  for (const username of ['', 'has space.rig', 'a'.repeat(200), 'bad<script>.rig']) {
+    const h = harness({ checkPayoutAddress: checker.check })
+    h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+    h.session.handle({ id: 2, method: 'mining.authorize', params: [username, 'x'] })
+    await Promise.resolve()
+    assert.equal(h.sent.find((m) => m.id === 2)?.result, false, `${JSON.stringify(username)} was accepted`)
+  }
+  assert.deepEqual(checker.asked, [], 'an unstorable username was posted to the node')
+})
+
+test('THE BROWSER TRANSPORT IS NEVER ASKED, BECAUSE ITS ACCOUNT IS NOT AN ADDRESS', async () => {
+  // `cf-00112233445566aa` is a label this service minted for an estate account. It is not an address
+  // and no node would call it one, so a check on this path would refuse every browser miner there
+  // has ever been. The structural guarantee is that the ticket path never reads a username at all.
+  const checker = addressCheck({}, 'invalid')
+  const tickets = ticketing('ticket-value', { account: 'cf-00112233445566aa', worker: 'web-abc123' })
+  const h = harness({ redeemTicket: tickets.redeem, checkPayoutAddress: checker.check })
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qattacker.rig1', 'ticket-value'] })
+  await Promise.resolve()
+
+  assert.equal(h.sent.find((m) => m.id === 2)?.result, true)
+  assert.equal(h.session.account, 'cf-00112233445566aa')
+  assert.deepEqual(checker.asked, [])
+})
+
+test('a pool with no node check configured behaves exactly as it did before', async () => {
+  // The absent case, which is every existing caller and every test above this section. Authorisation
+  // stays synchronous and nothing is queued, so a miner that pipelines a submit behind its authorise
+  // is answered in the same turn it always was.
+  const h = harness()
+  const job = h.pushTemplate()
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'x'] })
+  assert.equal(h.sent.find((m) => m.id === 2)?.result, true, 'authorisation did not settle synchronously')
+  assert.ok(h.sent.some((m) => m.method === 'mining.notify'))
+  assert.ok(job)
+})
+
+test('A SUBMIT THAT ARRIVES WHILE THE NODE IS BEING ASKED IS QUEUED, NOT CALLED UNAUTHORIZED', async () => {
+  // The one wrong answer available in this window: telling a miner that did authorise that it did
+  // not. It is a real sequence — a client that pipelines its handshake sends subscribe, authorize
+  // and its first submit without waiting — and before the queue it would have been rejected with 24.
+  // Definite assignment: the executor runs synchronously when `checkPayoutAddress` is called, which
+  // is inside the `mining.authorize` below, so this is set before the first assertion reads it.
+  let settle!: (verdict: AddressVerdict) => void
+  const h = harness({
+    checkPayoutAddress: () =>
+      new Promise<AddressVerdict>((resolve) => {
+        settle = resolve
+      }),
+  })
+  const job = h.pushTemplate()
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'x'] })
+  h.session.handle({ id: 3, method: 'mining.submit', params: ['w', job.id, '00000001', job.ntimeHex, 'deadbeef'] })
+
+  // Nothing has been said about the submit yet, and in particular nothing wrong has been said.
+  assert.equal(h.sent.find((m) => m.id === 3), undefined)
+
+  settle('valid')
+  await Promise.resolve()
+  await Promise.resolve()
+
+  assert.equal(h.sent.find((m) => m.id === 2)?.result, true)
+  const submitReply = h.sent.find((m) => m.id === 3)
+  assert.ok(submitReply, 'the queued submit was never answered')
+  // It is answered on its merits — this nonce does not meet the target — and NOT with 24.
+  assert.notEqual((submitReply?.error as [number, string, unknown])[0], STRATUM_ERROR.UNAUTHORIZED)
+  // And the ordering rule survives the queue: difficulty and work still precede the submit's reply.
+  const sentMethods = h.sent.map((m) => m.method ?? `reply:${String(m.id)}`)
+  assert.ok(sentMethods.indexOf('mining.notify') < sentMethods.indexOf('reply:3'))
+})
+
+test('the queue is bounded, because a client can fill it as fast as it likes', async () => {
+  // An unbounded queue here is memory growth at whatever rate a peer can write, held for as long as
+  // a node takes to answer. Past the limit the miner is told, with an id it can match, rather than
+  // being left waiting or silently dropped.
+  const h = harness({ checkPayoutAddress: () => new Promise<AddressVerdict>(() => {}) })
+  h.session.handle({ id: 1, method: 'mining.subscribe', params: [] })
+  h.session.handle({ id: 2, method: 'mining.authorize', params: ['bc1qexampleaddress.rig1', 'x'] })
+  for (let i = 0; i < 100; i += 1) {
+    h.session.handle({ id: 1000 + i, method: 'mining.suggest_difficulty', params: [1] })
+  }
+  const refusals = h.sent.filter((m) => (m.error as [number, string, unknown] | undefined)?.[0] === STRATUM_ERROR.OTHER)
+  assert.equal(refusals.length, 100 - 32, 'the queue was not bounded at 32')
 })
