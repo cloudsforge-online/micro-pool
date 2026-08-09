@@ -6,10 +6,23 @@
  *
  * `src/server.ts` was the one module in this repository with no test beside it — the route table,
  * the 404 envelope, the request-id echo, the parameter clamps and the entire public response shape
- * were all unasserted. It is not fixed wholesale here. What is covered is the surface the pool's
- * console reads and the route this change touched, plus the envelope and clamping behaviour that
- * every one of those answers depends on; the remaining routes are exercised for shape rather than
- * for their SQL, which lives in `store.test.ts` against a real database.
+ * were all unasserted. It was opened for the endpoint work of micro-org#285 and micro-org#289 and
+ * said so itself: "it is not fixed wholesale here". The remainder was closed on 2026-08-09, which
+ * is the rest of #283, and the three things it had left undone were the three that a status code
+ * cannot see:
+ *
+ *   1. the `limit` CLAMP, which is invisible from outside — see `recordingSql` below;
+ *   2. the per-chain hashrate constant, which is wrong by a factor of 65,536 or not at all;
+ *   3. the bodies of `/blocks`, `/workers` and `/shares`, whose `.map()`s had never run because
+ *      the stub answered `[]` to everything — so the string-typed amounts, the nullable fields and
+ *      the timestamp formatting were described nowhere in this repository at all.
+ *
+ * Their only other description in the estate is a hand-copy in `pool-web`, checked by a test that
+ * reads this repository's source AS TEXT and SKIPS ITSELF when micro-pool is not checked out beside
+ * it. A check that cannot fail is not a check, which is the whole of #283.
+ *
+ * The SQL underneath remains out of scope here; it is tested in `store.test.ts` against a real
+ * database, which is where a query belongs.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * ── The database is a stub here, and that is the boundary this file accepts ────────────────────
@@ -48,6 +61,29 @@ import type { Exec } from './store.ts'
  */
 function stubSql(rows: readonly unknown[] = []): Exec {
   return (async () => rows) as unknown as Exec
+}
+
+/**
+ * The same stub, keeping the interpolated values of every statement it was handed.
+ *
+ * `limitParam` CLAMPS rather than refuses, and a clamp is invisible from outside by construction: a
+ * caller who asks for 100,000 rows and is given 200 sees a 200 with 200 rows in it, which is exactly
+ * what a caller who asked for 200 sees. Asserting the status code therefore asserts nothing about
+ * the ceiling, and the ceiling is the only thing standing between an endpoint that takes no
+ * credential and a request for every share this pool has ever recorded. So the number that reaches
+ * `store.ts` is read off the statement instead.
+ *
+ * The values are searched rather than indexed by position, because their order is a property of the
+ * SQL in `store.ts` and not of the clamp — pinning it here would make this test fail for a query
+ * that grew a `where` clause, which is a failure about the wrong file.
+ */
+function recordingSql(rows: readonly unknown[] = []): { readonly values: unknown[][]; readonly sql: Exec } {
+  const values: unknown[][] = []
+  const sql = ((_strings: TemplateStringsArray, ...bound: unknown[]) => {
+    values.push(bound)
+    return Promise.resolve(rows)
+  }) as unknown as Exec
+  return { values, sql }
 }
 
 /** A chain reporting no published endpoint — the estate's own configuration on 2026-08-09. */
@@ -93,6 +129,8 @@ async function withServer(
   options: {
     snapshot?: PoolSnapshot
     rows?: readonly unknown[]
+    /** Overrides `rows` when a test needs to read what was bound rather than what came back. */
+    sql?: Exec
     beforeScrape?: ServerDeps['beforeScrape']
     browserMining?: ServerDeps['browserMining']
   },
@@ -108,7 +146,7 @@ async function withServer(
     lifecycle,
     logger,
     metrics,
-    sql: stubSql(options.rows ?? []),
+    sql: options.sql ?? stubSql(options.rows ?? []),
     snapshot: () => options.snapshot ?? snapshot(),
     ...(options.beforeScrape ? { beforeScrape: options.beforeScrape } : {}),
     ...(options.browserMining ? { browserMining: options.browserMining } : {}),
@@ -277,6 +315,35 @@ test('an account that could never have been stored is a 400, not an empty list',
   })
 })
 
+test('an account of exactly the maximum length is accepted, and one character more is not', async () => {
+  // The boundary itself, because 96 is the width of `pool_workers.account` and of the check in
+  // `session.ts` that decides what may be written there. A ceiling asserted only from outside is a
+  // ceiling that can move by one in either direction without anything noticing.
+  await withServer({}, async (h) => {
+    const at = await fetch(`${h.url}/v1/pool/workers?account=${'a'.repeat(96)}`)
+    assert.equal(at.status, 200)
+    const over = await fetch(`${h.url}/v1/pool/workers?account=${'a'.repeat(97)}`)
+    assert.equal(over.status, 400)
+  })
+})
+
+test('a refusal carries the same envelope and the same request id as everything else', async () => {
+  // The 404 envelope is asserted below; this is the 400 one, which is the answer a miner actually
+  // meets — a mistyped account or a chain this pool does not serve — and it is the one whose id a
+  // support conversation is conducted through.
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/shares`, { headers: { 'x-request-id': 'req-support-1' } })
+    assert.equal(res.status, 400)
+    const body = (await res.json()) as { error: { code: string; message: string; requestId: string } }
+    assert.deepEqual(Object.keys(body.error).sort(), ['code', 'message', 'requestId'])
+    assert.equal(body.error.code, 'bad_request')
+    // Echoed in the header AND repeated in the body, so a reader who can only see what their
+    // browser rendered can still quote the thing that joins to the log line.
+    assert.equal(res.headers.get('x-request-id'), 'req-support-1')
+    assert.equal(body.error.requestId, 'req-support-1')
+  })
+})
+
 test('every list is bounded by a clamp rather than by trust', async () => {
   // An unauthenticated caller asking for a million rows is a database load generator. Clamping
   // rather than refusing is deliberate — the caller gets the ceiling, which is what they wanted.
@@ -286,6 +353,268 @@ test('every list is bounded by a clamp rather than by trust', async () => {
     for (const limit of ['0', '-1', '2.5', 'lots']) {
       const res = await fetch(`${h.url}/v1/pool/blocks?limit=${limit}`)
       assert.equal(res.status, 400, limit)
+    }
+  })
+})
+
+test('THE CEILING IS THE NUMBER THAT REACHES THE DATABASE, NOT THE ONE THE STATUS CODE IMPLIES', async () => {
+  // The status code cannot see this and neither can the body: a clamped request and an honest one
+  // are the same 200 with the same rows in it. The only observable difference is the number bound
+  // into the statement, so that is what is read. micro-org#283 exists because a check that cannot
+  // fail is not a check, and "the clamp returns 200" is exactly such a check.
+  const blocks = recordingSql()
+  await withServer({ sql: blocks.sql }, async (h) => {
+    assert.equal((await fetch(`${h.url}/v1/pool/blocks?limit=100000`)).status, 200)
+  })
+  assert.ok(blocks.values[0]?.includes(200), `blocks did not ask for 200: ${JSON.stringify(blocks.values[0])}`)
+  assert.ok(!blocks.values[0]?.includes(100_000), 'the caller-supplied limit reached the database')
+
+  const shares = recordingSql()
+  await withServer({ sql: shares.sql }, async (h) => {
+    assert.equal((await fetch(`${h.url}/v1/pool/shares?account=ltc1qexample&limit=100000`)).status, 200)
+  })
+  assert.ok(shares.values[0]?.includes(1_000), `shares did not ask for 1000: ${JSON.stringify(shares.values[0])}`)
+  assert.ok(!shares.values[0]?.includes(100_000), 'the caller-supplied limit reached the database')
+})
+
+test('a caller who asks for no limit gets the documented default, not the ceiling', async () => {
+  // Two different numbers, and the difference is a page's worth of rows. A default that had drifted
+  // to the ceiling would be invisible to every other assertion in this file.
+  const blocks = recordingSql()
+  await withServer({ sql: blocks.sql }, async (h) => {
+    await fetch(`${h.url}/v1/pool/blocks`)
+  })
+  assert.ok(blocks.values[0]?.includes(50), `blocks default is not 50: ${JSON.stringify(blocks.values[0])}`)
+
+  const shares = recordingSql()
+  await withServer({ sql: shares.sql }, async (h) => {
+    await fetch(`${h.url}/v1/pool/shares?account=ltc1qexample`)
+  })
+  assert.ok(shares.values[0]?.includes(100), `shares default is not 100: ${JSON.stringify(shares.values[0])}`)
+})
+
+/* ------------------------------------------- the three list bodies, which nothing else looks at */
+
+/**
+ * Everything below drives raw rows — snake_case, `bigint` columns already `::text` as postgres.js
+ * hands them over — through the stub, because the composition between `store.ts` and the wire is
+ * the part of `server.ts` that no other test in this estate reaches.
+ *
+ * The stub in this file answered `[]` for its whole life until 2026-08-09, which meant every
+ * `.map()` in `server.ts` ran zero times: the string-typed amounts, the nullable fields and the
+ * timestamp formatting were all unasserted, and the only description of them anywhere was a
+ * hand-copy in `pool-web` guarded by a grep that skips itself when this repository is not checked
+ * out beside it. micro-org#283 and micro-org#287.
+ */
+
+test('A REWARD CROSSES THE WIRE AS A STRING, BECAUSE JSON HAS NO INTEGER WIDE ENOUGH FOR MONEY', async () => {
+  // 9007199254740993 is 2^53 + 1 — the first whole number a JSON number cannot represent. It is
+  // used here rather than a plausible block reward precisely because a `Number()` in the path is
+  // invisible for realistic values and silently wrong for large ones, and a subsidy in litoshi on a
+  // chain with 8 decimals has room to grow into that range.
+  const rows = [
+    {
+      height: 2_912_004,
+      hash: '0000000000000000000abc',
+      found_at: new Date('2026-08-09T10:00:00.000Z'),
+      reward: '9007199254740993',
+      network_difficulty_units: '3451211950000000',
+      submit_status: 'accepted',
+      submit_detail: null,
+    },
+    {
+      height: 2_912_003,
+      hash: '0000000000000000000def',
+      found_at: new Date('2026-08-09T09:45:30.500Z'),
+      reward: '625000000',
+      network_difficulty_units: '3451211950000000',
+      submit_status: 'rejected',
+      submit_detail: 'inconclusive',
+    },
+  ]
+  await withServer({ rows }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/blocks`)
+    assert.equal(res.status, 200)
+    const text = await res.text()
+    // Read as text first: a `reward` that had been through `Number()` would still round-trip through
+    // `JSON.parse` into something that compares equal to itself, and the loss would never show.
+    assert.ok(text.includes('"reward":"9007199254740993"'), text)
+    const body = JSON.parse(text) as {
+      chain: string
+      asset: string
+      decimals: number
+      payoutsImplemented: boolean
+      blocks: readonly Record<string, unknown>[]
+    }
+    assert.deepEqual(Object.keys(body).sort(), ['asset', 'blocks', 'chain', 'decimals', 'payoutsImplemented'])
+    assert.equal(body.chain, 'ltc')
+    assert.equal(body.asset, 'LTC')
+    assert.equal(body.decimals, 8)
+    // The second place this literal appears in `server.ts`, and the one a block list makes most
+    // tempting to drop — a page showing found blocks is exactly where a reader infers a payment.
+    assert.equal(body.payoutsImplemented, false)
+
+    assert.deepEqual(Object.keys(body.blocks[0] ?? {}).sort(), [
+      'foundAt',
+      'hash',
+      'height',
+      'networkDifficulty',
+      'reward',
+      'submitDetail',
+      'submitStatus',
+    ])
+    assert.equal(typeof body.blocks[0]?.reward, 'string')
+    // Units on disk, difficulty on the wire: 3451211950000000 / 1e8.
+    assert.equal(body.blocks[0]?.networkDifficulty, 34_512_119.5)
+    assert.equal(body.blocks[0]?.foundAt, '2026-08-09T10:00:00.000Z')
+    // Null means the node said nothing beyond its verdict, NOT that the block was fine.
+    assert.equal(body.blocks[0]?.submitDetail, null)
+    assert.equal(body.blocks[1]?.submitStatus, 'rejected')
+    assert.equal(body.blocks[1]?.submitDetail, 'inconclusive')
+  })
+})
+
+test('A SHARE ID IS A STRING FOR THE SAME REASON, AND A WORKER THAT NEVER SET A DIFFICULTY IS NULL', async () => {
+  const rows = [
+    {
+      id: '9007199254740993',
+      worker: 'rig-1',
+      job_id: '0f',
+      height: 2_912_004,
+      difficulty_units: '6553600000000',
+      achieved_units: '9830400000000',
+      is_block: false,
+      created_at: new Date('2026-08-09T10:00:00.000Z'),
+    },
+  ]
+  await withServer({ rows }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/shares?account=ltc1qexample`)
+    assert.equal(res.status, 200)
+    const text = await res.text()
+    // `pool_shares.id` is a bigserial. A pool recording a share a second passes 2^53 in about 285
+    // million years, so this is not a deadline — it is that the column's type says bigint and the
+    // wire ought not to quietly disagree with it.
+    assert.ok(text.includes('"id":"9007199254740993"'), text)
+    const body = JSON.parse(text) as { chain: string; account: string; shares: readonly Record<string, unknown>[] }
+    assert.deepEqual(Object.keys(body).sort(), ['account', 'chain', 'shares'])
+    assert.equal(body.account, 'ltc1qexample')
+    assert.deepEqual(Object.keys(body.shares[0] ?? {}).sort(), [
+      'achievedDifficulty',
+      'createdAt',
+      'creditedDifficulty',
+      'height',
+      'id',
+      'isBlock',
+      'jobId',
+      'worker',
+    ])
+    assert.equal(typeof body.shares[0]?.id, 'string')
+    // Credited and achieved are reported separately and both in difficulty, not units, because the
+    // point of this route is that a miner can line it up against their own log.
+    assert.equal(body.shares[0]?.creditedDifficulty, 65_536)
+    assert.equal(body.shares[0]?.achievedDifficulty, 98_304)
+    assert.equal(body.shares[0]?.createdAt, '2026-08-09T10:00:00.000Z')
+  })
+})
+
+test('a worker with no recorded difficulty reports null, which is not the same as zero', async () => {
+  // `last_difficulty` is null for a worker this pool has seen but never set a difficulty on — a
+  // connection that authorised and then went quiet. Rendering that as 0 would tell its owner their
+  // miner is being credited nothing, when the truth is that nothing has been decided yet.
+  const rows = [
+    {
+      id: '1',
+      account: 'ltc1qexample',
+      // The empty string is a real worker name here: `parseWorkerName` in `session.ts` accepts an
+      // account with no `.suffix` and stores the worker as ''. A page that treated a falsy worker as
+      // missing would drop the single most common row this route returns.
+      worker: '',
+      last_seen_at: new Date('2026-08-09T10:00:00.000Z'),
+      last_difficulty: null,
+      recent_shares: '0',
+      recent_units: '0',
+    },
+    {
+      id: '2',
+      account: 'ltc1qexample',
+      worker: 'rig-2',
+      last_seen_at: new Date('2026-08-09T09:59:00.000Z'),
+      last_difficulty: '6553600000000',
+      recent_shares: '12',
+      recent_units: '78643200000000',
+    },
+  ]
+  await withServer({ rows }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/workers?account=ltc1qexample`)
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as {
+      chain: string
+      account: string
+      windowSeconds: number
+      workers: readonly Record<string, unknown>[]
+    }
+    assert.deepEqual(Object.keys(body).sort(), ['account', 'chain', 'windowSeconds', 'workers'])
+    assert.equal(body.windowSeconds, 600)
+    assert.deepEqual(Object.keys(body.workers[0] ?? {}).sort(), [
+      'difficulty',
+      'hashrateEstimate',
+      'lastSeenAt',
+      'sharesInWindow',
+      'worker',
+    ])
+    assert.equal(body.workers[0]?.worker, '')
+    assert.equal(body.workers[0]?.difficulty, null)
+    assert.equal(body.workers[0]?.hashrateEstimate, 0)
+    assert.equal(body.workers[0]?.lastSeenAt, '2026-08-09T10:00:00.000Z')
+    assert.equal(body.workers[1]?.difficulty, 65_536)
+    assert.equal(body.workers[1]?.sharesInWindow, 12)
+    // 786,432 difficulty of scrypt work over the 600-second window, at 65537.00001525879 hashes per
+    // unit of scrypt difficulty. Composed here rather than restated as a literal, because the thing
+    // under test is that the CHAIN'S constant is the one used — see the test below.
+    assert.ok(
+      Math.abs((body.workers[1]?.hashrateEstimate as number) - (786_432 * 65_537.00001525879) / 600) < 1,
+      String(body.workers[1]?.hashrateEstimate),
+    )
+  })
+})
+
+test('A HASHRATE IS COMPOSED WITH THE CHAIN’S OWN CONSTANT, NOT WITH SHA-256D FOR EVERYONE', async () => {
+  // The same credited work on scrypt and on sha256d is not the same hashrate; it differs by the
+  // ratio of the two chains' difficulty-1 targets. A `hashesPerDifficulty` that had been fixed to
+  // one algorithm would report every Litecoin miner 65,536 times off — the exact failure `store.ts`
+  // refuses to make by returning units raw, undone one layer higher up.
+  //
+  // Measured 2026-08-09: sha256d = 4295032833.000015, scrypt = 65537.00001525879, ratio
+  // 65536.00000000023. NOT exactly 65536 in IEEE-754, so this is a tolerance and not an equality.
+  const both = snapshot({
+    chains: [chainStatus(), chainStatus({ chain: 'btc', name: 'Bitcoin', algorithm: 'sha256d', stratumPort: 3333 })],
+  })
+  // One `chainActivity` row, answered identically for both chains, so the ONLY difference between
+  // the two hashrates that come back is the constant `server.ts` chose.
+  await withServer({ snapshot: both, rows: [{ shares: '10', units: '6553600000000', workers: '1' }] }, async (h) => {
+    const body = (await (await fetch(`${h.url}/v1/pool`)).json()) as {
+      chains: readonly { chain: string; hashrateEstimate: number }[]
+    }
+    const ltc = body.chains.find((c) => c.chain === 'ltc')?.hashrateEstimate ?? 0
+    const btc = body.chains.find((c) => c.chain === 'btc')?.hashrateEstimate ?? 0
+    assert.ok(ltc > 0 && btc > 0, `${ltc} ${btc}`)
+    assert.ok(Math.abs(btc / ltc - 65_536) < 1, `ratio was ${btc / ltc}`)
+    // And the scrypt one is right in absolute terms too, so that swapping BOTH constants for one
+    // wrong constant still reddens this.
+    assert.ok(Math.abs(ltc - (65_536 * 65_537.00001525879) / 600) < 1, String(ltc))
+  })
+})
+
+test('every reply declares its own length', async () => {
+  // `send` writes `content-length` itself rather than letting Node chunk the response. Losing it
+  // costs nothing visible in a browser and breaks the plainest possible client — a `curl` behind a
+  // proxy that will not buffer — which is what this service's own README tells a reader to use.
+  await withServer({}, async (h) => {
+    for (const path of ['/livez', '/v1/pool', '/v1/pool/blocks', '/nope']) {
+      const res = await fetch(`${h.url}${path}`)
+      const length = res.headers.get('content-length')
+      assert.ok(length !== null, `${path} declared no length`)
+      assert.equal(Number(length), Buffer.byteLength(await res.text()), path)
     }
   })
 })
