@@ -234,6 +234,30 @@ export class PayoutsNotImplementedError extends Error {
  *   2. `INDEXER_CUSTODY_LABEL_PREFIXES` includes `pool:` on the estate.
  *   3. The `pool` service holds `indexer:write` and `ledger:post` grants. As of 2026-08-09 it holds
  *      no service-token grants at all.
+ *   4. The registration supplies a history claim the indexer's walked record can actually honour.
+ *      This one was added on 2026-08-09 after a second reading, because the first three are
+ *      necessary and NOT sufficient on Litecoin, and the miss fails in a different direction than
+ *      the drift this whole block is about.
+ *
+ *      LTC is a `DERIVED_FAMILIES` chain in `indexer/src/custody.ts` — the balance is walked, not
+ *      asked for the way `eth_getBalance` is asked. `deriveBalances` requires of EVERY address in
+ *      the custody set that its `history_from_height` be at or below the record's lowest walked
+ *      height, and when one address cannot satisfy that it throws rather than skipping it. So a
+ *      single badly-registered address does not under-report itself, it destroys the observation
+ *      for the whole asset — the ledger then records `unavailable`/`failed`, and LTC freezes from
+ *      the "no observation" branch instead of the drift branch.
+ *
+ *      This is not hypothetical for the pool specifically: the payout address accumulates coinbase
+ *      from the moment the pool mines, which is BEFORE anybody registers it, so it can never be
+ *      registered with `freshlyDerived: true`. It needs a truthful `history_from_height` — the mint
+ *      height — and the indexer's LTC record must already reach at or below that height, or a
+ *      backfill has to run first. `settlement/src/indexerclient.ts` documents the same constraint
+ *      on `watch`'s `freshlyDerived` parameter, citing micro-org#252.
+ *
+ *      Measured while writing this, so the failure mode is not confused with the current state:
+ *      LTC reconciled `clean` with `drift 0` on every fifteen-minute sweep through 2026-08-09,
+ *      including at 15:15:52Z. It froze once that day, from 15:00:50Z to 15:15:52Z, and that was
+ *      the node outage in micro-org#307, not this.
  *
  * None of that is in this repository's gift alone, which is exactly why the interlock is here
  * rather than in a ticket. Somebody switching payouts on has to read this first.
