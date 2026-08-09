@@ -1,8 +1,29 @@
-node_modules
-dist
+# What must never enter the build context, and why each line is here.
+#
+# `.env` and `.env.*` are both required, and the second is the one that is easy to forget: an
+# operator who copies `.env.example` to `.env.production` on their laptop has just made a file the
+# first pattern does not match, and `COPY . .` would bake it into a layer of an image published to
+# a registry. In this service those files hold the node RPC URLs, which carry HTTP Basic userinfo.
+#
+# `.git` is here for the same reason one step removed: the history holds every version of every
+# file, so shipping it undoes any secret that was ever committed and then deleted.
+#
+# The org's secret-hygiene workflow greps this file for `.env`, `.env.*` and `.git` as exact lines.
+# That is not a style check — it is the only thing standing between a careless `COPY . .` and a
+# credential in a published layer.
+.env
+.env.*
 .git
 .github
-.env
-*.log
+
+# Build output and installed trees. node_modules is reinstalled inside the image against the
+# image's own platform rather than copied from whatever the developer's machine resolved.
+node_modules
+dist
 *.tsbuildinfo
+*.log
+.DS_Store
+
+# Documentation. It changes far more often than the code and would invalidate the layer cache on
+# every edit for no benefit — nothing at runtime reads it.
 README.md
