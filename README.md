@@ -143,6 +143,7 @@ on:
 | Coinbase maturity | 100 confirmations | **240** — `consensus.nCoinbaseMaturity` from `chainparams.cpp` v1.14.9, effective from height 145,000; the estate's node is far past it |
 | Maturity re-check | against litecoind | **against dogecoind** — litecoind answers `-5` for a Dogecoin hash, which is not an answer about the block |
 | Credits and payouts | `POOL_LTC_MINIMUM_PAYOUT` | `POOL_DOGE_MINIMUM_PAYOUT`, **independent of its parent's** — different asset, different unit, prices four orders of magnitude apart |
+| Readable back over HTTP | `/v1/pool/blocks?chain=ltc` | `/v1/pool/blocks?chain=doge` — the aux chain is accepted **only on `/blocks`**, because that is the only one of the three routes whose table is keyed by the block's chain |
 
 240 blocks at Dogecoin's one-minute target is four hours, which is by design about the same wall
 time as Litecoin's 100 at two and a half minutes. Crediting a Dogecoin block at 100 would allocate
@@ -298,9 +299,30 @@ login is checkable by almost no miner.
 
 | Parameter | Where | Rules |
 | --- | --- | --- |
-| `chain` | `/blocks`, `/workers`, `/shares` | Lower-cased and trimmed. **Optional only when this pool serves exactly one chain**, in which case it defaults to that one; required otherwise. A chain this deployment does not serve is 400 and the message names the ones it does. |
+| `chain` | `/blocks`, `/workers`, `/shares` | Lower-cased and trimmed. **Optional only when this pool serves exactly one chain**, in which case it defaults to that one; required otherwise. A chain this deployment does not serve is 400 and the message names the ones it does. **The accepted set is not the same on all three** — see below. |
 | `account` | `/workers`, `/shares` | Required. Trimmed. Up to 96 characters of `[A-Za-z0-9_:-]`. Anything else is 400 — the character set is the one this pool would have been willing to store, so a value it rejects here is a value it can never have recorded a share against. |
 | `limit` | `/blocks`, `/shares` | A positive whole number. Absent or empty means the default. |
+
+#### `/blocks` takes a wider set of chains than `/shares` and `/workers`
+
+A merge-mined chain is a chain this pool can win a **block** on and cannot record a **share** on, so
+the two sets differ by exactly the aux chains configured:
+
+| Route | Accepted `chain` values | Default when absent |
+| --- | --- | --- |
+| `GET /v1/pool/blocks` | `POOL_CHAINS`, **plus every aux chain in `POOL_<PARENT>_AUX_CHAINS`** | the single share chain, never an aux one |
+| `GET /v1/pool/shares`, `GET /v1/pool/workers` | `POOL_CHAINS` only | the single share chain |
+
+`GET /v1/pool/blocks?chain=doge` answers with the Dogecoin blocks this pool won by merged mining,
+denominated in DOGE — `asset` and `decimals` are the **aux** chain's and not the parent's. Asking
+`/shares` or `/workers` for `doge` is a **400 rather than an empty list**, and the refusal is the
+honest answer: the Litecoin work is what produced the Dogecoin block, so a miner's DOGE share
+history *is* their LTC share history. An empty list would tell them their merged work was not
+recorded.
+
+Both refusals name the set they checked against, in different words on purpose — `it serves ltc`
+from the share routes and `it mines ltc` from `/blocks` — so the message says which question was
+asked. A deployment with no aux chain configured refuses `doge` on all three, exactly as before.
 
 **`limit` is CLAMPED, not refused, and nothing in the response says so.** Ask `/blocks` for 5,000
 and you get 200 with 200 rows, not a 400. The ceiling is what keeps an unauthenticated endpoint from
@@ -446,7 +468,9 @@ and on `/v1/pool/blocks`, and nowhere else** — in particular it is not part of
 
 ### `GET /v1/pool/blocks?chain=<chain>&limit=<n>`
 
-Blocks this pool found, newest first. `limit` defaults to 50 and is clamped at 200.
+Blocks this pool found, newest first. `limit` defaults to 50 and is clamped at 200. `chain` may be
+an aux chain — `?chain=doge` on a pool that merge-mines it — in which case every field below is the
+Dogecoin block's, including `asset` and `decimals`.
 
 ```json
 {
