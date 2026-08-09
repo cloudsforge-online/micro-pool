@@ -54,7 +54,10 @@ import type { JobRegistry, Job } from './work.ts'
 import type { VardiffOptions } from './vardiff.ts'
 import type { RedeemedTicket } from './tickets.ts'
 import type { AddressVerdict } from './payoutaddress.ts'
-import type { PoolChainId, PowAlgorithm } from './chains.ts'
+// A value import, which is allowed here and not in `session.ts`: this file is server-only and is
+// never loaded out of a bare checkout, so the package resolves. It is the boundary — the name is
+// read once here and handed down.
+import { nameFor, type PoolChainId, type PowAlgorithm } from './chains.ts'
 
 /** Longest line accepted. A `mining.submit` is around 200 bytes; this is two orders of magnitude up. */
 export const MAX_LINE_BYTES = 16 * 1024
@@ -343,6 +346,7 @@ export class StratumServer {
       handshakeTimer: null,
       session: new Session({
         chain: this.chain,
+        chainName: nameFor(this.chain),
         algorithm: this.#options.algorithm,
         registry: this.#options.registry,
         extranonce1,

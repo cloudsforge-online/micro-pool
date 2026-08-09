@@ -31,7 +31,14 @@ import { difficultyUnits } from './pplns.ts'
 import { notifyParams, type Job, type JobRegistry } from './work.ts'
 import { shareKey, validateShare, STRATUM_ERROR, type ShareResult } from './validate.ts'
 import { Vardiff, roundDifficulty, type VardiffOptions } from './vardiff.ts'
-import { nameFor, type PoolChainId, type PowAlgorithm } from './chains.ts'
+// TYPE-ONLY, and it has to stay that way. `chains.ts` value-imports `@cloudsforge/contracts-chain`,
+// and micro-hub-web drives THIS file directly out of a micro-pool checkout that has no
+// `node_modules` — so a value import here is not a style question, it is that repository's suite
+// failing to load at all. It did, on 2026-08-09: `nameFor` was imported for one error string in
+// micro-org#286 and micro-hub-web's release CI died with ERR_MODULE_NOT_FOUND before a single
+// assertion ran, including the assertion that exists to catch exactly this. The chain's display
+// name arrives as `chainName` in the deps instead.
+import type { PoolChainId, PowAlgorithm } from './chains.ts'
 import type { AddressVerdict } from './payoutaddress.ts'
 
 export interface OutgoingMessage {
@@ -65,6 +72,14 @@ export interface FoundBlock {
 
 export interface SessionDeps {
   readonly chain: PoolChainId
+  /**
+   * The chain's human name, for the one error string that says it out loud.
+   *
+   * Passed rather than looked up: `nameFor(chain)` reads it from `@cloudsforge/contracts-chain`,
+   * and this file may not reach that package at runtime — see the import block above. The caller
+   * is already on the server side, where the package resolves.
+   */
+  readonly chainName: string
   readonly algorithm: PowAlgorithm
   readonly registry: JobRegistry
   readonly extranonce1: Buffer
@@ -387,7 +402,7 @@ export class Session {
             // Says what is wrong AND what the field is for, because the commonest cause of this is
             // a miner that has an address for a different chain in it, and the second commonest is
             // a worker label typed where the address goes.
-            `${nameFor(this.#deps.chain)} does not recognise that payout address — the username must be` +
+            `${this.#deps.chainName} does not recognise that payout address — the username must be` +
               ' the address you want paid at, optionally followed by .worker',
             null,
           ],
