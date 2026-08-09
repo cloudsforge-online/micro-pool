@@ -17,15 +17,17 @@ Implements §5 of
 PPLNS allocation, writes the block row with the window bounds it was decided against, re-checks that
 block until it has matured or been orphaned, and stops. Nothing moves a balance.
 
-micro-org#302 changed what is *behind* that statement without changing the statement.
-`src/payouts.ts` now holds a real implementation — `LedgerPayoutSink`, which posts a double-entry
-credit to micro-ledger under the `credit_key` idempotency shape borrowed verbatim from
-`wallet/src/deposits.ts` — and `pool_payout_credits` exists in the schema, introduced by the same
-migration as the code that writes to it. **Two independent gates stand in front of it, and both are
-shut:**
+micro-org#302 changed what is *behind* that statement without changing the statement. The path is
+now complete end to end: `src/maturity.ts` decides whether a reward exists, `src/rewards.ts` walks
+the matured blocks and turns each one into per-worker claims through the existing PPLNS allocation
+(the leased job `pool.credit-blocks`), and `src/payouts.ts` holds a real sink — `LedgerPayoutSink`,
+which posts a double-entry credit to micro-ledger under the `credit_key` idempotency shape borrowed
+verbatim from `wallet/src/deposits.ts`. `pool_payout_credits` exists in the schema, introduced by
+the same migration as the code that writes to it. **Two independent gates stand in front of the
+whole path, and both are shut:**
 
 1. **The payout configuration is unset.** `POOL_<CHAIN>_MINIMUM_PAYOUT` has no default anywhere.
-   With no minimum, no sink is constructed, no payout job is registered, and `GET /v1/pool` reports
+   With no minimum, no sink is constructed, neither payout job is registered, and `GET /v1/pool` reports
    `payoutsImplemented: false`. See `.env.example` for why this block is optional when the fee is
    required: `src/env.ts` is eager, and a newly required variable is a container that will not boot.
 2. **`CUSTODY_BACKING_CLOSED` is `false`, in the source rather than in the environment.** The pool's
@@ -45,8 +47,10 @@ The other named holes, in one place:
 
 | Not implemented | What happens instead |
 | --- | --- |
-| Paying miners | Two gates refuse every credit: no payout configuration, and `CUSTODY_BACKING_CLOSED` is false. |
+| Paying miners | The mechanism exists and is exercised by tests; two gates refuse every credit in this release: no payout configuration, and `CUSTODY_BACKING_CLOSED` is false. |
 | Accrual across blocks | The minimum is a per-claim floor, not a running balance. A claim under it records nothing, so it stays payable later. |
+| Paying external miners | A miner with a payout address and no estate account is counted `skipped_no_account` and paid nothing. This service credits a ledger; it does not send a transaction. |
+| Reversing an orphaned credit | Nothing here reverses a credit. A block cannot reach `matured` and then `orphaned` through this service, and a correction is a new opposite ledger entry posted by a person — see the header of `src/rewards.ts`. |
 | Dogecoin | **Refused by name at boot.** `POOL_CHAINS=doge` will not start the service — see below. |
 | Stratum v2 | Not implemented and not planned for this pass. v1 is what deployed hardware speaks. |
 | TLS on the stratum port | Not implemented. Stratum v1 as deployed is plain TCP; the HTTP port is separate. |
@@ -390,6 +394,14 @@ verdict is the only thing separating "the coinbase was built wrongly" from "we l
 
 An orphan is logged at `error` and counted in `pool_block_maturity_total{status="orphaned"}`.
 
+`matured` is also the only state the allocation job will touch: `pool.credit-blocks` (every ten
+minutes, per chain, and **only for a chain with a payout minimum configured**) reads matured,
+accepted, not-yet-allocated blocks, re-summs the PPLNS window each one recorded when it was found,
+takes the fee, and offers every worker's share to the sink under `poolPayoutCreditKey`. Outcomes are
+counted in `pool_payout_claim_total{outcome=…}`, where the skips are the interesting values —
+`skipped_no_account` is every miner who has an address here and no estate account. In this release
+the sink refuses all of them at the first claim and the sweep stops, loudly, having written nothing.
+
 ### `GET /v1/pool/workers?chain=<chain>&account=<account>`
 
 Every worker seen under one account, with its recent contribution. No `limit`: the list is bounded
@@ -547,6 +559,7 @@ and nothing else, and the handshake timeout closes it.
 | `src/blocks.ts` | What happens when a share is a block, in the order it has to happen in. |
 | `src/pplns.ts` | The sliding window, and the integer allocation that makes the parts sum to the whole. |
 | `src/maturity.ts` | Re-reading a found block against the node: still on the chain, and 100 deep? |
+| `src/rewards.ts` | The walk from a matured block to per-worker claims: the window it was found against, the fee, and the remainder. |
 | `src/payouts.ts` | The credit key, the sink that posts it, and the two gates that refuse it — see the top of this file. |
 | `src/ledgerclient.ts` | One route of micro-ledger's API: `POST /entries`. Amounts are strings on the wire in both directions. |
 | `src/store.ts` | Every SQL statement, each scoped to one chain. |

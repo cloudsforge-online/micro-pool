@@ -164,6 +164,18 @@ export function registerPoolMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['chain', 'status'],
     })
+    .register({
+      // Every outcome of `rewards.ts`, including the two skips, because those are the interesting
+      // ones: `skipped_no_account` climbing while `credited` stays at zero is a pool whose miners
+      // are all external, and `skipped_below_minimum` climbing is a threshold set above what a
+      // block is worth to one miner. Registered unconditionally although it only moves on a
+      // deployment with payouts configured — a metric that appears when a feature is switched on is
+      // a metric no dashboard was built against.
+      name: 'pool_payout_claim_total',
+      help: 'Per-worker outcomes of allocating a matured block reward',
+      kind: 'counter',
+      labels: ['chain', 'outcome'],
+    })
     .register({ name: 'pool_connections', help: 'Live stratum connections', kind: 'gauge', labels: ['chain'] })
     .register({ name: 'pool_template_height', help: 'Height of the current template', kind: 'gauge', labels: ['chain'] })
     .register({

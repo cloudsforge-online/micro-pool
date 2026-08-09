@@ -324,9 +324,14 @@ registerHandlers(runner, {
   // maturity verdict, and it is not a detail: a second client pointed at a second node would answer
   // about a different chain of blocks.
   rpcFor: (chain) => chains.find((service) => service.chain === chain)?.node ?? null,
-  // Omitted entirely when payouts are off, which is what keeps `pool.flush-payouts` unregistered
-  // rather than registered-and-skipping. Spread rather than a ternary yielding `undefined`, so the
-  // property is absent under `exactOptionalPropertyTypes`.
+  // Both are part of a credit rather than of a job: the network is inside every credit key and the
+  // fee comes off the top of every block reward. Passed from the environment that already validated
+  // them, so `rewards.ts` never reads configuration and stays testable without any.
+  network: env.network,
+  feeBasisPoints: env.feeBasisPoints,
+  // Omitted entirely when payouts are off, which is what keeps `pool.credit-blocks` and
+  // `pool.flush-payouts` unregistered rather than registered-and-skipping. Spread rather than a
+  // ternary yielding `undefined`, so the property is absent under `exactOptionalPropertyTypes`.
   ...(payoutSinks.size > 0 ? { payoutSinkFor: (chain: PoolChainId) => payoutSinks.get(chain) ?? null } : {}),
 })
 await seedRecurring(queue, chainIds, payoutChains)

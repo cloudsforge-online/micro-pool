@@ -12,6 +12,10 @@
  *   | `pool.check-maturity` | yes     | One shared table again, and the RPC calls are the cost: N   |
  *   |                       |         | replicas would put N × `getblock` to a node that also has   |
  *   |                       |         | miners to serve, to reach the same verdict.                 |
+ *   | `pool.credit-blocks`  | yes     | It reads a matured block's PPLNS window and offers every    |
+ *   |                       |         | worker's share to the sink. Two replicas would compute the  |
+ *   |                       |         | same allocation and race on the same credit keys. Scheduled |
+ *   |                       |         | ONLY for chains that have a payout sink.                    |
  *   | `pool.flush-payouts`  | yes     | It posts MONEY to another service. Two replicas draining    |
  *   |                       |         | the same rows would be two credits racing on one key — safe |
  *   |                       |         | only because the ledger dedupes, which is not a reason to   |
@@ -32,9 +36,12 @@
 
 import { JobRunner, type JobQueue, type RunnerEvent } from '@cloudsforge/jobs'
 import type { Logger, Metrics } from '@cloudsforge/telemetry'
+import type { Network } from '@cloudsforge/contracts-chain'
 import { pruneShares, type Exec } from './store.ts'
 import { sweepMaturity } from './maturity.ts'
-import { isPoolChainId, type PoolChainId } from './chains.ts'
+import { creditMaturedBlocks } from './rewards.ts'
+import { assetFor, isPoolChainId, type PoolChainId } from './chains.ts'
+import type { PayoutSink } from './payouts.ts'
 import type { NodeRpc } from './rpc.ts'
 
 export const PRUNE_KIND = 'pool.prune-shares'
@@ -55,6 +62,16 @@ export const MATURITY_KIND = 'pool.check-maturity'
  * off, which is every deployment on 2026-08-09, this kind is never seeded and never registered.
  */
 export const PAYOUT_FLUSH_KIND = 'pool.flush-payouts'
+
+/**
+ * Turns matured blocks into claims — the producer, without which the flush above drains a table
+ * nothing writes to.
+ *
+ * Scheduled on exactly the same terms as the flush: per chain, and only for chains an operator
+ * configured a payout minimum for. `rewards.ts` holds the reasoning and every decision; this is only
+ * where it is scheduled.
+ */
+export const CREDIT_KIND = 'pool.credit-blocks'
 
 /**
  * How often the prune runs, and how much it deletes per run.
@@ -91,6 +108,17 @@ const MATURITY_EVERY_MS = 10 * 60_000
 const PAYOUT_FLUSH_EVERY_MS = 5 * 60_000
 const PAYOUT_FLUSH_BATCH = 100
 
+/**
+ * How often matured blocks are allocated.
+ *
+ * Ten minutes, the same as the maturity sweep, and the two intervals compose rather than compete: a
+ * block becomes spendable at some moment, the maturity sweep notices within ten minutes, and this
+ * one allocates it within ten more. Twenty minutes of worst-case delay against the hundred
+ * confirmations — about four hours on Litecoin — that had to pass first is not a number worth
+ * optimising, and a shorter interval would only run the same empty query more often.
+ */
+const CREDIT_EVERY_MS = 10 * 60_000
+
 export interface JobDeps {
   readonly sql: Exec
   readonly logger: Logger
@@ -108,17 +136,30 @@ export interface JobDeps {
    */
   readonly rpcFor: (chain: PoolChainId) => NodeRpc | null
   /**
+   * Which network this pool mines. Part of every credit key, so it cannot be defaulted or guessed:
+   * a testnet credit under a mainnet key would be the same movement to the ledger.
+   */
+  readonly network: Network
+  /** `POOL_FEE_BASIS_POINTS`. Required with no default; `pplns.ts` says why. */
+  readonly feeBasisPoints: number
+  /**
    * The payout sink for one chain, or null — and null on every deployment that exists today.
    *
    * Optional on `JobDeps` rather than required, so that a caller which has not configured payouts
    * writes nothing at all rather than writing `() => null` to satisfy a type. Absence and "no sink
-   * for this chain" are the same answer here and both mean the flush handler is not registered.
+   * for this chain" are the same answer here and both mean neither payout handler is registered.
    */
-  readonly payoutSinkFor?: (chain: PoolChainId) => PayoutFlusher | null
+  readonly payoutSinkFor?: (chain: PoolChainId) => JobPayoutSink | null
 }
 
-/** The one method the flush job needs. Narrower than `LedgerPayoutSink` so a test can supply one. */
-export interface PayoutFlusher {
+/**
+ * What the two payout jobs need of a sink: the producer credits, the flush retries.
+ *
+ * Declared here rather than imported whole from `payouts.ts` so a test can supply one of each
+ * without a database or a ledger, and so this module keeps depending on the seam rather than on
+ * `LedgerPayoutSink`.
+ */
+export interface JobPayoutSink extends PayoutSink {
   flushPending(chain: PoolChainId, limit: number): Promise<number>
 }
 
@@ -138,7 +179,12 @@ export function recurringFor(
   return chains.flatMap((chain) => [
     { kind: PRUNE_KIND, key: `chain:${chain}`, everyMs: PRUNE_EVERY_MS },
     { kind: MATURITY_KIND, key: `chain:${chain}`, everyMs: MATURITY_EVERY_MS },
-    ...(paid.has(chain) ? [{ kind: PAYOUT_FLUSH_KIND, key: `chain:${chain}`, everyMs: PAYOUT_FLUSH_EVERY_MS }] : []),
+    ...(paid.has(chain)
+      ? [
+          { kind: CREDIT_KIND, key: `chain:${chain}`, everyMs: CREDIT_EVERY_MS },
+          { kind: PAYOUT_FLUSH_KIND, key: `chain:${chain}`, everyMs: PAYOUT_FLUSH_EVERY_MS },
+        ]
+      : []),
   ])
 }
 
@@ -238,13 +284,44 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
   })
 
   /*
-   * Registered only when a sink resolver was supplied, which is only when an operator configured a
-   * payout minimum. On a deployment with payouts off the kind is neither seeded nor registered, so a
-   * row that somehow existed would sit unclaimed rather than dead-letter — and that is the right way
-   * round: a queue row is not a reason for a pool that has been told not to pay anybody to pay them.
+   * The producer and its retry, registered only when a sink resolver was supplied, which is only
+   * when an operator configured a payout minimum. On a deployment with payouts off neither kind is
+   * seeded and neither is registered, so a row that somehow existed would sit unclaimed rather than
+   * dead-letter — and that is the right way round: a queue row is not a reason for a pool that has
+   * been told not to pay anybody to pay them.
    */
   const sinkFor = deps.payoutSinkFor
   if (sinkFor) {
+    runner.register<{ chain?: string }>(CREDIT_KIND, async (job, ctx) => {
+      const chain = job.payload.chain
+      if (typeof chain !== 'string' || !isPoolChainId(chain)) {
+        throw new Error(`${CREDIT_KIND} requires a payload naming a chain this pool serves`)
+      }
+      if (ctx.signal.aborted) return
+      const sink = sinkFor(chain)
+      if (sink === null) {
+        deps.logger.warn('no payout sink for this chain; skipping the block credit sweep', { chain })
+        return
+      }
+      const sweep = await creditMaturedBlocks({
+        sql: deps.sql,
+        sink,
+        chain,
+        network: deps.network,
+        // Read from the chain table rather than passed in, for the reason `chains.ts` gives about
+        // every number that exists in `contracts-chain`: a second copy of "ltc means LTC" is a
+        // second thing that can be wrong, and this one would credit a miner in the wrong asset.
+        asset: assetFor(chain),
+        feeBasisPoints: deps.feeBasisPoints,
+        log: (level, message, fields) => deps.logger[level](message, fields),
+        onOutcome: (outcome) => deps.metrics.increment('pool_payout_claim_total', { chain, outcome }),
+      })
+      // Logged even when it did nothing, like the two sweeps above, and for the same reason: a job
+      // that has quietly stopped allocating is indistinguishable from one with nothing to allocate
+      // unless the run itself is visible.
+      deps.logger.info('credited matured blocks', { chain, ...sweep })
+    })
+
     runner.register<{ chain?: string }>(PAYOUT_FLUSH_KIND, async (job, ctx) => {
       const chain = job.payload.chain
       if (typeof chain !== 'string' || !isPoolChainId(chain)) {

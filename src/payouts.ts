@@ -4,17 +4,17 @@
  *
  * Nothing in this estate is credited by this service today. What exists is the accounting that
  * decides what a miner is *owed* — `pplns.ts` allocates a block reward across a window of shares,
- * `maturity.ts` decides whether that reward exists at all, and `store.ts` records both — plus, as of
- * micro-org#302, a `LedgerPayoutSink` at the bottom of this file that would credit micro-ledger if
- * it were ever reached.
+ * `maturity.ts` decides whether that reward exists at all, `rewards.ts` walks the matured blocks and
+ * offers each worker's share, and `store.ts` records all of it — plus, as of micro-org#302, a
+ * `LedgerPayoutSink` at the bottom of this file that would credit micro-ledger if it were reached.
  *
  * It is not reached, for two separate reasons that fail in two separate ways:
  *
  *   1. **Nothing constructs it.** `index.ts` builds a sink only when the payout configuration block
  *      is set — `POOL_<CHAIN>_MINIMUM_PAYOUT` and the ledger's URL and token, all with no defaults —
- *      and none of it is set on the estate. Unset means no sink, no job, and `payoutsImplemented`
- *      false in every response. `env.ts` explains at the read site why the block is opt-in rather
- *      than required.
+ *      and none of it is set on the estate. Unset means no sink, no `pool.credit-blocks` job, no
+ *      `pool.flush-payouts` job, and `payoutsImplemented` false in every response. `env.ts` explains
+ *      at the read site why the block is opt-in rather than required.
  *   2. **`CUSTODY_BACKING_CLOSED` is false**, so even a fully configured deployment refuses every
  *      claim. That constant carries the long version: crediting a miner creates a liability the
  *      estate must back, micro-ledger's reconciliation sweep cannot see the coin behind it, and the
@@ -45,8 +45,6 @@
  *   - There is no DEFAULT implementation of `PayoutSink`, and in particular not a no-op that logs.
  *     A line reading "would credit 0.03 LTC to …" is a line an operator will eventually read as a
  *     payment. The only implementation is the real one, and it refuses.
- *   - Nothing calls `credit`. No route, no job, and no branch of `blocks.ts` — a block that matures
- *     is marked matured and that is where it stops.
  *   - There is no on-chain send anywhere in this repository. A miner with no estate account cannot
  *     be paid by this service at all, and the sink says so by name rather than crediting a
  *     liability owed to a string.
@@ -57,14 +55,19 @@
  *
  * Open in 36 §7, and none of them is a technical question:
  *
- *   1. The pool fee (§7.1). Already surfaced: `POOL_FEE_BASIS_POINTS` is required with no default,
- *      so the estate cannot ship a fee by accident. Nothing yet deducts it.
+ *   1. What the pool fee actually is (§7.1). `POOL_FEE_BASIS_POINTS` is required with no default so
+ *      the estate cannot ship one by accident, and `rewards.ts` now takes it off the top of every
+ *      allocation — but the number itself is still a product decision nobody has made. What the
+ *      fee IS is answered; what it should BE is not.
  *   2. Which asset a miner is paid in (§7.2) — the coin they mined, or EMBER. The sink credits the
  *      coin, which is the only choice that needs no price.
- *   3. What happens to a balance below the minimum payout, which `POOL_<CHAIN>_MINIMUM_PAYOUT`
- *      names a threshold for and nothing yet accumulates against.
+ *   3. What happens to a balance below the minimum payout. `POOL_<CHAIN>_MINIMUM_PAYOUT` is a
+ *      per-claim floor and nothing accumulates across blocks; the claim below it writes nothing at
+ *      all, so the debt stays derivable from `pool_shares`. Accrual is a per-worker balance this
+ *      service must not keep — 04 §11 — and is open.
  *   4. Whether an external miner — the overwhelming majority, who gave an address and never an
- *      estate account — is paid at all, and by what.
+ *      estate account — is paid at all, and by what. `rewards.ts` counts them as
+ *      `skipped_no_account` and pays them nothing.
  *
  * ── WHAT IS NO LONGER OPEN ──────────────────────────────────────────────────────────────────────
  *
@@ -395,9 +398,10 @@ export class LedgerPayoutSink implements PayoutSink {
    * Finish the claims whose ledger posting never landed.
    *
    * The safety net the claim-then-post ordering requires, and the only reason that ordering is safe
-   * to choose. Nothing schedules it today because nothing constructs this class; when payouts are
-   * switched on it belongs in `jobs.ts` beside `pool.check-maturity`, keyed on the chain, for the
-   * same reason that one is leased.
+   * to choose. Scheduled as `pool.flush-payouts` in `jobs.ts`, keyed on the chain and leased for the
+   * same reason the maturity sweep is — but only for chains an operator configured a payout minimum
+   * for, which on 2026-08-09 is none of them. On a deployment with payouts off nothing constructs
+   * this class, so the kind is neither seeded nor registered.
    */
   async flushPending(chain: PoolChainId, limit: number): Promise<number> {
     const pending = await pendingPayoutCredits(this.#deps.sql, { chain, limit })

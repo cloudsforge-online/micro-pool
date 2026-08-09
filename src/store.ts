@@ -314,8 +314,10 @@ export async function setBlockMaturity(
  * `matured` is the only status that qualifies, and the asymmetry is the point: `pending` covers both
  * a young block and a node that could not be reached, and both of those are "we do not know yet".
  *
- * Nothing calls this to pay anybody today — `payouts.ts` explains at length that no payout path
- * exists — so its only consumer is the test that asserts a re-organised block leaves it empty.
+ * Its consumers are `blocksAwaitingCredit` below — which is this predicate plus "and not offered to
+ * the sink yet" — and the tests that assert a re-organised block leaves it empty. The two are kept
+ * as separate statements rather than one with a flag because this one is the DEFINITION and that one
+ * is a work queue, and `store.test.ts` asserts they agree on every state a block can be in.
  */
 export async function payableBlocks(
   exec: Exec,
@@ -331,6 +333,132 @@ export async function payableBlocks(
     limit ${args.limit}
   `
   return rows.map((row) => ({ hash: row.hash, height: row.height }))
+}
+
+/**
+ * A matured block, with everything the allocation needs to be recomputed from it.
+ *
+ * The window bounds come back rather than being re-derived, because they were snapshotted at the
+ * moment the block was found and re-deriving them a hundred confirmations later would answer a
+ * different question — `blocks.ts` and migration 2 both say so where they are written.
+ */
+export interface PayableBlockRow {
+  readonly hash: string
+  readonly height: number
+  /** The whole coinbase value, fees included, in the chain's smallest unit. The pool fee comes out of it. */
+  readonly reward: bigint
+  readonly windowFirstShareId: bigint | null
+  readonly windowLastShareId: bigint | null
+}
+
+/**
+ * The matured blocks whose PPLNS allocation has not been offered to the payout sink yet.
+ *
+ * The credit job's work queue, and the predicate is `payableBlocks` above plus `payout_credited_at
+ * is null`. Two statements rather than one with a flag: that one is the single definition of "this
+ * reward exists" and is read by anything that needs to know, this one is a queue that drains, and a
+ * boolean argument would have made every caller of the definition also a caller of the queue.
+ * `store.test.ts` pins that they agree — a pending block is in neither, a matured block is in both,
+ * and a credited block is in the definition and not in the queue.
+ *
+ * Oldest first, so a backlog is paid in the order it was earned.
+ *
+ * The marker being an optimisation rather than the safety is worth restating at the read site:
+ * `credit_key` is what makes a re-offer a no-op, so a run that crashes after crediting half a block
+ * and never marks it simply re-offers the whole block next time and credits the other half. See
+ * migration 6.
+ */
+export async function blocksAwaitingCredit(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<PayableBlockRow[]> {
+  const rows = await exec<
+    { hash: string; height: number; reward: string; first_id: string | null; last_id: string | null }[]
+  >`
+    select hash, height, reward::text,
+           window_first_share_id::text as first_id,
+           window_last_share_id::text  as last_id
+    from pool_blocks
+    where chain = ${args.chain}
+      and maturity_status = 'matured'
+      and submit_status = 'accepted'
+      and payout_credited_at is null
+    order by height
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({
+    hash: row.hash,
+    height: row.height,
+    reward: BigInt(row.reward),
+    windowFirstShareId: row.first_id === null ? null : BigInt(row.first_id),
+    windowLastShareId: row.last_id === null ? null : BigInt(row.last_id),
+  }))
+}
+
+/**
+ * Record that a block's allocation has been offered to the sink. True when this call was the one
+ * that marked it.
+ *
+ * `payout_credited_at is null` is in the predicate for the same reason it is in
+ * `markPayoutCredited`: two replicas can reach the same block, and the second must not restamp a
+ * time the first already wrote. The boolean is what keeps the job's log line honest about which run
+ * did the work.
+ *
+ * **What this does not mean.** Not "every worker was paid" — a claim under the configured minimum
+ * and a miner with no estate account are both skipped and both counted. Migration 6 says why the
+ * column is still worth having and why it is not a receipt.
+ */
+export async function markBlockPayoutsCredited(
+  exec: Exec,
+  args: { chain: PoolChainId; hash: string },
+): Promise<boolean> {
+  const rows = await exec<{ id: string }[]>`
+    update pool_blocks
+       set payout_credited_at = now()
+     where chain = ${args.chain}
+       and hash = ${args.hash}
+       and payout_credited_at is null
+    returning id
+  `
+  return rows.length > 0
+}
+
+/**
+ * The shares of one recorded window, summed per worker.
+ *
+ * **Why an id RANGE reproduces the window exactly.** `pplnsWindow` walks backwards from a share id
+ * and stops when the running difficulty crosses the window size, so the set it includes is
+ * contiguous in `id` by construction — every share between the smallest and largest id it took is
+ * also one it took. `blocks.ts` records those two ids on the block at the moment it was found, so
+ * re-reading `first <= id <= last` a hundred confirmations later returns the same rows, in the same
+ * groups, with the same weights, however much the share table has grown since. Recomputing the
+ * window from the multiplier instead would not: `POOL_PPLNS_WINDOW` is configuration and the network
+ * difficulty moves, so a block found in March would be allocated against April's rule.
+ *
+ * Those rows are also still there to be read, which is not luck — `pruneShares` takes its floor from
+ * the oldest `window_first_share_id` of any recorded block precisely so that a block's allocation
+ * stays reproducible for as long as the block is on file.
+ */
+export async function windowShares(
+  exec: Exec,
+  args: { chain: PoolChainId; firstShareId: bigint; lastShareId: bigint },
+): Promise<WindowRow[]> {
+  const rows = await exec<{ worker_id: string; account: string; worker: string; units: string }[]>`
+    select s.worker_id, w.account, w.worker, sum(s.difficulty_units)::text as units
+    from pool_shares s
+    join pool_workers w on w.id = s.worker_id
+    where s.chain = ${args.chain}
+      and s.id >= ${param(args.firstShareId)}
+      and s.id <= ${param(args.lastShareId)}
+    group by s.worker_id, w.account, w.worker
+    order by s.worker_id
+  `
+  return rows.map((row) => ({
+    workerId: Number(row.worker_id),
+    account: row.account,
+    worker: row.worker,
+    units: BigInt(row.units),
+  }))
 }
 
 export interface PayoutCreditInput {

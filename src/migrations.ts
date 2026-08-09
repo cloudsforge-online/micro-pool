@@ -288,6 +288,43 @@ export const MIGRATIONS: readonly Migration[] = [
         on pool_payout_credits (chain, block_hash);
     `,
   },
+  {
+    version: 6,
+    name: 'block-credit-marker',
+    /*
+     * ═══ ONE COLUMN, AND IT IS AN OPTIMISATION RATHER THAN A SAFETY PROPERTY ═════════════════════
+     *
+     * Migration 5 made `credit_key` the thing that stops a miner being paid twice, and it is enough
+     * on its own: `rewards.ts` may walk the same matured block on every sweep for ever and the
+     * unique constraint turns every re-offer into a no-op. What it is NOT is cheap. Without a marker
+     * the credit job re-reads the PPLNS window of every matured block this pool has ever found,
+     * re-runs the allocation, and hands every worker back to the sink, on a ten-minute timer,
+     * growing without bound for the life of the pool.
+     *
+     * So this column answers "has this block's allocation been offered to the sink" and nothing
+     * else. It deliberately does not say "every worker in this block was paid", because that is not
+     * true and a column named as though it were would be read as a receipt: a claim under
+     * `POOL_<CHAIN>_MINIMUM_PAYOUT` and a miner with no estate account are both skipped, both
+     * counted, and both still derivable in full from `window_first_share_id`/`window_last_share_id`
+     * and `pool_shares` — which `pruneShares` already refuses to delete under a recorded block.
+     *
+     * It is on `pool_blocks` rather than in a new table because it is one fact about one block, and
+     * `pool_payout_credits` cannot carry it: the honest state of a block whose every worker was
+     * below the minimum is "offered, credited nothing", which in a credits table is no rows at all
+     * and is indistinguishable from a block nobody has looked at.
+     */
+    up: `
+      alter table pool_blocks
+        add column if not exists payout_credited_at timestamptz;
+
+      -- The credit job's access path: the matured blocks of one chain that have not been offered
+      -- yet, oldest first. Partial and narrow, because once a pool has been running a while the rows
+      -- it excludes are all of them, and this query then reads an empty index rather than a table.
+      create index if not exists pool_blocks_uncredited_idx
+        on pool_blocks (chain, height)
+        where maturity_status = 'matured' and payout_credited_at is null;
+    `,
+  },
 ]
 
 /**
