@@ -25,6 +25,10 @@ import { parseTemplate } from './template.ts'
 import { fakeTemplateReply, fakeHashHex, FAKE_PAYOUT_SCRIPT, REGTEST_BITS } from './faketemplate.ts'
 import { DEFAULT_VARDIFF } from './vardiff.ts'
 import { STRATUM_ERROR } from './validate.ts'
+// A value import, which the test tier may make and `session.ts` may not — see
+// `browserdriven.test.ts`. Used so the harness feeds the same name production feeds, rather than
+// a literal that would keep passing after contracts-chain renamed the chain.
+import { nameFor } from './chains.ts'
 import type { AddressVerdict } from './payoutaddress.ts'
 import {
   parseWorkerName,
@@ -80,6 +84,7 @@ function harness(overrides: Partial<SessionDeps> = {}): Harness {
 
   const session = new Session({
     chain: 'btc',
+    chainName: nameFor('btc'),
     algorithm: 'sha256d',
     registry,
     extranonce1: EXTRANONCE1,
