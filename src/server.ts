@@ -212,6 +212,22 @@ function buildRoutes(): Route[] {
        * a `micro-pool-web` written against this API would otherwise have to know from documentation
        * that the number it is about to show is not a balance. Making it a field means the UI can be
        * built now and cannot accidentally imply a payment that will not arrive.
+       *
+       * ## `stratumEndpoint` is null far more often than it is not, and null is an answer
+       *
+       * The same principle, applied to the thing a miner actually needs. This response used to
+       * carry a port and no name, which left every consumer to invent the other half — and
+       * micro-pool-web duly derived it from `window.location.hostname`, producing
+       * `stratum+tcp://pool.<apex>:3334` on a public page. That endpoint cannot connect: the
+       * console's hostname is served through a Cloudflare Tunnel and Traefik, neither of which
+       * forwards a raw TCP stream, and the listener is bound to loopback by default anyway. A
+       * plausible connection string that does not connect is worse than no connection string,
+       * because its owner debugs their hardware instead of asking a question (micro-org#285).
+       *
+       * So the endpoint is reported when an operator has published one and is **null** otherwise —
+       * not the `Host` header, not the bind address, not the bound port. A consumer renders the
+       * absence. `stratumPort` remains beside it and is the BIND: honest about itself, useless as
+       * half of a connection string, and named as such in `ChainStatus`.
        */
       handle: async (_ctx, deps) => {
         const snapshot = deps.snapshot()
@@ -226,6 +242,7 @@ function buildRoutes(): Route[] {
               decimals: decimalsFor(chain),
               algorithm: status.algorithm,
               stratumPort: status.stratumPort,
+              stratumEndpoint: status.stratumEndpoint,
               connections: status.connections,
               height: status.height,
               networkDifficulty: status.networkDifficulty,

@@ -72,6 +72,29 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
 }
 
 /**
+ * An optional whole number with no fallback — `null` when unset, never a default.
+ *
+ * `integer` above supplies one and that is right for every value it is used for. This exists for
+ * the PUBLISHED stratum port, where a default would be a guess dressed as configuration. The
+ * obvious default — the port the listener binds — is precisely the conflation this function was
+ * added to stop: on 2026-08-09 the estate's compose file publishes the stratum listener as
+ * `${POOL_STRATUM_HOST_BIND:-127.0.0.1}:${POOL_LTC_STRATUM_PORT:-3334}:3334`, where the CONTAINER
+ * side is the literal 3334 and only the HOST side reads the variable — and the service's own
+ * environment block does not set `POOL_LTC_STRATUM_PORT` at all. So an operator who moves the
+ * published port changes one number and the pool goes on binding, and reporting, the other. A
+ * default here would make that divergence invisible instead of absent.
+ */
+function optionalInteger(source: Source, name: string, min: number, max: number): number | null {
+  const raw = source[name]?.trim()
+  if (!raw) return null
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new EnvError(`${name} must be a whole number between ${min} and ${max} (got ${raw})`)
+  }
+  return value
+}
+
+/**
  * A required whole number with no fallback. Exists for `POOL_FEE_BASIS_POINTS` alone, and the
  * absence of a default there is the entire point — see `feeBasisPoints` below.
  */
@@ -116,13 +139,73 @@ function nodeUrl(source: Source, name: string): string {
   return value
 }
 
+/**
+ * The name a miner outside this deployment dials, or `null` when nobody has published one.
+ *
+ * Checked for shape, because the two ways to get this wrong are both silent. A value carrying a
+ * scheme composes `stratum+tcp://stratum+tcp://…` in every consumer that builds a connection
+ * string, and a value carrying a port composes `host:3334:3334` — neither fails here, both fail in
+ * a stranger's mining firmware, and a miner whose configuration does not connect blames their own
+ * hardware long before they blame this string. Refusing at boot is the only place the person who
+ * typed it is still watching.
+ *
+ * The port test is "exactly one colon". An IPv6 literal has at least two (`2001:db8::1`), so it
+ * survives; `pool.example.com:3334` does not, which is the mistake being caught.
+ */
+function publicHost(source: Source, name: string): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
+  if (/[\s/@]/.test(value) || value.includes('://')) {
+    throw new EnvError(`${name} is the hostname a miner dials, not a URL — no scheme, no path, no credentials`)
+  }
+  if (value.split(':').length === 2) {
+    throw new EnvError(
+      `${name} is a hostname on its own; the port a miner dials is POOL_<CHAIN>_STRATUM_PUBLIC_PORT, ` +
+        'because a pool serving two chains publishes two ports under one name',
+    )
+  }
+  return value
+}
+
 export interface ChainConfig {
   readonly chain: PoolChainId
   /** Carries HTTP Basic userinfo. Never logged. */
   readonly nodeUrl: string
   readonly payoutAddress: string
+  /**
+   * The port this chain's stratum listener BINDS. Not necessarily a port anything can reach: it is
+   * the inside of whatever port mapping the deploy wrote. See `stratumPublicPort`.
+   */
   readonly stratumPort: number
+  /**
+   * The port a miner dials for this chain, when the deploy has published one — `null` otherwise.
+   *
+   * Separate from `stratumPort` because a container port and a published port are different facts
+   * and this service can only know the first. It defaults to nothing rather than to the bind; see
+   * `optionalInteger`.
+   */
+  readonly stratumPublicPort: number | null
   readonly initialDifficulty: number
+}
+
+/** Where a miner points their hardware. Both halves, or neither. */
+export interface StratumEndpoint {
+  readonly host: string
+  readonly port: number
+}
+
+/**
+ * The endpoint to advertise for one chain, or `null` when this deployment has not published one.
+ *
+ * Null is a real answer and the common one. A pool on a LAN, or one whose stratum port is bound to
+ * loopback — which is the estate's own default on 2026-08-09 — has no endpoint a stranger could
+ * dial, and saying so is correct rather than degraded. What must never happen is a half-answer: a
+ * host with no published port, or a port with no name, would compose into a connection string that
+ * looks complete and is not, so the pair is all-or-nothing by construction.
+ */
+export function stratumEndpointOf(host: string | null, chain: ChainConfig): StratumEndpoint | null {
+  if (host === null || chain.stratumPublicPort === null) return null
+  return { host, port: chain.stratumPublicPort }
 }
 
 export interface Env {
@@ -139,6 +222,28 @@ export interface Env {
   readonly network: Network
   readonly chains: readonly ChainConfig[]
   readonly stratumBind: string
+  /**
+   * The hostname a miner types into their firmware, or `null` when nobody has published one.
+   *
+   * **Optional, and unset by default, and the default is not a fallback to anything.** This is the
+   * one fact about a stratum endpoint that this service cannot derive and must not guess:
+   *
+   *   - It is NOT `stratumBind`. That is an interface to listen on — `0.0.0.0` says "every
+   *     interface", which is not a name and cannot be dialled.
+   *   - It is NOT the `Host` header of whoever asked. The HTTP surface and the stratum listener are
+   *     different protocols on different ports, and on this estate they are different reachability
+   *     stories as well: the console arrives through a Cloudflare Tunnel and Traefik, and neither
+   *     can carry a raw TCP stream, so the hostname that served the page provably does NOT carry
+   *     stratum. A consumer deriving one from the other is the defect this variable was added for
+   *     (micro-org#285).
+   *   - It is NOT a hostname of this container. A pool behind a port mapping, a NAT or a tunnel is
+   *     reached by a name only the deploy knows.
+   *
+   * So it is typed in, or it is null and every consumer says a name has not been published — which
+   * is the honest screen. A wrong hostname in a stranger's mining configuration costs them a silent
+   * outage they will blame on their own hardware, and that is strictly worse than an absent one.
+   */
+  readonly stratumPublicHost: string | null
   /**
    * Bytes written into every coinbase this pool builds, identifying it on the chain.
    *
@@ -188,6 +293,7 @@ function loadChain(source: Source, chain: PoolChainId): ChainConfig {
     nodeUrl: nodeUrl(source, `POOL_${upper}_NODE_URL`),
     payoutAddress: required(source, `POOL_${upper}_PAYOUT_ADDRESS`),
     stratumPort: integer(source, `POOL_${upper}_STRATUM_PORT`, DEFAULT_STRATUM_PORT[chain], 1, 65_535),
+    stratumPublicPort: optionalInteger(source, `POOL_${upper}_STRATUM_PUBLIC_PORT`, 1, 65_535),
     initialDifficulty: decimal(
       source,
       `POOL_${upper}_INITIAL_DIFFICULTY`,
@@ -239,6 +345,38 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     throw new EnvError('two chains are configured on the same stratum port; each chain needs its own listener')
   }
 
+  /*
+   * The published endpoint, refused when it is half-made.
+   *
+   * Both halves are optional and null is the ordinary answer, so neither absence is an error on its
+   * own. A HALF is: each of these two states is a decision somebody started and did not finish, and
+   * each produces a pool that silently advertises nothing while its operator believes otherwise.
+   *
+   *   - A host and no published port anywhere. The variable was typed and does nothing.
+   *   - A published port and no host. There is a number and no name to dial it at.
+   *
+   * Per chain rather than globally, because a pool may legitimately publish one chain and not
+   * another — an estate that exposes Litecoin to strangers and keeps Bitcoin on the LAN is a
+   * configuration, not a mistake — so a host plus SOME published ports is allowed and quiet.
+   */
+  const stratumPublicHost = publicHost(source, 'POOL_STRATUM_PUBLIC_HOST')
+  const published = chains.filter((chain) => chain.stratumPublicPort !== null)
+  if (stratumPublicHost !== null && published.length === 0) {
+    throw new EnvError(
+      'POOL_STRATUM_PUBLIC_HOST is set and no chain has a POOL_<CHAIN>_STRATUM_PUBLIC_PORT, so no ' +
+        'endpoint would be advertised at all. A published port is not defaulted from the bound one: ' +
+        'the two differ whenever the deploy maps them, and a port that is usually right is how a ' +
+        'miner ends up dialling nothing. State the port a miner reaches this pool on.',
+    )
+  }
+  if (stratumPublicHost === null && published.length > 0) {
+    const names = published.map((chain) => `POOL_${chain.chain.toUpperCase()}_STRATUM_PUBLIC_PORT`)
+    throw new EnvError(
+      `${names.join(', ')} names a published port and POOL_STRATUM_PUBLIC_HOST names nothing to ` +
+        'dial it at. A port on its own is not an endpoint.',
+    )
+  }
+
   const coinbaseTag = optional(source, 'POOL_COINBASE_TAG', '/cloudsforge/')
   if (Buffer.byteLength(coinbaseTag, 'utf8') > 32) {
     throw new EnvError('POOL_COINBASE_TAG must be at most 32 bytes — the coinbase scriptSig it shares is capped at 100')
@@ -258,6 +396,9 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // Stratum is plain TCP and unauthenticated; binding it is a deployment decision, and the
     // default is every interface because that is what a compose network needs.
     stratumBind: optional(source, 'POOL_STRATUM_BIND', '0.0.0.0'),
+    // The name to advertise, which is a different question from the interface to listen on and is
+    // answered by nothing this process can observe about itself. See the field's own note.
+    stratumPublicHost,
     coinbaseTag,
     feeBasisPoints: requiredInteger(source, 'POOL_FEE_BASIS_POINTS', 0, 10_000),
     pplnsMultiplier: decimal(source, 'POOL_PPLNS_WINDOW_MULTIPLIER', 2, 0.1, 100),

@@ -49,7 +49,11 @@ import { algorithmFor, nameFor } from './chains.ts'
 import { networkDifficultyOf } from './pow.ts'
 import { EXTRANONCE2_BYTES } from './stratum.ts'
 import type { AcceptedShare } from './session.ts'
-import type { ChainConfig } from './env.ts'
+// Types only, and that matters: `env.ts` validates eagerly and calls `process.exit(1)` on a bad
+// environment, so a value import here would make merely importing this module — from a test, from a
+// script — require a complete configuration. The published endpoint is therefore composed by the
+// composition root in `index.ts` and handed down, rather than derived here.
+import type { ChainConfig, StratumEndpoint } from './env.ts'
 import type { Logger, Metrics } from '@cloudsforge/telemetry'
 import type { Network } from '@cloudsforge/contracts-chain'
 
@@ -60,6 +64,14 @@ export interface ChainServiceDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly stratumBind: string
+  /**
+   * What to ADVERTISE, as against `stratumBind`, which is the interface to listen ON, and
+   * `config.stratumPort`, which is the port bound behind whatever mapping the deploy applies.
+   *
+   * Composed by the caller from `POOL_STRATUM_PUBLIC_HOST` and this chain's
+   * `POOL_<CHAIN>_STRATUM_PUBLIC_PORT`, and `null` whenever an operator has published neither.
+   */
+  readonly stratumEndpoint: StratumEndpoint | null
   readonly coinbaseTag: string
   readonly pplnsMultiplier: number
   readonly templatePollMs: number
@@ -71,7 +83,21 @@ export interface ChainStatus {
   readonly chain: string
   readonly name: string
   readonly algorithm: string
+  /**
+   * The port the listener BINDS. Reported because it is a true fact about this process and an
+   * operator reading `/v1/pool` beside a compose file needs it — but it is the inside of a port
+   * mapping, so it is not what a miner dials unless `stratumEndpoint` says the same number.
+   */
   readonly stratumPort: number
+  /**
+   * What to type into mining firmware, or `null` when this deployment has published nothing.
+   *
+   * Null is the honest answer and, on the estate as it stands, the correct one: the stratum port is
+   * bound to loopback by default and the hostname that serves the console cannot carry raw TCP. A
+   * consumer renders the absence — "no endpoint has been published, ask an operator" — rather than
+   * composing a connection string out of the bind, which is the defect micro-org#285 records.
+   */
+  readonly stratumEndpoint: StratumEndpoint | null
   readonly connections: number
   readonly height: number | null
   readonly networkDifficulty: number | null
@@ -233,6 +259,7 @@ export class ChainService {
       name: nameFor(chain),
       algorithm: algorithmFor(chain),
       stratumPort: this.#deps.config.stratumPort,
+      stratumEndpoint: this.#deps.stratumEndpoint,
       connections: this.#stratum.connectionCount,
       height: template?.height ?? null,
       networkDifficulty: template ? networkDifficultyOf(algorithmFor(chain), template.blockTarget) : null,

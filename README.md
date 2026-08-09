@@ -86,15 +86,21 @@ curl -s localhost:4146/livez
 curl -s localhost:4146/readyz
 curl -s localhost:4146/metrics
 curl -s localhost:4146/v1/pool | jq          # chains, heights, difficulty, connections, fee
-curl -s localhost:4146/v1/workers/<address>  # a miner's own share history
+curl -s "localhost:4146/v1/pool/blocks?chain=btc" | jq
+curl -s "localhost:4146/v1/pool/workers?chain=btc&account=<address>" | jq
+curl -s "localhost:4146/v1/pool/shares?chain=btc&account=<address>" | jq
 ```
 
-Point a miner at the stratum port — 3333 for BTC, 3334 for LTC. The username is
+Point a miner at the stratum port — 3333 for BTC, 3334 for LTC by default. The username is
 `<payout-address>.<worker>` and the password is ignored:
 
 ```sh
 cgminer -o stratum+tcp://127.0.0.1:3333 -u bc1qyouraddress.rig1 -p x
 ```
+
+`127.0.0.1` there is a fact about a local checkout and not something this service told you. What a
+miner elsewhere should dial is `POOL_STRATUM_PUBLIC_HOST` and `POOL_<CHAIN>_STRATUM_PUBLIC_PORT`,
+both unset by default — see the section below.
 
 ### Tests
 
@@ -237,6 +243,36 @@ not have one, which is all of them.
 to start without it. §7.1 records that the fee has not been chosen; a default of 0 would be choosing
 "free" and a default of 200 would be choosing "2%", in the file least likely to be read by whoever
 eventually decides.
+
+**The endpoint a miner dials is configuration, and reported as `null` until somebody sets it.** This
+service cannot work out what to advertise and does not try. `POOL_STRATUM_BIND` is an *interface* —
+`0.0.0.0` is not a name and cannot be dialled — the per-chain `POOL_<CHAIN>_STRATUM_PORT` is the
+port the listener *binds*, which is the inside of whatever mapping the deploy wrote, and the
+hostname on the request is the HTTP surface, which is a different protocol on a different port.
+
+So there are two optional variables, both unset by default:
+
+| Variable | What it is |
+| --- | --- |
+| `POOL_STRATUM_PUBLIC_HOST` | The hostname or address a miner types into their firmware. One per deployment. Refused at boot if it carries a scheme, a path, credentials or a port — each of those composes a connection string that looks complete and is not. |
+| `POOL_<CHAIN>_STRATUM_PUBLIC_PORT` | The published TCP port for that chain. Per chain, because one name fronts one port per chain. **Not defaulted from the bound port.** |
+
+`GET /v1/pool` reports them together as `stratumEndpoint: { host, port }` per chain, and **`null`
+when either half is missing** — never the bind, never the request's `Host` header, never a
+derivation. Half a pair is refused at boot rather than half-advertised: a host with no published
+port advertises nothing, and a port with no host is not an endpoint.
+
+Null is the ordinary answer and, on this estate today, the correct one — the stratum port is bound
+to loopback and the hostname serving the console reaches it through a Cloudflare Tunnel and Traefik,
+neither of which forwards a raw TCP stream. `micro-pool-web` renders the absence. The alternative
+was measured and is worse: with a port and no host in this response, the console derived the host
+from its own address and printed `stratum+tcp://pool.<apex>:3334`, which cannot connect and which
+costs its reader a silent outage they will blame on their own hardware (micro-org#285).
+
+The published port is separate from the bound one because deploys map them. The estate's compose
+file publishes `${POOL_LTC_STRATUM_PORT:-3334}:3334` — the host side reads a variable, the container
+side is a literal, and the service's environment does not set that variable at all — so on
+2026-08-09 an operator who moves the published port changes a number this service never sees.
 
 ---
 

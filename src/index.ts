@@ -28,7 +28,7 @@ import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Lifecycle, installSignalHandlers, postgresProbe, type Probe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
-import { SERVICE, env } from './env.ts'
+import { SERVICE, env, stratumEndpointOf } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer } from './server.ts'
 import { ChainService, registerPoolMetrics } from './chainservice.ts'
@@ -118,6 +118,9 @@ const chains = env.chains.map(
       logger,
       metrics,
       stratumBind: env.stratumBind,
+      // Composed here, where the environment already is, so that `chainservice.ts` needs nothing
+      // from `env.ts` but its types. Null unless an operator published both halves.
+      stratumEndpoint: stratumEndpointOf(env.stratumPublicHost, config),
       coinbaseTag: env.coinbaseTag,
       pplnsMultiplier: env.pplnsMultiplier,
       templatePollMs: env.templatePollMs,

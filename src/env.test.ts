@@ -28,7 +28,7 @@ const BASE: Record<string, string> = {
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
-const { EnvError, SERVICE, env, loadEnv } = await import('./env.ts')
+const { EnvError, SERVICE, env, loadEnv, stratumEndpointOf } = await import('./env.ts')
 
 const LTC: Record<string, string> = {
   POOL_LTC_NODE_URL: 'http://rpcuser:rpcpassword@litecoin:9332/',
@@ -93,6 +93,134 @@ test('the defaults that have one are the ones a deployment need not think about'
   assert.equal(loaded.templatePollMs, 10_000)
   assert.equal(loaded.vardiffSharesPerMinute, 12)
   assert.equal(loaded.databasePoolMax, 10)
+})
+
+/* ------------------------------------------- the endpoint a miner dials, which is not derivable */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE DEFAULT IS "NOTHING IS PUBLISHED", AND IT IS NULL RATHER THAN A PLAUSIBLE STRING.
+ *
+ * This is the half of a stratum endpoint the service cannot observe about itself. The bind is an
+ * interface, the bound port is the inside of the deploy's port mapping, and the hostname on an HTTP
+ * request is a different protocol on a different port that — on this estate, through a Cloudflare
+ * Tunnel and Traefik — provably does not carry raw TCP at all.
+ *
+ * The consequence of guessing was measured: with no such field, micro-pool-web derived the host
+ * from `window.location.hostname` and published `stratum+tcp://pool.<apex>:3334` on a page anybody
+ * could read. That connects to nothing, and its reader debugs their own hardware. micro-org#285.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('NOTHING IS ADVERTISED UNTIL SOMEBODY SAYS SO, AND THE ABSENCE IS NULL', () => {
+  const loaded = loadEnv(BASE)
+  assert.equal(loaded.stratumPublicHost, null)
+  assert.equal(loaded.chains[0]?.stratumPublicPort, null)
+  // Not the bind, which is an interface and not a name.
+  assert.notEqual(loaded.stratumPublicHost, loaded.stratumBind)
+  // And composing them yields nothing rather than half of something.
+  assert.equal(stratumEndpointOf(loaded.stratumPublicHost, loaded.chains[0] as never), null)
+})
+
+test('a published endpoint is both halves, per chain, and neither half is the bound port', () => {
+  const loaded = loadEnv({
+    ...BASE,
+    ...LTC,
+    POOL_CHAINS: 'btc,ltc',
+    POOL_STRATUM_PUBLIC_HOST: 'stratum.example.com',
+    // Deliberately NOT the bound ports. This is the shape the estate's own compose file produces:
+    // it publishes `${POOL_LTC_STRATUM_PORT:-3334}:3334`, so the host side and the container side
+    // are separate numbers and only one of them is dialable from outside.
+    POOL_BTC_STRATUM_PUBLIC_PORT: '4333',
+    POOL_LTC_STRATUM_PUBLIC_PORT: '4334',
+  })
+  assert.equal(loaded.stratumPublicHost, 'stratum.example.com')
+  assert.deepEqual(
+    loaded.chains.map((chain) => [chain.stratumPort, chain.stratumPublicPort]),
+    [
+      [3333, 4333],
+      [3334, 4334],
+    ],
+  )
+  assert.deepEqual(stratumEndpointOf(loaded.stratumPublicHost, loaded.chains[0] as never), {
+    host: 'stratum.example.com',
+    port: 4333,
+  })
+})
+
+test('one chain may be published while another stays on the LAN', () => {
+  // Not an oversight to be corrected into symmetry: an estate that exposes Litecoin to strangers
+  // and keeps Bitcoin on its own network is a configuration. The unpublished chain reports null and
+  // the console tells its reader to ask, which is the same honest screen as a pool with no endpoint
+  // at all.
+  const loaded = loadEnv({
+    ...BASE,
+    ...LTC,
+    POOL_CHAINS: 'btc,ltc',
+    POOL_STRATUM_PUBLIC_HOST: 'stratum.example.com',
+    POOL_LTC_STRATUM_PUBLIC_PORT: '3334',
+  })
+  assert.equal(stratumEndpointOf(loaded.stratumPublicHost, loaded.chains[0] as never), null)
+  assert.deepEqual(stratumEndpointOf(loaded.stratumPublicHost, loaded.chains[1] as never), {
+    host: 'stratum.example.com',
+    port: 3334,
+  })
+})
+
+test('HALF AN ENDPOINT IS REFUSED AT BOOT RATHER THAN HALF-ADVERTISED', () => {
+  // Both of these are a decision somebody started and did not finish, and both would leave a pool
+  // advertising nothing while its operator believed it had published something. Boot is the last
+  // moment the person who typed it is still watching.
+  assert.throws(
+    () => loadEnv({ ...BASE, POOL_STRATUM_PUBLIC_HOST: 'stratum.example.com' }),
+    (err: Error) => err instanceof EnvError && /no chain has a POOL_<CHAIN>_STRATUM_PUBLIC_PORT/.test(err.message),
+  )
+  assert.throws(
+    () => loadEnv({ ...BASE, POOL_BTC_STRATUM_PUBLIC_PORT: '3333' }),
+    (err: Error) =>
+      err instanceof EnvError &&
+      err.message.includes('POOL_BTC_STRATUM_PUBLIC_PORT') &&
+      err.message.includes('POOL_STRATUM_PUBLIC_HOST'),
+  )
+})
+
+test('the published port is never defaulted from the bound one', () => {
+  // The secondary finding of micro-org#285, pinned. A default that is usually right is how an
+  // operator who remaps the port ends up advertising the one nobody can reach — and it would be
+  // invisible, because the number rendered would look exactly like the number they configured
+  // somewhere else.
+  const loaded = loadEnv({ ...BASE, POOL_BTC_STRATUM_PORT: '3333' })
+  assert.equal(loaded.chains[0]?.stratumPort, 3333)
+  assert.equal(loaded.chains[0]?.stratumPublicPort, null)
+})
+
+test('a public host that is really a URL, or carries a port, is refused', () => {
+  // Both compose a connection string that looks complete and connects to nothing: `stratum+tcp://`
+  // twice over, or `host:3334:3334`. Neither fails here — they fail in a stranger's firmware, which
+  // is the one place nobody involved can see them.
+  for (const bad of [
+    'stratum+tcp://stratum.example.com',
+    'http://stratum.example.com',
+    'stratum.example.com/pool',
+    'user@stratum.example.com',
+    'stratum.example.com:3334',
+  ]) {
+    assert.throws(
+      () => loadEnv({ ...BASE, POOL_STRATUM_PUBLIC_HOST: bad, POOL_BTC_STRATUM_PUBLIC_PORT: '3333' }),
+      (err: Error) => err instanceof EnvError,
+      bad,
+    )
+  }
+})
+
+test('an IPv6 literal is a hostname, not a host:port', () => {
+  // The port check is "exactly one colon". An address literal has at least two, so it survives it —
+  // and an estate reachable only over IPv6 is a deployment, not a corner case.
+  const loaded = loadEnv({
+    ...BASE,
+    POOL_STRATUM_PUBLIC_HOST: '2001:db8::1',
+    POOL_BTC_STRATUM_PUBLIC_PORT: '3333',
+  })
+  assert.equal(loaded.stratumPublicHost, '2001:db8::1')
 })
 
 /* ------------------------------------------------------------------ the named refusals */
@@ -237,6 +365,10 @@ test('no refusal anywhere in this file echoes a configured value that could be a
     { POOL_BTC_INITIAL_DIFFICULTY: 'nope' },
     { POOL_BTC_NODE_URL: 'not a url at all' },
     { POOL_BTC_NODE_URL: 'ftp://alice:s3cr3t@bitcoin:8332/' },
+    { POOL_STRATUM_PUBLIC_HOST: 'stratum.example.com' },
+    { POOL_BTC_STRATUM_PUBLIC_PORT: '3333' },
+    { POOL_STRATUM_PUBLIC_HOST: 'http://alice:s3cr3t@stratum.example.com' },
+    { POOL_STRATUM_PUBLIC_HOST: 'stratum.example.com', POOL_BTC_STRATUM_PUBLIC_PORT: '70000' },
   ]
   let raised = 0
   for (const breakage of breakages) {
