@@ -222,6 +222,72 @@ export const MIGRATIONS: readonly Migration[] = [
         where maturity_status = 'pending';
     `,
   },
+  {
+    version: 5,
+    name: 'payout-credits',
+    /*
+     * The table `migrations.ts` spent four versions saying should not exist yet.
+     *
+     * It exists now because the change that creates it is the change that writes to it — that was
+     * always the condition, and the reason was that an empty `pool_payout_credits` reads to the next
+     * person as a feature that exists and is not firing. That is still true of a table nobody
+     * inserts into, so if the sink is ever removed this table must go with it.
+     *
+     * ## `credit_key` is the whole design
+     *
+     * `wallet/src/deposits.ts` established the estate's shape for crediting a ledger from an
+     * external event, and the entirety of its safety is ONE key doing two jobs: the unique
+     * constraint on the local row AND the `idempotencyKey` sent to the ledger, "so the two services
+     * cannot disagree about whether this movement has been credited". `poolPayoutCreditKey` is that
+     * key here — `(chain, network, blockHash, workerId)` — and it is written into this column
+     * verbatim. A payout that deduped locally on one key and called the ledger with another would
+     * pay twice the first time a response was lost, and a lost response on a call that succeeded is
+     * the ordinary case rather than an exotic one.
+     *
+     * ## Why `ledger_entry_id` is nullable, and why that is not laziness
+     *
+     * The claim commits before the ledger call, so a crash between the two leaves a row here with no
+     * entry id. That state is deliberate: it is visible, queryable and retriable, and the retry is
+     * safe because the ledger dedupes on the same key. The reverse ordering would produce a ledger
+     * entry this service does not know it made, and the next attempt would credit again.
+     *
+     * `block_hash` and `chain` are stored beside the key rather than only inside it, because the
+     * question an operator asks is "what did we pay for this block" and parsing a delimited string
+     * in a `where` clause is not an answer.
+     */
+    up: `
+      create table if not exists pool_payout_credits (
+        id              bigserial   primary key,
+        chain           text        not null,
+        network         text        not null,
+        block_hash      text        not null,
+        block_height    integer     not null,
+        worker_id       bigint      not null references pool_workers (id),
+        account         text        not null,
+        asset_code      text        not null,
+        -- Smallest units, as an exact integer. Never a float, for the reason the header of this
+        -- file gives about difficulty and the estate gives everywhere about money.
+        amount          numeric(78,0) not null,
+        credit_key      text        not null,
+        ledger_entry_id text,
+        created_at      timestamptz not null default now(),
+        credited_at     timestamptz,
+        constraint pool_payout_credits_key_uniq unique (credit_key),
+        constraint pool_payout_credits_amount_ck check (amount > 0)
+      );
+
+      -- The retry job's whole input: the claims whose ledger posting has not landed. Partial,
+      -- because in a healthy estate the rows it excludes are all of them.
+      create index if not exists pool_payout_credits_pending_idx
+        on pool_payout_credits (id)
+        where ledger_entry_id is null;
+
+      -- "What did this block pay, and to whom." The operator's question and the sink's own
+      -- already-paid check.
+      create index if not exists pool_payout_credits_block_idx
+        on pool_payout_credits (chain, block_hash);
+    `,
+  },
 ]
 
 /**
@@ -237,7 +303,12 @@ export const MIGRATIONS: readonly Migration[] = [
  * `pool_account_links` is deliberately NOT here. It maps an estate user to their pool account label
  * and a person is not per chain; migration 3 says so where the table is created.
  */
-export const POOL_CHAIN_TABLES: readonly string[] = Object.freeze(['pool_shares', 'pool_blocks', 'pool_workers'])
+export const POOL_CHAIN_TABLES: readonly string[] = Object.freeze([
+  'pool_shares',
+  'pool_blocks',
+  'pool_workers',
+  'pool_payout_credits',
+])
 
 /**
  * Every table this service owns, chain-scoped or not.
@@ -253,11 +324,15 @@ export const POOL_TABLES: readonly string[] = Object.freeze([...POOL_CHAIN_TABLE
  * which is what stops a replica of the new code answering requests against the old schema when a
  * deploy runs ahead of its migrator.
  *
- * **There is deliberately no payouts table here.** Payout crediting is not implemented in this
- * release — `payouts.ts` says so in detail and the README says so in the first screen. A table
- * called `pool_payout_credits` sitting empty in the schema would read, to the next person, as a
- * feature that exists and is not firing. The migration that creates it belongs to the change that
- * writes to it.
+ * Versions 1 through 4 carried a note here saying there was deliberately no payouts table, on the
+ * condition that the migration creating it would belong to the change that writes to it. Migration
+ * 5 is that change: `payouts.ts` now has a sink that inserts into `pool_payout_credits`, so the
+ * table is no longer a promise sitting in a schema. **The condition still binds in the other
+ * direction** — a release that removed the sink would have to remove the table with it.
+ *
+ * A table is not a running feature, and the two are still separate here: nothing constructs the sink
+ * unless the payout configuration block is set, which it is not on the estate. `env.ts` explains
+ * that at the read site and `payouts.ts` explains what has to become true first.
  */
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)
 

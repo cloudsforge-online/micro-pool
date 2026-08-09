@@ -1,12 +1,24 @@
 /**
  * ════════════════════════════════════════════════════════════════════════════════════════════════
- * **PAYOUTS ARE NOT IMPLEMENTED. THIS FILE IMPLEMENTS NOTHING. IT RESERVES A SHAPE.**
+ * **PAYOUTS ARE OFF. THIS FILE NOW CONTAINS A REAL SINK, AND TWO INDEPENDENT GATES REFUSE IT.**
  *
- * Nothing in this repository credits a ledger, moves an asset, or pays a miner. What exists today
- * is the accounting that decides what a miner is *owed*: `pplns.ts` allocates a block reward across
- * a window of shares, and `store.ts` records the shares and the blocks. The step from "owed" to
- * "paid" — a ledger entry, a wallet balance, an on-chain send — is a separate change and it has not
- * been made.
+ * Nothing in this estate is credited by this service today. What exists is the accounting that
+ * decides what a miner is *owed* — `pplns.ts` allocates a block reward across a window of shares,
+ * `maturity.ts` decides whether that reward exists at all, and `store.ts` records both — plus, as of
+ * micro-org#302, a `LedgerPayoutSink` at the bottom of this file that would credit micro-ledger if
+ * it were ever reached.
+ *
+ * It is not reached, for two separate reasons that fail in two separate ways:
+ *
+ *   1. **Nothing constructs it.** `index.ts` builds a sink only when the payout configuration block
+ *      is set — `POOL_<CHAIN>_MINIMUM_PAYOUT` and the ledger's URL and token, all with no defaults —
+ *      and none of it is set on the estate. Unset means no sink, no job, and `payoutsImplemented`
+ *      false in every response. `env.ts` explains at the read site why the block is opt-in rather
+ *      than required.
+ *   2. **`CUSTODY_BACKING_CLOSED` is false**, so even a fully configured deployment refuses every
+ *      claim. That constant carries the long version: crediting a miner creates a liability the
+ *      estate must back, micro-ledger's reconciliation sweep cannot see the coin behind it, and the
+ *      result would be a frozen asset estate-wide rather than a payment.
  *
  * This is stated at the top of the README as well, and in the pull request that introduced this
  * service, because a mining pool that appears to pay and does not is the worst possible thing for
@@ -28,31 +40,52 @@
  * So `poolPayoutCreditKey` is written now, tested now, and is the only key the eventual
  * implementation may use.
  *
- * ── WHAT IS DELIBERATELY ABSENT ─────────────────────────────────────────────────────────────────
+ * ── WHAT IS STILL DELIBERATELY ABSENT ───────────────────────────────────────────────────────────
  *
- *   - There is no `pool_payout_credits` table. `migrations.ts` says why: an empty table with a
- *     unique constraint on `credit_key` would read as a feature that exists and is not firing.
- *   - There is no default implementation of `PayoutSink`, not even one that logs. A no-op that logs
- *     "would credit 0.03 LTC to …" is a line an operator will eventually read as a payment.
- *   - Nothing constructs a `PayoutSink`. `index.ts` does not hold one and no route returns one.
+ *   - There is no DEFAULT implementation of `PayoutSink`, and in particular not a no-op that logs.
+ *     A line reading "would credit 0.03 LTC to …" is a line an operator will eventually read as a
+ *     payment. The only implementation is the real one, and it refuses.
+ *   - Nothing calls `credit`. No route, no job, and no branch of `blocks.ts` — a block that matures
+ *     is marked matured and that is where it stops.
+ *   - There is no on-chain send anywhere in this repository. A miner with no estate account cannot
+ *     be paid by this service at all, and the sink says so by name rather than crediting a
+ *     liability owed to a string.
+ *   - There is no outbox and no `@cloudsforge/contracts-events` dependency. The first event this
+ *     service would emit is the payout, and it does not happen.
  *
- * ── WHAT THE IMPLEMENTATION WILL HAVE TO DECIDE, WHICH THIS FILE CANNOT ─────────────────────────
+ * ── WHAT THE IMPLEMENTATION STILL HAS TO DECIDE, WHICH THIS FILE CANNOT ─────────────────────────
  *
- * All four are open in 36 §7 and none of them is a technical question:
+ * Open in 36 §7, and none of them is a technical question:
  *
  *   1. The pool fee (§7.1). Already surfaced: `POOL_FEE_BASIS_POINTS` is required with no default,
- *      so the estate cannot ship a fee by accident.
- *   2. Which asset a miner is paid in (§7.2) — the coin they mined, or EMBER.
- *   3. The minimum payout, and what happens to a balance below it.
- *   4. Coinbase maturity. A block reward is unspendable for 100 blocks on both chains, and a block
- *      can be orphaned in that time. `pool_blocks.submit_status` records what the node said at
- *      submission; **nothing yet re-checks whether the block survived**, and paying a reward that
- *      was later orphaned is paying money that does not exist.
+ *      so the estate cannot ship a fee by accident. Nothing yet deducts it.
+ *   2. Which asset a miner is paid in (§7.2) — the coin they mined, or EMBER. The sink credits the
+ *      coin, which is the only choice that needs no price.
+ *   3. What happens to a balance below the minimum payout, which `POOL_<CHAIN>_MINIMUM_PAYOUT`
+ *      names a threshold for and nothing yet accumulates against.
+ *   4. Whether an external miner — the overwhelming majority, who gave an address and never an
+ *      estate account — is paid at all, and by what.
+ *
+ * ── WHAT IS NO LONGER OPEN ──────────────────────────────────────────────────────────────────────
+ *
+ * Coinbase maturity, which was item 4 here through four releases. `maturity.ts` re-reads every
+ * recorded block against the node and `store.payableBlocks` is the single definition of a reward
+ * that exists. Nothing pays on `submit_status` any more, because nothing pays at all — but when it
+ * does, the question is answered.
  * ════════════════════════════════════════════════════════════════════════════════════════════════
  */
 
 import type { AssetCode, Network } from '@cloudsforge/contracts-chain'
+import type { Actor } from '@cloudsforge/contracts-money'
 import type { PoolChainId } from './chains.ts'
+import type { LedgerClient } from './ledgerclient.ts'
+import {
+  claimPayoutCredit,
+  markPayoutCredited,
+  pendingPayoutCredits,
+  userForAccount,
+  type Exec,
+} from './store.ts'
 
 /**
  * The identity of one payout credit: `(chain, network, blockHash, workerId)`.
@@ -135,5 +168,347 @@ export class PayoutsNotImplementedError extends Error {
         'See src/payouts.ts.',
     )
     this.name = 'PayoutsNotImplementedError'
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE SINK, AND THE INTERLOCK THAT STOPS IT
+ * ════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * **Is the pool's payout address backed in the way the ledger's reconciliation sweep requires?**
+ *
+ * `false`, and until it is `true` no claim is credited. This is not a feature flag and it is not
+ * configurable — it is a constant in the source, so that turning it on is a code change somebody
+ * reviews rather than an environment variable somebody sets at three in the morning.
+ *
+ * ── WHAT THE PAYOUT PATH IS DEPENDING ON BEING TRUE, AND IS NOT ────────────────────────────────
+ *
+ * Crediting a miner in the ledger creates a LIABILITY the estate must back with a matching custody
+ * ASSET. micro-ledger's reconciliation sweep (`ledger/src/reconcile.ts`, `reconcileAsset`) checks
+ * exactly that, every fifteen minutes, by comparing:
+ *
+ *   - the ledger's own custody total — the sum of balances on accounts with `subject = 'custody'`
+ *     and `type = 'asset'`, with **no filter of any kind**; against
+ *   - the indexer's observation of the addresses it has been told to watch, via
+ *     `GET /v1/custody/:chain/:network/total`.
+ *
+ * Drift is ledger minus observed. Beyond tolerance it writes `asset_freezes` and **freezes the
+ * asset estate-wide**, and only an exactly-clean run deletes that row — so a structural mismatch
+ * does not heal, it re-freezes for ever. LTC's tolerance is ZERO (`ledger/src/env.ts` states in
+ * terms that a one-satoshi Litecoin drift freezes LTC withdrawals) and `LEDGER_RECONCILE_ASSETS`
+ * on the estate is `SHARD,EMBER,LTC`.
+ *
+ * The pool's coinbase pays into a custody-held address minted under custody purpose `pool`. Read on
+ * 2026-08-09, against the running estate and the current source of all three services:
+ *
+ *   1. **Nothing registers that address with the indexer.** Registration is push-only —
+ *      `POST /v1/watch/:chain/:network/:address` with a free-text label — and the only two writers
+ *      in the estate are `wallet/src/deposits.ts` (`deposit:<userId>`) and
+ *      `settlement/src/treasury.ts` (`treasury:<chain>:<network>`). The pool writes nothing.
+ *   2. **Even if it did, the indexer would not count it.** `custodyAddresses` selects by label
+ *      prefix from `INDEXER_CUSTODY_LABEL_PREFIXES`, whose value on the estate is
+ *      `"deposit:,treasury:"`. No `pool:` prefix exists anywhere.
+ *
+ * So a payout credit would raise the LEDGER's custody total while the OBSERVED total did not move.
+ * Positive drift, zero tolerance, LTC in the reconciled set: **every LTC withdrawal in the estate
+ * freezes, and stays frozen.** Worse than the outage, the freeze would read as a custody shortfall
+ * — the ledger claiming to hold coin the indexer cannot see — which is the shape of theft rather
+ * than of a missing config line.
+ *
+ * This is micro-org#247/#248 with the sign reversed. On 2026-08-05 settlement registered an EMBER
+ * treasury under a label the `treasury:` prefix already matched, so 24.1 EMBER appeared on the
+ * OBSERVED side with no ledger account behind it; the resulting drift froze EMBER withdrawals for
+ * three days. That was "watched but not booked". This would be "booked but not watched", and the
+ * fix settlement landed — making register-and-book one atomic operation — is the shape of the fix
+ * this service will need.
+ *
+ * ── WHAT HAS TO HAPPEN BEFORE THIS BECOMES `true` ──────────────────────────────────────────────
+ *
+ *   1. The pool payout address is registered with the indexer under a `pool:` label, and its
+ *      opening balance is booked into the ledger in the same operation that registers it — the
+ *      `treasury.ts` shape, not two steps that can be interrupted between.
+ *   2. `INDEXER_CUSTODY_LABEL_PREFIXES` includes `pool:` on the estate.
+ *   3. The `pool` service holds `indexer:write` and `ledger:post` grants. As of 2026-08-09 it holds
+ *      no service-token grants at all.
+ *
+ * None of that is in this repository's gift alone, which is exactly why the interlock is here
+ * rather than in a ticket. Somebody switching payouts on has to read this first.
+ */
+export const CUSTODY_BACKING_CLOSED = false
+
+/**
+ * A claim reached the sink while `CUSTODY_BACKING_CLOSED` is false, or the claim named a miner the
+ * ledger has no account for.
+ *
+ * Thrown rather than logged-and-skipped for the reason `PayoutsNotImplementedError` exists: the two
+ * things always reached for instead — returning silently, or logging and continuing — both produce a
+ * pool that behaves as though it paid.
+ */
+export class PayoutRefusedError extends Error {
+  readonly reason: string
+  constructor(reason: string, detail: string) {
+    super(`micro-pool refused to credit a payout (${reason}): ${detail}`)
+    this.name = 'PayoutRefusedError'
+    this.reason = reason
+  }
+}
+
+export interface LedgerPayoutSinkDeps {
+  readonly sql: Exec
+  readonly ledger: LedgerClient
+  /**
+   * Smallest units a claim must be worth before an entry is posted for it. **No default: it comes
+   * from `POOL_<CHAIN>_MINIMUM_PAYOUT`, which has none either**, and the absence of a default is the
+   * whole point — see `optionalUnits` in `env.ts`. A sink cannot be constructed without one, which is
+   * what makes "payouts are configured" and "somebody chose the threshold" the same statement.
+   */
+  readonly minimumUnits: bigint
+  /**
+   * Whether the estate's books can absorb what a credit writes. **`index.ts` passes
+   * `CUSTODY_BACKING_CLOSED` and there is nothing else to pass** — it is not read from the
+   * environment, and `payouts.test.ts` reads `index.ts` to prove the composition root passes the
+   * constant rather than a literal.
+   *
+   * A parameter rather than a direct read of the constant so the branches BEHIND the interlock are
+   * reachable from a test. An untested minimum check and an untested account lookup in a module that
+   * moves money would be a worse trade than this, and the trade costs nothing an operator can reach:
+   * flipping this in production still means editing a source file somebody reviews.
+   */
+  readonly custodyBackingConfirmed: boolean
+  /** Ties every entry back to the run that caused it. One correlation id per sweep, not per claim. */
+  readonly correlationId: () => string
+  readonly log: (level: 'info' | 'warn' | 'error', message: string, fields?: Record<string, unknown>) => void
+}
+
+/**
+ * The `PayoutSink` implementation, against micro-ledger.
+ *
+ * Modelled directly on `wallet/src/deposits.ts`, which is the estate's established shape for
+ * crediting a ledger from an external event, and the correspondence is deliberate down to the
+ * ordering: **claim locally, commit, then post.** The wallet argues that ordering at length and the
+ * argument transfers unchanged — a crash between the two leaves a row with no ledger entry, which is
+ * visible, queryable and retriable, and the retry is safe because the ledger dedupes on the same
+ * key. The reverse ordering leaves a ledger entry this service does not know it made, and the next
+ * attempt credits it again.
+ *
+ * `claim.creditKey` — `poolPayoutCreditKey`, unchanged — does BOTH jobs: it is the value behind the
+ * unique constraint `pool_payout_credits_key_uniq` and it is the `idempotencyKey` on the wire. That
+ * is the whole of the at-most-once guarantee, and an implementation that used two keys would pay
+ * twice the first time a response was lost.
+ *
+ * **Nothing constructs one of these.** `index.ts` builds a sink only when the payout configuration
+ * block is set, which it is not on the estate, and `CUSTODY_BACKING_CLOSED` refuses every claim
+ * besides. Both gates, because they fail differently: the first is a deployment that has not been
+ * configured, and the second is an estate whose books cannot yet absorb what this would write.
+ */
+export class LedgerPayoutSink implements PayoutSink {
+  readonly #deps: LedgerPayoutSinkDeps
+
+  constructor(deps: LedgerPayoutSinkDeps) {
+    this.#deps = deps
+  }
+
+  async credit(claim: PayoutClaim): Promise<void> {
+    if (!this.#deps.custodyBackingConfirmed) {
+      throw new PayoutRefusedError(
+        'custody_backing_not_confirmed',
+        `the pool payout address is not observed by the indexer, so crediting ${claim.amount} ` +
+          `${claim.asset} would put the ledger's custody total above what the reconciliation sweep ` +
+          'can see and freeze the asset estate-wide. See CUSTODY_BACKING_CLOSED in src/payouts.ts.',
+      )
+    }
+
+    /*
+     * Below the threshold the operator set, so nothing is written — not the ledger entry and not the
+     * local row.
+     *
+     * **Writing nothing is the deliberate part.** A dust claim that got a `pool_payout_credits` row
+     * would be marked as handled by the very unique constraint that makes this at-most-once, and it
+     * could then never be paid: the key is per block per worker, and there is exactly one of it. By
+     * refusing before the claim, the debt stays where it already lives — in `pool_shares` and
+     * `pool_blocks` — and is re-derivable in full by whatever eventually accrues across blocks.
+     *
+     * Which is to say: **accrual is not implemented here.** This is a per-claim floor, not a running
+     * balance that pays out when it crosses one. Saying so plainly, because the two are easy to
+     * confuse and only the second is what a miner expects from the phrase "minimum payout". The
+     * accrual model needs a per-worker balance this service does not keep and must not invent — 04
+     * §11, no user balance column outside the ledger — so it is the ledger that will hold it, once
+     * `CUSTODY_BACKING_CLOSED` allows anything to be posted at all.
+     */
+    if (claim.amount < this.#deps.minimumUnits) {
+      throw new PayoutRefusedError(
+        'below_minimum',
+        `${claim.amount} ${claim.asset} is under the configured minimum of ${this.#deps.minimumUnits}; ` +
+          'nothing was recorded, so the claim can still be paid by a future accrual',
+      )
+    }
+
+    // A miner is credited as an ESTATE USER or not at all. Most pool accounts are the payout address
+    // somebody typed into their own firmware, and there is no liability account in the ledger for a
+    // string; only a browser miner who signed in has a `pool_account_links` row. Crediting an
+    // unlinked account to something plausible — `user:<the address>` — would create a liability
+    // owed to nobody, which is a balance no withdrawal can ever drain and a reconciliation the
+    // estate can never square.
+    const userId = await userForAccount(this.#deps.sql, claim.account)
+    if (userId === null) {
+      throw new PayoutRefusedError(
+        'no_estate_account',
+        `pool account ${claim.account} is not linked to an estate user; an external miner is paid ` +
+          'on chain, which this service does not do',
+      )
+    }
+
+    const id = await claimPayoutCredit(this.#deps.sql, {
+      chain: claim.chain,
+      network: claim.network,
+      blockHash: claim.blockHash,
+      blockHeight: claim.blockHeight,
+      workerId: claim.workerId,
+      account: claim.account,
+      assetCode: claim.asset,
+      amount: claim.amount,
+      creditKey: claim.creditKey,
+    })
+    if (id === null) {
+      // Already on file. Not an error and not rare — a retried sweep, a second replica, a job re-run
+      // after a lost response all arrive here. Whether that earlier claim reached the ledger is
+      // `flushPending`'s question, not this one's.
+      this.#deps.log('info', 'this payout was already claimed', { creditKey: claim.creditKey })
+      return
+    }
+
+    await this.#post({
+      id,
+      chain: claim.chain,
+      network: claim.network,
+      blockHash: claim.blockHash,
+      blockHeight: claim.blockHeight,
+      userId,
+      asset: claim.asset,
+      amount: claim.amount,
+      creditKey: claim.creditKey,
+    })
+  }
+
+  /**
+   * Finish the claims whose ledger posting never landed.
+   *
+   * The safety net the claim-then-post ordering requires, and the only reason that ordering is safe
+   * to choose. Nothing schedules it today because nothing constructs this class; when payouts are
+   * switched on it belongs in `jobs.ts` beside `pool.check-maturity`, keyed on the chain, for the
+   * same reason that one is leased.
+   */
+  async flushPending(chain: PoolChainId, limit: number): Promise<number> {
+    const pending = await pendingPayoutCredits(this.#deps.sql, { chain, limit })
+    let posted = 0
+    for (const credit of pending) {
+      const userId = await userForAccount(this.#deps.sql, credit.account)
+      if (userId === null) {
+        // The row was written when the link existed, so this is a link that has since been removed.
+        // Left pending and counted rather than deleted: the claim is a real debt and the row is the
+        // only record of it.
+        this.#deps.log('error', 'a claimed payout names an account with no estate user', {
+          creditKey: credit.creditKey,
+        })
+        continue
+      }
+      await this.#post({
+        id: credit.id,
+        chain,
+        network: credit.network as Network,
+        blockHash: credit.blockHash,
+        blockHeight: credit.blockHeight,
+        userId,
+        asset: credit.assetCode as AssetCode,
+        amount: credit.amount,
+        creditKey: credit.creditKey,
+      })
+      posted += 1
+    }
+    return posted
+  }
+
+  /**
+   * Post one claimed credit and record the entry it produced.
+   *
+   * **The double-entry pair 04-domain-model §2 requires**: a debit to the custody asset account —
+   * the coinbase paid coin into a custody-held address, so the estate holds more — and a credit to
+   * the miner's liability account, because a miner's balance is money the estate owes them. The
+   * entry balances because those are the same number.
+   *
+   * That first posting is precisely the one `CUSTODY_BACKING_CLOSED` is about: it is the number the
+   * reconciliation sweep sums, and the sweep has no way to see the coin behind it.
+   */
+  async #post(credit: {
+    id: number
+    chain: PoolChainId
+    network: Network
+    blockHash: string
+    blockHeight: number
+    userId: string
+    asset: AssetCode
+    amount: bigint
+    creditKey: string
+  }): Promise<void> {
+    const actor: Actor = 'service:pool'
+    const entry = await this.#deps.ledger.postEntry({
+      // The closest kind in the ledger's closed vocabulary, and an accurate one: a block reward
+      // allocated by PPLNS is a reward granted for work done. There is no `pool_payout` kind and
+      // this service does not get to invent one — `@cloudsforge/contracts-money` is exact-pinned so
+      // that every service names the same movement the same way.
+      kind: 'reward_granted',
+      actor,
+      correlationId: this.#deps.correlationId(),
+      // The same key the local row is deduped on, so the two services cannot disagree about whether
+      // this movement has been credited.
+      idempotencyKey: credit.creditKey,
+      description: `Mining reward for block ${credit.blockHash}`,
+      metadata: {
+        chain: credit.chain,
+        network: credit.network,
+        blockHash: credit.blockHash,
+        blockHeight: credit.blockHeight,
+      },
+      postings: [
+        {
+          direction: 'debit',
+          amount: credit.amount,
+          assetCode: credit.asset,
+          sequence: 0,
+          account: { subject: 'custody', assetCode: credit.asset, purpose: 'available', type: 'asset' },
+        },
+        {
+          direction: 'credit',
+          amount: credit.amount,
+          assetCode: credit.asset,
+          sequence: 1,
+          account: {
+            subject: `user:${credit.userId}`,
+            assetCode: credit.asset,
+            purpose: 'available',
+            type: 'liability',
+          },
+        },
+      ],
+    })
+
+    const closed = await markPayoutCredited(this.#deps.sql, {
+      chain: credit.chain,
+      id: credit.id,
+      ledgerEntryId: entry.id,
+    })
+    if (!closed) {
+      // Another replica finished it first. The ledger deduped on the same key, so there is no second
+      // entry — there is simply nothing left to record.
+      return
+    }
+    this.#deps.log('info', 'credited a mining payout', {
+      chain: credit.chain,
+      blockHash: credit.blockHash,
+      creditKey: credit.creditKey,
+      ledgerEntryId: entry.id,
+      replayed: entry.replayed,
+    })
   }
 }

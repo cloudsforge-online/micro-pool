@@ -99,6 +99,26 @@ export async function findAccountLink(exec: Exec, userId: string): Promise<strin
 }
 
 /**
+ * The estate user behind a pool account label, if there is one.
+ *
+ * The reverse of `findAccountLink`, and the two are not symmetric in importance. That one answers
+ * "what label do I mint work under"; this one answers "**is there anybody in this estate to credit**",
+ * which is the question a payout cannot proceed without. Most pool accounts are not labels at all —
+ * they are the payout address a miner typed into their own firmware — and those have no estate user,
+ * no liability account, and no way to be paid except on chain. `payouts.ts` refuses them by name
+ * rather than crediting them to something plausible.
+ *
+ * A plain `select`, unlike `findAccountLink`: nothing about answering this question means the account
+ * was used, and stamping `last_used_at` from a payout path would make the column mean two things.
+ */
+export async function userForAccount(exec: Exec, account: string): Promise<string | null> {
+  const rows = await exec<{ user_id: string }[]>`
+    select user_id from pool_account_links where account = ${account}
+  `
+  return rows[0]?.user_id ?? null
+}
+
+/**
  * Claim a pool account label for a user, or lose the race and return null.
  *
  * `on conflict do nothing` on the primary key means a caller that loses gets no row back, which is
@@ -311,6 +331,132 @@ export async function payableBlocks(
     limit ${args.limit}
   `
   return rows.map((row) => ({ hash: row.hash, height: row.height }))
+}
+
+export interface PayoutCreditInput {
+  readonly chain: PoolChainId
+  readonly network: string
+  readonly blockHash: string
+  readonly blockHeight: number
+  readonly workerId: number
+  readonly account: string
+  readonly assetCode: string
+  readonly amount: bigint
+  readonly creditKey: string
+}
+
+/**
+ * Claim one payout credit locally, before anything is said to the ledger.
+ *
+ * Returns the row id when this call is the one that claimed it, and **null when the movement was
+ * already on file**. Null is not an error and is the case this function exists for: a retried sink
+ * call, a second replica reaching the same block, a job re-run after a lost response. `credit_key`
+ * carries the unique constraint and the database settles the race, which is the only arbiter that
+ * two processes both believing they are first cannot argue with.
+ *
+ * This commits BEFORE the ledger is called, which is the ordering `wallet/src/deposits.ts` argues
+ * for at length and is not the obvious one. The failure it leaves possible is a local row with no
+ * ledger entry — visible, queryable and retriable, and safe to retry because the ledger dedupes on
+ * this same key. The failure it makes impossible is a ledger entry this service does not know it
+ * made, which the next attempt would credit again.
+ */
+export async function claimPayoutCredit(exec: Exec, credit: PayoutCreditInput): Promise<number | null> {
+  const rows = await exec<{ id: string }[]>`
+    insert into pool_payout_credits (
+      chain, network, block_hash, block_height, worker_id, account, asset_code, amount, credit_key
+    )
+    values (
+      ${credit.chain}, ${credit.network}, ${credit.blockHash}, ${credit.blockHeight},
+      ${credit.workerId}, ${credit.account}, ${credit.assetCode},
+      ${param(credit.amount)}::numeric(78,0), ${credit.creditKey}
+    )
+    on conflict (credit_key) do nothing
+    returning id
+  `
+  const inserted = rows[0]
+  return inserted ? Number(inserted.id) : null
+}
+
+/**
+ * Record the ledger entry a claim produced.
+ *
+ * `ledger_entry_id is null` is in the predicate so a replica that finished first is not overwritten
+ * by a slower one carrying the ledger's replayed answer for the same key. The return says whether
+ * this call was the one that closed the claim, which is what a caller needs in order not to announce
+ * the same payment twice.
+ */
+export async function markPayoutCredited(
+  exec: Exec,
+  args: { chain: PoolChainId; id: number; ledgerEntryId: string },
+): Promise<boolean> {
+  const rows = await exec<{ id: string }[]>`
+    update pool_payout_credits
+       set ledger_entry_id = ${args.ledgerEntryId},
+           credited_at     = now()
+     where chain = ${args.chain}
+       and id = ${args.id}
+       and ledger_entry_id is null
+    returning id
+  `
+  return rows.length > 0
+}
+
+export interface PendingPayoutCredit {
+  readonly id: number
+  readonly network: string
+  readonly blockHash: string
+  readonly blockHeight: number
+  readonly workerId: number
+  readonly account: string
+  readonly assetCode: string
+  readonly amount: bigint
+  readonly creditKey: string
+}
+
+/**
+ * Claims whose ledger posting has not landed. A retry's whole input.
+ *
+ * Oldest first by id, so a backlog drains in the order it accumulated rather than starving its own
+ * head. There is no time filter: a claim that has been unposted for a week is more urgent than one
+ * from a minute ago, not less, and a `where created_at < now() - …` here would hide exactly the rows
+ * an operator needs to see.
+ */
+export async function pendingPayoutCredits(
+  exec: Exec,
+  args: { chain: PoolChainId; limit: number },
+): Promise<PendingPayoutCredit[]> {
+  const rows = await exec<
+    {
+      id: string
+      network: string
+      block_hash: string
+      block_height: number
+      worker_id: string
+      account: string
+      asset_code: string
+      amount: string
+      credit_key: string
+    }[]
+  >`
+    select id, network, block_hash, block_height, worker_id, account, asset_code,
+           amount::text, credit_key
+    from pool_payout_credits
+    where chain = ${args.chain}
+      and ledger_entry_id is null
+    order by id
+    limit ${args.limit}
+  `
+  return rows.map((row) => ({
+    id: Number(row.id),
+    network: row.network,
+    blockHash: row.block_hash,
+    blockHeight: row.block_height,
+    workerId: Number(row.worker_id),
+    account: row.account,
+    assetCode: row.asset_code,
+    amount: BigInt(row.amount),
+    creditKey: row.credit_key,
+  }))
 }
 
 export interface WindowRow {

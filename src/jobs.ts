@@ -12,6 +12,11 @@
  *   | `pool.check-maturity` | yes     | One shared table again, and the RPC calls are the cost: N   |
  *   |                       |         | replicas would put N × `getblock` to a node that also has   |
  *   |                       |         | miners to serve, to reach the same verdict.                 |
+ *   | `pool.flush-payouts`  | yes     | It posts MONEY to another service. Two replicas draining    |
+ *   |                       |         | the same rows would be two credits racing on one key — safe |
+ *   |                       |         | only because the ledger dedupes, which is not a reason to   |
+ *   |                       |         | do it. Scheduled ONLY for chains that have a payout sink,   |
+ *   |                       |         | which on this estate is none of them; see `env.ts`.         |
  *   | template polling      | no      | `template.ts`: each replica must hold its own template,     |
  *   |                       |         | because each replica serves its own TCP connections. A lease|
  *   |                       |         | here would leave the losing replica with no work to give.   |
@@ -42,6 +47,16 @@ export const PRUNE_KIND = 'pool.prune-shares'
 export const MATURITY_KIND = 'pool.check-maturity'
 
 /**
+ * Drains payout credits this service claimed locally and never got a ledger entry for.
+ *
+ * The safety net that makes `LedgerPayoutSink`'s claim-then-post ordering safe to choose, and the
+ * reason that ordering is the estate's shape rather than a shortcut. It is scheduled per chain and
+ * **only for chains an operator configured a payout minimum for** — see `recurringFor`. With payouts
+ * off, which is every deployment on 2026-08-09, this kind is never seeded and never registered.
+ */
+export const PAYOUT_FLUSH_KIND = 'pool.flush-payouts'
+
+/**
  * How often the prune runs, and how much it deletes per run.
  *
  * Hourly, and capped at 50,000 rows: a prune that tried to delete a month of backlog in one
@@ -64,6 +79,18 @@ const PRUNE_BATCH = 50_000
  */
 const MATURITY_EVERY_MS = 10 * 60_000
 
+/**
+ * How often the payout flush runs, and how many rows it drains per run.
+ *
+ * Five minutes, because what it drains is a claim with no ledger entry — money a miner is owed that
+ * the ledger has not been told about — and the interval is the worst-case delay between a lost
+ * response and the credit landing. Capped at 100 because each row is one HTTP round trip to the
+ * ledger under a lease, and a run that tried to post a thousand would hold the lease past its
+ * renewal while a miner waits on the first.
+ */
+const PAYOUT_FLUSH_EVERY_MS = 5 * 60_000
+const PAYOUT_FLUSH_BATCH = 100
+
 export interface JobDeps {
   readonly sql: Exec
   readonly logger: Logger
@@ -80,19 +107,48 @@ export interface JobDeps {
    * of blocks than the one this pool mined on.
    */
   readonly rpcFor: (chain: PoolChainId) => NodeRpc | null
+  /**
+   * The payout sink for one chain, or null — and null on every deployment that exists today.
+   *
+   * Optional on `JobDeps` rather than required, so that a caller which has not configured payouts
+   * writes nothing at all rather than writing `() => null` to satisfy a type. Absence and "no sink
+   * for this chain" are the same answer here and both mean the flush handler is not registered.
+   */
+  readonly payoutSinkFor?: (chain: PoolChainId) => PayoutFlusher | null
 }
 
-/** The recurring set for a given chain list. One row per chain per kind, seeded at boot. */
-export function recurringFor(chains: readonly PoolChainId[]): ReadonlyArray<{ kind: string; key: string; everyMs: number }> {
+/** The one method the flush job needs. Narrower than `LedgerPayoutSink` so a test can supply one. */
+export interface PayoutFlusher {
+  flushPending(chain: PoolChainId, limit: number): Promise<number>
+}
+
+/**
+ * The recurring set for a given chain list. One row per chain per kind, seeded at boot.
+ *
+ * `payoutChains` is a SUBSET of `chains` and defaults to none, which is what keeps
+ * `pool.flush-payouts` out of the queue entirely on a deployment with payouts off. It is a separate
+ * argument rather than a flag on each chain because the caller that knows the answer is `index.ts`,
+ * which reads `env.payouts`, and this module deliberately imports nothing from `env.ts`.
+ */
+export function recurringFor(
+  chains: readonly PoolChainId[],
+  payoutChains: readonly PoolChainId[] = [],
+): ReadonlyArray<{ kind: string; key: string; everyMs: number }> {
+  const paid = new Set(payoutChains)
   return chains.flatMap((chain) => [
     { kind: PRUNE_KIND, key: `chain:${chain}`, everyMs: PRUNE_EVERY_MS },
     { kind: MATURITY_KIND, key: `chain:${chain}`, everyMs: MATURITY_EVERY_MS },
+    ...(paid.has(chain) ? [{ kind: PAYOUT_FLUSH_KIND, key: `chain:${chain}`, everyMs: PAYOUT_FLUSH_EVERY_MS }] : []),
   ])
 }
 
 /** Enqueue the recurring set at boot. `keep` means N replicas booting together produce one row. */
-export async function seedRecurring(queue: JobQueue, chains: readonly PoolChainId[]): Promise<void> {
-  for (const job of recurringFor(chains)) {
+export async function seedRecurring(
+  queue: JobQueue,
+  chains: readonly PoolChainId[],
+  payoutChains: readonly PoolChainId[] = [],
+): Promise<void> {
+  for (const job of recurringFor(chains, payoutChains)) {
     await queue.enqueue({ kind: job.kind, key: job.key, payload: { chain: job.key.slice('chain:'.length) }, onConflict: 'keep' })
   }
 }
@@ -112,12 +168,13 @@ export function rescheduleRecurring(
   queue: JobQueue,
   logger: Logger,
   chains: readonly PoolChainId[],
+  payoutChains: readonly PoolChainId[] = [],
 ): (event: RunnerEvent) => void {
   // Keyed on kind and key together, joined by NUL: the runner's events carry both, and a job kind
   // is only unique per key. The separator is spelled as the escape `\0` rather than as the byte —
   // see the note in `chainservice.ts`; a literal NUL in the source aborts the estate-wide
   // `conformance` sweep, which reads every `.ts` file in every checkout as UTF-8 text.
-  const byKey = new Map(recurringFor(chains).map((r) => [`${r.kind}\0${r.key}`, r]))
+  const byKey = new Map(recurringFor(chains, payoutChains).map((r) => [`${r.kind}\0${r.key}`, r]))
   return (event) => {
     if (event.type !== 'completed') return
     const recurring = event.kind && event.key ? byKey.get(`${event.kind}\0${event.key}`) : undefined
@@ -179,6 +236,36 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     // run itself is visible.
     deps.logger.info('checked block maturity', { chain, ...sweep })
   })
+
+  /*
+   * Registered only when a sink resolver was supplied, which is only when an operator configured a
+   * payout minimum. On a deployment with payouts off the kind is neither seeded nor registered, so a
+   * row that somehow existed would sit unclaimed rather than dead-letter — and that is the right way
+   * round: a queue row is not a reason for a pool that has been told not to pay anybody to pay them.
+   */
+  const sinkFor = deps.payoutSinkFor
+  if (sinkFor) {
+    runner.register<{ chain?: string }>(PAYOUT_FLUSH_KIND, async (job, ctx) => {
+      const chain = job.payload.chain
+      if (typeof chain !== 'string' || !isPoolChainId(chain)) {
+        throw new Error(`${PAYOUT_FLUSH_KIND} requires a payload naming a chain this pool serves`)
+      }
+      if (ctx.signal.aborted) return
+      const sink = sinkFor(chain)
+      if (sink === null) {
+        // Same shape as the maturity sweep's null-rpc branch: a recurring row survives a
+        // configuration change that turns payouts off for this chain, and dead-lettering it would
+        // put a permanent red mark on a service doing exactly what it was told.
+        deps.logger.warn('no payout sink for this chain; skipping the flush', { chain })
+        return
+      }
+      const posted = await sink.flushPending(chain, PAYOUT_FLUSH_BATCH)
+      // Logged even at zero, and zero is the expected number: a claim reaches this job only when the
+      // ledger posting that should have followed it never landed. A run that has quietly stopped
+      // draining is indistinguishable from one with nothing to drain unless the run is visible.
+      deps.logger.info('flushed pending payouts', { chain, posted })
+    })
+  }
 
   return runner
 }

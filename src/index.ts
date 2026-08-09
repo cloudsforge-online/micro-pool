@@ -28,7 +28,7 @@ import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Lifecycle, installSignalHandlers, postgresProbe, type Probe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
-import { Verifier } from '@cloudsforge/auth'
+import { ServiceTokenProvider, Verifier } from '@cloudsforge/auth'
 import { SERVICE, env, stratumEndpointOf, websocketEndpointOf } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer } from './server.ts'
@@ -36,6 +36,9 @@ import { attachStratumWebSocket } from './wsstratum.ts'
 import { TicketStore } from './tickets.ts'
 import { ChainService, registerPoolMetrics } from './chainservice.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
+import { CUSTODY_BACKING_CLOSED, LedgerPayoutSink } from './payouts.ts'
+import { httpLedgerClient, LEDGER_SCOPES } from './ledgerclient.ts'
+import type { PoolChainId } from './chains.ts'
 import type { Exec } from './store.ts'
 
 // 1. Environment. Importing `./env.ts` validated it; a missing variable has already exited with a
@@ -121,6 +124,63 @@ logger.info('browser mining', {
   // being different is a real (if quiet) configuration: the transport works for anybody who knows
   // the URL, and `GET /v1/pool` reports null because nobody published one.
   advertised: env.websocketPublicOrigin !== null,
+})
+
+// 6a-bis. Payouts, which are OFF unless an operator typed a per-chain minimum — and are off on every
+//         deployment that exists on 2026-08-09. `env.payouts` is null in that case and this whole
+//         block collapses to an empty map and one log line. See `optionalUnits` in `env.ts` for why
+//         a required variable here would have failed the estate's next deploy at boot.
+//
+//         **Two independent gates stand between this and a miner being paid**, and they fail
+//         differently. This one is a deployment that has not been configured. The other is
+//         `CUSTODY_BACKING_CLOSED` in `payouts.ts`: the pool's payout address is not observed by the
+//         indexer, so a credit would push the ledger's custody total above what the reconciliation
+//         sweep can see and freeze LTC withdrawals estate-wide. Constructing a sink here does not
+//         open that second gate, and nothing in this repository can.
+const payoutSinks = new Map<string, LedgerPayoutSink>()
+if (env.payouts !== null) {
+  const config = env.payouts
+  // Constructed once and shared by every chain's sink: the credential is exchanged for a short
+  // service token, and a provider per chain would be N exchanges for one credential.
+  const tokens = new ServiceTokenProvider({
+    identityUrl: config.identityUrl,
+    credential: config.identityCredential,
+    scopes: LEDGER_SCOPES,
+    onEvent: (event) => logger.info('service token', { ...event }),
+  })
+  const ledger = httpLedgerClient({
+    baseUrl: config.ledgerUrl,
+    token: () => tokens.token(),
+    deadlineMs: config.deadlineMs,
+  })
+  for (const [chain, minimumUnits] of config.minimums) {
+    payoutSinks.set(
+      chain,
+      new LedgerPayoutSink({
+        sql: sql as unknown as Exec,
+        ledger,
+        minimumUnits,
+        // The interlock, passed from the constant and from nowhere else. It is `false` in this
+        // release, so every claim reaching this sink is refused with a reason naming the
+        // reconciliation freeze it would otherwise cause. `payouts.test.ts` reads this file to check
+        // that this line is the constant rather than a literal `true`.
+        custodyBackingConfirmed: CUSTODY_BACKING_CLOSED,
+        // One correlation id per sink construction would tie every entry this replica ever posts to
+        // one identifier, which is not a correlation. Per call, from the credit key's own namespace,
+        // so a ledger entry can be traced back to the run that produced it.
+        correlationId: () => `pool:${env.instanceId}:${Date.now()}`,
+        log: (level, message, fields) => logger[level](message, fields),
+      }),
+    )
+  }
+}
+const payoutChains = env.chains.map((chain) => chain.chain).filter((chain) => payoutSinks.has(chain))
+logger.info('payouts', {
+  // Both facts, every boot, because they are different and an operator who confused them would be
+  // wrong in the expensive direction. `configured` says somebody set the variables. `enabled` says
+  // money can actually move, and it is false in this release no matter what anybody configures.
+  configured: payoutChains,
+  enabled: CUSTODY_BACKING_CLOSED && payoutChains.length > 0,
 })
 
 // 6b. The chains. One `ChainService` each, constructed now and started below — construction is pure
@@ -230,7 +290,7 @@ attachStratumWebSocket({
 //    claiming before it stops serving — `shouldClaim` is wired to the Lifecycle for exactly that.
 const queue = new JobQueue(sql as unknown as JobsSql, { owner: env.instanceId })
 const chainIds = env.chains.map((chain) => chain.chain)
-const reschedule = rescheduleRecurring(queue, logger, chainIds)
+const reschedule = rescheduleRecurring(queue, logger, chainIds, payoutChains)
 const runner = new JobRunner({
   queue,
   concurrency: 2,
@@ -264,8 +324,12 @@ registerHandlers(runner, {
   // maturity verdict, and it is not a detail: a second client pointed at a second node would answer
   // about a different chain of blocks.
   rpcFor: (chain) => chains.find((service) => service.chain === chain)?.node ?? null,
+  // Omitted entirely when payouts are off, which is what keeps `pool.flush-payouts` unregistered
+  // rather than registered-and-skipping. Spread rather than a ternary yielding `undefined`, so the
+  // property is absent under `exactOptionalPropertyTypes`.
+  ...(payoutSinks.size > 0 ? { payoutSinkFor: (chain: PoolChainId) => payoutSinks.get(chain) ?? null } : {}),
 })
-await seedRecurring(queue, chainIds)
+await seedRecurring(queue, chainIds, payoutChains)
 runner.start()
 
 // 9. Start the chains. This is where the node is contacted, the payout address is validated and the
