@@ -22,6 +22,7 @@ import {
   int64LE,
   isHex,
   pushData,
+  readVarInt,
   scriptNum,
   stratumPrevHash,
   swap32Hex,
@@ -142,6 +143,42 @@ test('varInt covers all four widths at their boundaries', () => {
   assert.equal(varInt(0xffffffff).toString('hex'), 'feffffffff')
   assert.equal(varInt(0x100000000).toString('hex'), 'ff0000000001000000')
   assert.throws(() => varInt(-1), RangeError)
+})
+
+test('readVarInt is the inverse of varInt at every width', () => {
+  // Round-tripped rather than spelled out again, because two hand-written tables agreeing proves
+  // only that the same person wrote both.
+  for (const value of [0, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffffffff]) {
+    const encoded = varInt(value)
+    assert.deepEqual(readVarInt(encoded, 0), { value, size: encoded.length }, `varInt(${value})`)
+  }
+})
+
+test('readVarInt reads at an offset, which is the only way it is ever used', () => {
+  const buffer = Buffer.concat([Buffer.from('deadbeef', 'hex'), varInt(0x10000)])
+  assert.deepEqual(readVarInt(buffer, 4), { value: 0x10000, size: 5 })
+})
+
+test('a non-minimal compact size integer is refused', () => {
+  // `fd0100` is three bytes spelling the number one. Core rejects it, so a reader that accepted it
+  // would disagree with the node about where the next field starts — and disagreeing about an offset
+  // is how a transaction gets walked into the wrong byte and answers the wrong question.
+  assert.throws(() => readVarInt(Buffer.from('fd0100', 'hex'), 0), RangeError)
+  assert.throws(() => readVarInt(Buffer.from('feffff0000', 'hex'), 0), RangeError)
+  assert.throws(() => readVarInt(Buffer.from('ff0100000000000000', 'hex'), 0), RangeError)
+})
+
+test('a compact size integer that runs past the end is refused rather than read short', () => {
+  assert.throws(() => readVarInt(Buffer.alloc(0), 0), RangeError)
+  assert.throws(() => readVarInt(Buffer.from('fd01', 'hex'), 0), RangeError)
+  assert.throws(() => readVarInt(Buffer.from('fe010203', 'hex'), 0), RangeError)
+  assert.throws(() => readVarInt(Buffer.from('ff01020304', 'hex'), 0), RangeError)
+})
+
+test('a length no field could have is refused rather than becoming an approximate offset', () => {
+  // Above 2^32 a compact size integer stops fitting a JS number exactly. Nothing inside a
+  // transaction is that long, so this is a refusal and not a limitation.
+  assert.throws(() => readVarInt(Buffer.from('ff0000000000000001', 'hex'), 0), RangeError)
 })
 
 /* ------------------------------------------------------------------ script */

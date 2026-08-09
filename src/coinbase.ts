@@ -39,6 +39,7 @@
  */
 
 import { int64LE, pushData, scriptNum, uint32LE, varInt } from './bytes.ts'
+import { MWEB_BLOCK_PRESENT } from './mweb.ts'
 import { sha256d } from './pow.ts'
 
 /** The 32-byte witness reserved value. See `witnessSerialisedCoinbase`. */
@@ -246,16 +247,32 @@ export function buildHeader(args: {
  * The transactions arrive as the hex the template gave for each, and are passed through untouched —
  * they are already consensus-serialised, witnesses and all, and re-encoding them would be a third
  * implementation of transaction serialisation in a repository that needs none.
+ *
+ * ## The MWEB extension block, and the byte in front of it
+ *
+ * `mwebHex` is Litecoin's extension block, from the template's top-level `mweb` field, and it goes
+ * after the transaction vector behind a one-byte presence marker that the template does NOT include.
+ * A caller that concatenated the field on its own would be one byte short and the node would reject
+ * the block as unparseable; a caller that omitted it on a block whose last transaction is the HogEx
+ * would be short by the whole extension block. Both were checked against a node rather than
+ * reasoned about — see `mweb.ts` — and this is the one place either can be written.
+ *
+ * It is `null` for Bitcoin always, and for Litecoin before MWEB activated. `template.ts` is what
+ * guarantees the invariant this function relies on: `mwebHex` is non-null exactly when the last
+ * transaction is the integrating one, which is exactly when Core looks for an extension block.
  */
 export function serialiseBlock(args: {
   readonly header: Buffer
   readonly coinbase: Buffer
   readonly transactionsHex: readonly string[]
+  readonly mwebHex?: string | null
 }): Buffer {
+  const mwebHex = args.mwebHex ?? null
   return Buffer.concat([
     args.header,
     varInt(args.transactionsHex.length + 1),
     args.coinbase,
     ...args.transactionsHex.map((hex) => Buffer.from(hex, 'hex')),
+    ...(mwebHex === null ? [] : [Buffer.from([MWEB_BLOCK_PRESENT]), Buffer.from(mwebHex, 'hex')]),
   ])
 }

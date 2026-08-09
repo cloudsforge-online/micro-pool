@@ -42,6 +42,41 @@ export const REGTEST_BITS = '207fffff'
 /** Mainnet-era Bitcoin difficulty, for the case where a share must NOT be a block. */
 export const MAINNET_BITS = '1d00ffff'
 
+/**
+ * A real MWEB integrating transaction — the HogEx — captured from a real template.
+ *
+ * Litecoin Core 0.21.5.6, regtest, `getblocktemplate {"rules":["mweb","segwit"]}` at height 433 on
+ * 2026-08-09, the block that `scripts/regtest-mweb.sh` reproduces. **Copied rather than
+ * constructed**, and that is the whole value of it: a hand-built fixture would only prove that
+ * `mweb.ts` can parse what this file writes, which is a tautology. These bytes are the ones a node
+ * actually emitted, and `mweb.test.ts` walks them field by field against the layout documented in
+ * `mweb.ts`.
+ *
+ * The trailing `00` before the locktime is the byte that decides: the MWEB field present and empty,
+ * which is what a HogEx is and what an ordinary MWEB-carrying transaction is not.
+ */
+export const REGTEST_HOGEX_DATA =
+  '02000000000801' +
+  '40d34df5f273e1728b41fd409a020cc051a1c638c093cc2524b1e5535734d4d3' +
+  '0000000000ffffffff' +
+  '018860814a00000000225820' +
+  '3e1b37197b099d1281e331eee87364b42db1bd48cd7d945cb9b062b6629730bd' +
+  '0000000000'
+
+/** The txid the same node reported for the transaction above. Display order, as the RPC gives it. */
+export const REGTEST_HOGEX_TXID = '05595c73b5d753a2f7d6c06fb05898a60da3088f5260c2a7ecdd8ab90bf3f355'
+
+/**
+ * The top-level `mweb` field of the same template: the extension block, 167 bytes, no presence
+ * marker. The marker is `MWEB_BLOCK_PRESENT` and belongs to the block serialiser.
+ */
+export const REGTEST_MWEB_BLOCK =
+  '8231c3e3ef5c90522ea1cc6cb96f462a20358f0f546ef99c6365c5d03d772223' +
+  '55860000000000000000000000000000000000000000000000000000000000000000' +
+  'af2edc674154ff129d9e826727ada0828d3ba480924bbed84bf6dcae2e1f1db2' +
+  '17e28fe8b75bd371070a27f71c6158a56a38b6f1eaf45ab09fbb9b2fde1ad540' +
+  '00000000000000000000000000000000000000000000000000000000000000000200000000'
+
 export interface FakeTemplateOptions {
   readonly height?: number
   readonly version?: number
@@ -54,6 +89,14 @@ export interface FakeTemplateOptions {
   readonly transactionCount?: number
   readonly witnessCommitment?: string | null
   readonly longPollId?: string | null
+  /**
+   * Shape this template the way a Litecoin node shapes one once MWEB has activated: the HogEx
+   * appended as the LAST transaction, and the extension block in the top-level `mweb` field.
+   *
+   * Off by default, because most of this suite is about behaviour both chains share and a Bitcoin
+   * template never has either field.
+   */
+  readonly mweb?: boolean
 }
 
 /** A deterministic 32-byte hash, in DISPLAY order, derived from a label. */
@@ -83,6 +126,12 @@ export function fakeTemplateReply(options: FakeTemplateOptions = {}): Record<str
     return { data, txid, fee: 1000 + index, weight: 400 }
   })
 
+  // Last, because that is where Litecoin puts it and where consensus requires it. A fixture that put
+  // it anywhere else would be testing a template no node produces.
+  if (options.mweb === true) {
+    transactions.push({ data: REGTEST_HOGEX_DATA, txid: REGTEST_HOGEX_TXID, fee: 0, weight: 376 })
+  }
+
   const curTime = options.curTime ?? 1_760_000_000
   const reply: Record<string, unknown> = {
     height: options.height ?? 800_000,
@@ -94,6 +143,7 @@ export function fakeTemplateReply(options: FakeTemplateOptions = {}): Record<str
     coinbasevalue: options.coinbaseValue ?? 312_500_000,
     transactions,
   }
+  if (options.mweb === true) reply['mweb'] = REGTEST_MWEB_BLOCK
   const witness = options.witnessCommitment === undefined ? `6a24aa21a9ed${'22'.repeat(32)}` : options.witnessCommitment
   if (witness !== null) reply['default_witness_commitment'] = witness
   if (options.longPollId !== null && options.longPollId !== undefined) reply['longpollid'] = options.longPollId

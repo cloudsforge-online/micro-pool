@@ -117,6 +117,24 @@ docker run -d --rm --name pool-test-pg -e POSTGRES_PASSWORD=ci -e POSTGRES_USER=
 POOL_TEST_DATABASE_URL=postgres://ci:ci@127.0.0.1:55432/pool_test pnpm test
 ```
 
+### Mining a real block on a real node
+
+```sh
+scripts/regtest-mweb.sh          # needs Docker; nothing here touches an estate node
+```
+
+The suite mines every share for real but it cannot tell you whether a **node** accepts the block that
+comes out, because every byte of it is checked against a fixture this repository also wrote. That gap
+is what micro-org#277 was: the suite passed in full against a service that could not obtain a block
+template from Litecoin at all.
+
+So this script starts a litecoind on regtest in Docker, mines it past MWEB activation, puts a few
+transactions in its mempool, and runs `src/regtest.test.ts` — which drives this repository's own
+template fetch, coinbase assembly, merkle fold and block serialisation and then calls `submitblock`.
+It passes when the node accepts the block and its height goes up by one. `src/regtest.test.ts` skips
+without `POOL_REGTEST_NODE_URL`, which is what happens in CI; the script's own header explains why
+this is not a CI job and what MWEB needs on regtest that mainnet does not.
+
 ### The image
 
 ```sh
@@ -138,6 +156,7 @@ docker build -t cloudsforge-pool \
 | `src/bytes.ts` | The four byte orders this protocol uses, each named, with the conversions between them. |
 | `src/merkle.ts` | The merkle branch with a hole at the coinbase, and the fold that reconstructs a root from one. |
 | `src/coinbase.ts` | Building the coinbase transaction: BIP34 height, the extranonce placeholders, the witness commitment, the `coinb1`/`coinb2` split. |
+| `src/mweb.ts` | Recognising Litecoin's MWEB integrating transaction in a template, and refusing one that is not last. |
 | `src/template.ts` | `getblocktemplate`, longpoll, staleness, the payout-address and network checks. |
 | `src/work.ts` | A template becomes a job: the `mining.notify` parameters and the job history a submit can still name. |
 | `src/stratum.ts` | The TCP listener and the line framing. Timeouts, back-pressure, the share buffer. |
@@ -195,6 +214,19 @@ wrong pays every block it ever finds to an unspendable output.
 address the node calls invalid kills the process at boot, where somebody is watching. A node that is
 simply not up yet is retried with the stratum port shut and `/readyz` red — otherwise ordinary restart
 ordering becomes a crash loop.
+
+**Litecoin asks for `mweb` as well as `segwit`, and MWEB is not optional.** Litecoin Core refuses
+`getblocktemplate` outright — `error -8`, not a degraded template — unless both rules are named, at
+every height, whether or not MWEB has activated. The template that comes back always carries an
+integrating transaction (the HogEx) even with an empty mempool, and a top-level `mweb` blob. **Both
+are load-bearing**: the extension block is read off the wire only when the final transaction is the
+HogEx, so the HogEx has to stay last and the blob has to be appended behind a `0x01` marker, or the
+node cannot deserialise the block at all. `src/mweb.ts` recognises it, `src/template.ts` refuses a
+template where the two disagree, and `src/blocks.ts` refuses to submit a block whose HogEx has moved.
+MWEB does **not** touch the coinbase: its commitment lives in the HogEx's witness-version-8 output and
+`default_witness_commitment` is exactly what it is on Bitcoin. Bitcoin keeps asking for `['segwit']`
+alone, and asking it for `mweb` would be asking for a rule it has never heard of. Measured against
+litecoind 0.21.5.6 on 2026-08-09; see micro-org#277 and `scripts/regtest-mweb.sh`.
 
 **The read API is public and there is no `@cloudsforge/auth` here.** The only identity a miner has is
 the stratum username they chose; there is no estate account behind it. §6 makes a checkable share

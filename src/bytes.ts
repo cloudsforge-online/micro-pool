@@ -136,6 +136,44 @@ export function varInt(value: number): Buffer {
 }
 
 /**
+ * The inverse of `varInt`, for the one place this repository has to READ a serialised transaction
+ * rather than write one.
+ *
+ * That place is `mweb.ts`, which has to walk a transaction handed to it by the node far enough to
+ * discover whether it is Litecoin's MWEB integrating transaction. Nothing else here parses; the
+ * transactions in a template are opaque hex passed through untouched, and that is still the rule.
+ *
+ * **Non-minimal encodings are refused.** Bitcoin's compact size integer has exactly one legal
+ * encoding per value, and `0xfd 0x01 0x00` — three bytes spelling the number one — is not it. Core
+ * rejects it, so a reader here that accepted it would disagree with the node about where the next
+ * field starts, which is the same class of defect as reading the wrong byte order: no error, just a
+ * different answer to a question both sides thought they agreed on.
+ */
+export function readVarInt(buffer: Buffer, offset: number): { value: number; size: number } {
+  if (offset >= buffer.length) throw new RangeError(`a compact size integer was expected at ${offset}`)
+  const first = buffer.readUInt8(offset)
+  if (first < 0xfd) return { value: first, size: 1 }
+  if (first === 0xfd) {
+    if (offset + 3 > buffer.length) throw new RangeError(`a 3-byte compact size integer runs past the end`)
+    const value = buffer.readUInt16LE(offset + 1)
+    if (value < 0xfd) throw new RangeError(`the compact size integer ${value} is not minimally encoded`)
+    return { value, size: 3 }
+  }
+  if (first === 0xfe) {
+    if (offset + 5 > buffer.length) throw new RangeError(`a 5-byte compact size integer runs past the end`)
+    const value = buffer.readUInt32LE(offset + 1)
+    if (value <= 0xffff) throw new RangeError(`the compact size integer ${value} is not minimally encoded`)
+    return { value, size: 5 }
+  }
+  if (offset + 9 > buffer.length) throw new RangeError(`a 9-byte compact size integer runs past the end`)
+  const wide = buffer.readBigUInt64LE(offset + 1)
+  if (wide <= 0xffffffffn) throw new RangeError(`the compact size integer ${wide} is not minimally encoded`)
+  // Nothing inside a transaction can legally be this long, and a length that does not fit a JS
+  // number would become an approximate offset, which is worse than a refusal.
+  throw new RangeError(`the compact size integer ${wide} is longer than any field in a transaction`)
+}
+
+/**
  * A script data push of up to 75 bytes, which is every push this repository makes.
  *
  * Deliberately refuses above 75 rather than emitting OP_PUSHDATA1. Everything pushed into a

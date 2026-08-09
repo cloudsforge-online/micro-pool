@@ -34,6 +34,7 @@
  */
 
 import { hashFromDisplay } from './bytes.ts'
+import { hogExIndexOf } from './mweb.ts'
 import { targetFromCompactBits } from './pow.ts'
 import { NodeRpcError, NodeUnavailableError, type NodeRpc } from './rpc.ts'
 import { EXPECTED_NODE_CHAIN, poolChain, type PoolChainId } from './chains.ts'
@@ -44,6 +45,14 @@ export interface TemplateTransaction {
   readonly data: string
   /** Internal byte order, ready for the merkle tree. */
   readonly txid: Buffer
+  /**
+   * Litecoin's MWEB integrating transaction — the HogEx. See `mweb.ts`.
+   *
+   * Always false on Bitcoin, and false on Litecoin until MWEB activated. Carried per transaction
+   * rather than as "the last one" so that `blocks.ts` can assert the position it depends on instead
+   * of assuming it.
+   */
+  readonly isHogEx: boolean
 }
 
 export interface BlockTemplate {
@@ -60,6 +69,15 @@ export interface BlockTemplate {
   readonly coinbaseValue: bigint
   readonly transactions: readonly TemplateTransaction[]
   readonly witnessCommitmentHex: string | null
+  /**
+   * Litecoin's MWEB extension block, hex, exactly as the template's top-level `mweb` field gave it,
+   * or null on a template that has none — which is every Bitcoin template and every Litecoin
+   * template from before MWEB activated.
+   *
+   * Non-null exactly when the last transaction is the HogEx; `parseTemplate` refuses a template
+   * where those two disagree, because Core's block deserialiser ties them together. See `mweb.ts`.
+   */
+  readonly mwebHex: string | null
   readonly longPollId: string | null
   readonly fetchedAt: Date
 }
@@ -110,9 +128,12 @@ export function parseTemplate(value: unknown, fetchedAt: Date = new Date()): Blo
 
   const transactionsRaw = raw['transactions']
   if (!Array.isArray(transactionsRaw)) throw new TypeError('getblocktemplate.transactions is not an array')
-  const transactions: TemplateTransaction[] = transactionsRaw.map((entry, index) => {
+  const parsed = transactionsRaw.map((entry, index) => {
     const tx = objectAt(entry, `getblocktemplate.transactions[${index}]`)
     const data = stringAt(tx, 'data')
+    if (!/^([0-9a-fA-F]{2})+$/.test(data)) {
+      throw new TypeError(`getblocktemplate.transactions[${index}].data is not hex`)
+    }
     // `txid` is the non-witness hash and `hash` is the witness one; the merkle tree this pool
     // computes is the txid tree, so a template that omits `txid` — pre-segwit Core did — must fall
     // back to `hash`, which was the same thing then. Reading `hash` on a modern segwit template
@@ -122,11 +143,47 @@ export function parseTemplate(value: unknown, fetchedAt: Date = new Date()): Blo
     if (!/^[0-9a-fA-F]{64}$/.test(txidHex)) {
       throw new TypeError(`getblocktemplate.transactions[${index}].txid is not a 32-byte hex hash`)
     }
-    return { data, txid: hashFromDisplay(txidHex) }
+    return { data, txid: hashFromDisplay(txidHex), bytes: Buffer.from(data, 'hex') }
   })
+
+  // Which of these, if any, is Litecoin's MWEB integrating transaction — and a refusal if it is not
+  // where the block serialisation requires it to be. `mweb.ts` explains why this is read out of the
+  // bytes rather than assumed from the position the node happens to use.
+  const hogExIndex = hogExIndexOf(parsed.map((tx) => tx.bytes))
+  const transactions: TemplateTransaction[] = parsed.map((tx, index) => ({
+    data: tx.data,
+    txid: tx.txid,
+    isHogEx: index === hogExIndex,
+  }))
 
   const witnessCommitment = raw['default_witness_commitment']
   const longPollId = raw['longpollid']
+
+  // The extension block and the HogEx are one fact stated twice, and Core ties them together: it
+  // writes the extension block after the transaction vector if and only if the last transaction is
+  // the integrating one, and reads it back under the same condition. A template where only one of
+  // the two is present is a template no valid block can be built from, so it is refused here rather
+  // than turned into a block the node cannot parse.
+  const mwebRaw = raw['mweb']
+  const mwebHex = typeof mwebRaw === 'string' && mwebRaw !== '' ? mwebRaw : null
+  if (mwebHex !== null && !/^([0-9a-fA-F]{2})+$/.test(mwebHex)) {
+    throw new TypeError('getblocktemplate.mweb is not hex')
+  }
+  const hasHogEx = hogExIndex !== -1
+  if (mwebHex !== null && !hasHogEx) {
+    throw new TypeError(
+      'getblocktemplate carries an mweb extension block but no MWEB integrating transaction. Litecoin ' +
+        'reads the extension block off the wire only behind a final HogEx, so this template cannot be ' +
+        'turned into a block the node will parse.',
+    )
+  }
+  if (hasHogEx && mwebHex === null) {
+    throw new TypeError(
+      'getblocktemplate carries an MWEB integrating transaction but no mweb extension block. The ' +
+        'integrating transaction commits to an extension block that is not here, so submitting this ' +
+        'block would mean submitting a commitment to nothing.',
+    )
+  }
 
   const curTime = integerAt(raw, 'curtime')
 
@@ -144,6 +201,7 @@ export function parseTemplate(value: unknown, fetchedAt: Date = new Date()): Blo
     coinbaseValue: BigInt(coinbaseValueRaw),
     transactions,
     witnessCommitmentHex: typeof witnessCommitment === 'string' && witnessCommitment !== '' ? witnessCommitment : null,
+    mwebHex,
     longPollId: typeof longPollId === 'string' && longPollId !== '' ? longPollId : null,
     fetchedAt,
   }

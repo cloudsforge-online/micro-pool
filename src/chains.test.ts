@@ -25,6 +25,7 @@ import {
   EXPECTED_NODE_CHAIN,
   isPoolChainId,
   nameFor,
+  poolChain,
   POOL_CHAIN_IDS,
   REFUSED_CHAINS,
 } from './chains.ts'
@@ -42,6 +43,29 @@ test('the proof-of-work function is dispatched per chain', () => {
   // every share, because a wrong hash is not an error, it is a number that never clears a target.
   assert.equal(algorithmFor('btc'), 'sha256d')
   assert.equal(algorithmFor('ltc'), 'scrypt')
+})
+
+/* ------------------------------------------------------------------ the template rules */
+
+test('litecoin asks for mweb as well as segwit, because the node refuses the call otherwise', () => {
+  // Measured against Litecoin Core 0.21.5.6 on 2026-08-09, mainnet and regtest alike:
+  //   error code: -8
+  //   getblocktemplate must be called with the segwit & mweb rule sets
+  //   (call with {"rules": ["mweb", "segwit"]})
+  // That is a refusal of the call, not a degraded template, and `chainservice.ts` treats a node that
+  // answers wrongly as fatal — so this single line is the difference between a service that boots
+  // and one that exits. Asserted as a set membership rather than as an array so a future rule can be
+  // added without this test dictating the order Core does not care about.
+  const rules = poolChain('ltc').templateRules
+  assert.ok(rules.includes('mweb'), 'litecoin must claim the mweb rule set')
+  assert.ok(rules.includes('segwit'), 'litecoin must claim the segwit rule set')
+})
+
+test('bitcoin does not ask for mweb, and that is not an omission to be tidied up', () => {
+  // Bitcoin has no MWEB. A rule name bitcoind does not know is a rule it refuses the call for, in
+  // the same way and with the same consequence, so copying Litecoin's list here would break the
+  // chain this list was correct for.
+  assert.deepEqual([...poolChain('btc').templateRules], ['segwit'])
 })
 
 /* ------------------------------------------------------------------ what is refused */

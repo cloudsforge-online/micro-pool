@@ -58,15 +58,34 @@ export interface BlockSubmissionResult {
  * commitment. A block with the commitment output but no witness stack is rejected by the node, and a
  * block with a witness stack but no commitment output is rejected too — the two are one decision, so
  * they are made in one place from one condition.
+ *
+ * **MWEB changes nothing about the coinbase**, which was checked rather than assumed: a regtest
+ * block mined by Litecoin Core 0.21.5.6 on 2026-08-09 carries a coinbase whose only witness-related
+ * bytes are the same `default_witness_commitment` output and the same 32 zero bytes of witness
+ * reserved value as a Bitcoin block, with no MWEB flag on the transaction at all. MWEB's own
+ * commitment — the extension block header's hash — lives in the HogEx's witness-version-8 output,
+ * which arrives inside transaction data this function passes through untouched.
+ *
+ * What MWEB does change is the tail: the extension block goes after the transactions, and only
+ * behind a HogEx. The order is asserted here rather than trusted, because `template.transactions` is
+ * "as the node gave them" and a silently reordered list would produce a block whose extension block
+ * the node never even looks for.
  */
 export function serialiseFoundBlock(found: FoundBlock): string {
   const template = found.job.template
   const coinbase =
     template.witnessCommitmentHex === null ? found.coinbase : witnessSerialisedCoinbase(found.coinbase)
+  if (template.mwebHex !== null && template.transactions[template.transactions.length - 1]?.isHogEx !== true) {
+    throw new Error(
+      'the MWEB integrating transaction is not the last transaction of this block. Litecoin reads the ' +
+        'extension block off the wire only behind a final HogEx, so this block would not deserialise.',
+    )
+  }
   return serialiseBlock({
     header: found.header,
     coinbase,
     transactionsHex: template.transactions.map((tx) => tx.data),
+    mwebHex: template.mwebHex,
   }).toString('hex')
 }
 

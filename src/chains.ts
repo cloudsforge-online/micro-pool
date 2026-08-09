@@ -79,11 +79,41 @@ interface PoolChain {
    * be called with the segwit rule set" — if a caller omits a rule the node considers mandatory,
    * so this is not optional decoration.
    *
-   * MWEB is deliberately absent for Litecoin. Litecoin Core only includes MWEB transactions when
-   * the caller asks for them, so omitting it costs this pool the fees on those transactions and
-   * nothing else; the block is valid either way. Adding `mweb` means building a coinbase with the
-   * MWEB commitment, which this repository does not do, so asking for it would be asking the node
-   * for transactions we cannot correctly commit to.
+   * ## Litecoin asks for `mweb` as well, and the reason this file used to give for omitting it was
+   * ## wrong on both counts
+   *
+   * This entry read `['segwit']` for Litecoin until 2026-08-09, and the comment justifying that
+   * said, in full: *"MWEB is deliberately absent for Litecoin. Litecoin Core only includes MWEB
+   * transactions when the caller asks for them, so omitting it costs this pool the fees on those
+   * transactions and nothing else; the block is valid either way. Adding `mweb` means building a
+   * coinbase with the MWEB commitment, which this repository does not do, so asking for it would be
+   * asking the node for transactions we cannot correctly commit to."* That was a belief, never a
+   * measurement, and it is recorded here rather than deleted because the two mistakes in it are both
+   * worth keeping.
+   *
+   * **What was measured**, against Litecoin Core 0.21.5.6 — the estate's mainnet node on 2026-08-09
+   * (micro-org#277) and a regtest node the same day:
+   *
+   *   - Omitting `mweb` does not degrade the template, it **refuses the call**: `error code -8,
+   *     getblocktemplate must be called with the segwit & mweb rule sets (call with {"rules":
+   *     ["mweb", "segwit"]})`. So there was no "block valid either way" to weigh against lost fees;
+   *     there was no template at all, and `chainservice.ts` treats a node that answers wrongly as
+   *     fatal, so the service exited at boot. The refusal is unconditional: regtest at height 0,
+   *     with MWEB still in BIP9 `defined` and no extension block possible, answers the same -8.
+   *   - Asking correctly returns a template with a **mandatory** MWEB integrating transaction — the
+   *     HogEx — in `transactions` even when the mempool is completely empty, and a top-level `mweb`
+   *     extension block to serialise with it. Neither is a set of transactions the pool can decline;
+   *     every Litecoin block since mainnet 2,265,984 carries one.
+   *   - The second half of the old comment is wrong in a more interesting way: **the coinbase does
+   *     not carry the MWEB commitment and never did.** The commitment is the HogEx's
+   *     witness-version-8 output, and the coinbase's `default_witness_commitment` is unchanged by
+   *     MWEB — a regtest block's coinbase is byte-for-byte the shape `coinbase.ts` already builds.
+   *     The work MWEB actually needed was in reading the HogEx's position and appending the
+   *     extension block, which is `mweb.ts`, and none of it is in the coinbase.
+   *
+   * Bitcoin keeps `['segwit']` alone, and that is not an oversight to be tidied up later: Bitcoin
+   * has no MWEB, and a rule name bitcoind does not know is a rule it refuses the call for in the
+   * same way. The two chains ask for different things because they are different chains.
    */
   readonly templateRules: readonly string[]
 }
@@ -99,7 +129,10 @@ const POOL_CHAINS: Readonly<Record<PoolChainId, PoolChain>> = Object.freeze({
     chain: 'ltc',
     asset: 'LTC',
     algorithm: 'scrypt',
-    templateRules: Object.freeze(['segwit']),
+    // The order is the one Core's own error message spells out. `rules` is a set to the node, so it
+    // does not matter to it — it is written this way so that a reader comparing this line against
+    // the -8 quoted above sees the same two words in the same order.
+    templateRules: Object.freeze(['mweb', 'segwit']),
   }),
 })
 

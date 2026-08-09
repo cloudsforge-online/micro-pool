@@ -26,7 +26,8 @@ import {
   WITNESS_RESERVED_VALUE,
   type CoinbaseInput,
 } from './coinbase.ts'
-import { FAKE_PAYOUT_SCRIPT } from './faketemplate.ts'
+import { FAKE_PAYOUT_SCRIPT, REGTEST_HOGEX_DATA, REGTEST_MWEB_BLOCK } from './faketemplate.ts'
+import { MWEB_BLOCK_PRESENT } from './mweb.ts'
 import { sha256d } from './pow.ts'
 
 const EXTRANONCE1 = Buffer.from('deadbeef', 'hex')
@@ -340,4 +341,41 @@ test('a block with only a coinbase counts one transaction', () => {
   const block = serialiseBlock({ header: Buffer.alloc(80), coinbase, transactionsHex: [] })
   assert.equal(block.readUInt8(80), 1)
   assert.equal(block.length, 80 + 1 + coinbase.length)
+})
+
+/* ------------------------------------------------------------------ the MWEB tail */
+
+test('a block with no extension block ends at its last transaction', () => {
+  // Every Bitcoin block, and every Litecoin block from before MWEB activated. The absence has to be
+  // an absence and not a zero marker: Core only reads a marker byte when the last transaction is a
+  // HogEx, so a stray 0x00 here is trailing garbage the node rejects the block for.
+  const parts = buildCoinbase(input())
+  const coinbase = assembleCoinbase(parts, EXTRANONCE1, EXTRANONCE2)
+  const withNull = serialiseBlock({ header: Buffer.alloc(80), coinbase, transactionsHex: [], mwebHex: null })
+  const withoutKey = serialiseBlock({ header: Buffer.alloc(80), coinbase, transactionsHex: [] })
+  assert.ok(withNull.equals(withoutKey))
+  assert.equal(withNull.length, 80 + 1 + coinbase.length)
+})
+
+test('the extension block is appended behind a presence marker the template does not carry', () => {
+  // Checked against a node-mined regtest block on 2026-08-09: header, transaction vector, then 0x01,
+  // then exactly the bytes `getblocktemplate.mweb` held and nothing after. A caller that appended
+  // the field on its own would be one byte short and the node could not deserialise the block.
+  const parts = buildCoinbase(input())
+  const coinbase = assembleCoinbase(parts, EXTRANONCE1, EXTRANONCE2)
+  const block = serialiseBlock({
+    header: Buffer.alloc(80),
+    coinbase,
+    transactionsHex: [REGTEST_HOGEX_DATA],
+    mwebHex: REGTEST_MWEB_BLOCK,
+  })
+
+  const tail = block.subarray(block.length - (1 + REGTEST_MWEB_BLOCK.length / 2))
+  assert.equal(tail.readUInt8(0), MWEB_BLOCK_PRESENT)
+  assert.equal(tail.subarray(1).toString('hex'), REGTEST_MWEB_BLOCK)
+  // And the HogEx is still in the transaction vector, untouched, immediately before it.
+  assert.equal(
+    block.subarray(81 + coinbase.length, block.length - tail.length).toString('hex'),
+    REGTEST_HOGEX_DATA,
+  )
 })

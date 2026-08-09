@@ -24,7 +24,15 @@ import {
   type BlockTemplate,
 } from './template.ts'
 import { NodeRpcError } from './rpc.ts'
-import { fakeHashHex, fakeNode, fakeTemplateReply, FAKE_PAYOUT_SCRIPT, MAINNET_BITS } from './faketemplate.ts'
+import {
+  fakeHashHex,
+  fakeNode,
+  fakeTemplateReply,
+  FAKE_PAYOUT_SCRIPT,
+  MAINNET_BITS,
+  REGTEST_HOGEX_DATA,
+  REGTEST_MWEB_BLOCK,
+} from './faketemplate.ts'
 import { targetFromCompactBits } from './pow.ts'
 
 /* ------------------------------------------------------------------ parsing */
@@ -108,6 +116,58 @@ test('an absent witness commitment is null, not an empty string', () => {
   const empty = fakeTemplateReply()
   empty['default_witness_commitment'] = ''
   assert.equal(parseTemplate(empty).witnessCommitmentHex, null)
+})
+
+/* ------------------------------------------------------------------ MWEB */
+
+test('a bitcoin-shaped template has no extension block and no integrating transaction', () => {
+  // The ordinary case, and the one every other test in this file runs in.
+  const template = parseTemplate(fakeTemplateReply())
+  assert.equal(template.mwebHex, null)
+  assert.ok(template.transactions.every((tx) => !tx.isHogEx))
+})
+
+test('a litecoin template carries the extension block and marks the integrating transaction', () => {
+  const template = parseTemplate(fakeTemplateReply({ mweb: true }))
+  assert.equal(template.mwebHex, REGTEST_MWEB_BLOCK)
+  // Last, which is where consensus requires it and where the node puts it.
+  assert.equal(template.transactions.length, 4)
+  assert.equal(template.transactions[3]?.isHogEx, true)
+  assert.equal(template.transactions[3]?.data, REGTEST_HOGEX_DATA)
+  assert.ok(template.transactions.slice(0, 3).every((tx) => !tx.isHogEx))
+})
+
+test('the integrating transaction anywhere but last is refused at the boundary', () => {
+  // Not a hypothetical about a node misbehaving so much as a guard on this repository: the moment
+  // anything starts reordering or filtering `transactions`, a block stops deserialising and the only
+  // evidence is a rejection string on the one block the pool ever finds.
+  const reply = fakeTemplateReply({ mweb: true })
+  const transactions = reply['transactions'] as unknown[]
+  transactions.unshift(transactions.pop())
+  assert.throws(() => parseTemplate(reply), /not last/)
+})
+
+test('an extension block without an integrating transaction is refused', () => {
+  // Core writes the extension block behind a final HogEx and reads it back under the same condition,
+  // so these two fields are one fact stated twice. A template where they disagree cannot become a
+  // block the node will parse, and mining on it would waste every share until it was found.
+  const reply = fakeTemplateReply()
+  reply['mweb'] = REGTEST_MWEB_BLOCK
+  assert.throws(() => parseTemplate(reply), /no MWEB integrating transaction/)
+})
+
+test('an integrating transaction without an extension block is refused', () => {
+  const reply = fakeTemplateReply({ mweb: true })
+  delete reply['mweb']
+  assert.throws(() => parseTemplate(reply), /no mweb extension block/)
+})
+
+test('an mweb field that is not hex is refused at the boundary', () => {
+  // It is concatenated into the block as bytes. `Buffer.from` would silently truncate at the first
+  // character it did not like, which is a block short by an arbitrary number of bytes.
+  const reply = fakeTemplateReply({ mweb: true })
+  reply['mweb'] = 'not hex at all'
+  assert.throws(() => parseTemplate(reply), TypeError)
 })
 
 test('an absent longpollid is null, so the loop knows to sleep instead', () => {
