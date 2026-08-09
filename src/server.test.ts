@@ -363,10 +363,75 @@ test('a pool serving one chain defaults it; a pool serving two refuses to pick',
 test('a chain this pool does not serve is refused with the ones it does', async () => {
   await withServer({}, async (h) => {
     for (const chain of ['btc', 'doge', 'not-a-chain']) {
-      const res = await fetch(`${h.url}/v1/pool/blocks?chain=${chain}`)
+      // The share routes. A pool with no aux configured refuses `doge` here exactly as it refuses
+      // a chain that does not exist, which is the state of the estate today.
+      const res = await fetch(`${h.url}/v1/pool/shares?account=ltc1qexample&chain=${chain}`)
       assert.equal(res.status, 400, chain)
       const body = (await res.json()) as { error: { message: string } }
       assert.match(body.error.message, /it serves ltc/)
+
+      const blocks = await fetch(`${h.url}/v1/pool/blocks?chain=${chain}`)
+      assert.equal(blocks.status, 400, chain)
+      // A different verb, because it is a different set: blocks are per MINED chain and shares are
+      // per share chain. The wording is what tells a reader which question they asked.
+      assert.match(((await blocks.json()) as { error: { message: string } }).error.message, /it mines ltc/)
+    }
+  })
+})
+
+/* ------------------------------------------------------------------ blocks on a merge-mined chain */
+
+test('A MERGE-MINED CHAIN’S BLOCKS ARE READABLE, OR THE POOL WINS DOGE NOBODY CAN SEE', async () => {
+  // `pool_blocks` is keyed by the chain the BLOCK is on and `pool_shares` by the chain the SHARE is
+  // on; before this the blocks route took the share chain, so a Dogecoin block this pool won was
+  // recorded in a table with no route that could read it back. That is not a missing feature — it
+  // is a found block, with a reward and a maturity countdown, invisible to the miner who found it.
+  const merged = chainStatus({
+    merged: {
+      chain: 'doge',
+      name: 'Dogecoin',
+      committed: true,
+      unavailability: null,
+      height: 5_015_467,
+      networkDifficulty: 12_345_678.5,
+    },
+  })
+  await withServer({ snapshot: snapshot({ chains: [merged] }) }, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool/blocks?chain=doge`)
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { chain: string; asset: string; decimals: number }
+    assert.equal(body.chain, 'doge')
+    // The asset and the exponent are the AUX chain's, not the parent's. A body that answered `LTC`
+    // for a Dogecoin block would put a reader's reward in the wrong currency at the last step.
+    assert.equal(body.asset, 'DOGE')
+    assert.equal(body.decimals, 8)
+
+    // And the default is still the parent. A reader who asked no question means the chain they
+    // point a miner at, and there is exactly one of those however many aux chains hang off it.
+    const fallback = await fetch(`${h.url}/v1/pool/blocks`)
+    assert.equal(((await fallback.json()) as { chain: string }).chain, 'ltc')
+  })
+})
+
+test('a merge-mined chain has no shares and no workers of its own, and says so rather than answering empty', async () => {
+  // A miner's Litecoin work is what produced the Dogecoin block, so their DOGE share history IS
+  // their LTC share history. Answering `chain=doge` with an empty list would tell them their merged
+  // work was never recorded — the one reading that would send them to another pool.
+  const merged = chainStatus({
+    merged: {
+      chain: 'doge',
+      name: 'Dogecoin',
+      committed: true,
+      unavailability: null,
+      height: 5_015_467,
+      networkDifficulty: 12_345_678.5,
+    },
+  })
+  await withServer({ snapshot: snapshot({ chains: [merged] }) }, async (h) => {
+    for (const route of ['shares', 'workers']) {
+      const res = await fetch(`${h.url}/v1/pool/${route}?account=ltc1qexample&chain=doge`)
+      assert.equal(res.status, 400, route)
+      assert.match(((await res.json()) as { error: { message: string } }).error.message, /does not serve doge/)
     }
   })
 })

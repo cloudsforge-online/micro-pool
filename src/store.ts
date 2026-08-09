@@ -899,7 +899,10 @@ export interface BlockRecord {
 
 export async function recentBlocks(
   exec: Exec,
-  args: { chain: PoolChainId; limit: number },
+  // `MinedChainId` and not `PoolChainId`: `pool_blocks` is keyed by the chain the BLOCK is on, and
+  // a merge-mined Dogecoin block is a row here with no stratum listener, no shares and no template
+  // behind it. Reading them back is the only way one is ever visible to anybody.
+  args: { chain: MinedChainId; limit: number },
 ): Promise<BlockRecord[]> {
   const rows = await exec<
     {

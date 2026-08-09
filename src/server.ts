@@ -48,7 +48,18 @@ import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { bearerFrom, statusFor, type Principal } from '@cloudsforge/auth'
 import { hashesPerDifficulty } from './pow.ts'
 import { unitsToDifficulty } from './pplns.ts'
-import { algorithmFor, assetFor, auxAssetFor, decimalsFor, isPoolChainId, type PoolChainId } from './chains.ts'
+import {
+  algorithmFor,
+  assetFor,
+  auxAssetFor,
+  decimalsFor,
+  isMinedChainId,
+  isPoolChainId,
+  minedAssetFor,
+  minedDecimalsFor,
+  type MinedChainId,
+  type PoolChainId,
+} from './chains.ts'
 import { chainActivity, recentBlocks, sharesForAccount, workersForAccount, type Exec } from './store.ts'
 import { accountForUser, newBrowserWorkerLabel, type MintedTicket } from './tickets.ts'
 import type { ChainStatus } from './chainservice.ts'
@@ -417,14 +428,14 @@ function buildRoutes(): Route[] {
       method: 'GET',
       path: '/v1/pool/blocks',
       handle: async (ctx, deps) => {
-        const chain = chainParam(ctx, deps)
+        const chain = minedChainParam(ctx, deps)
         const blocks = await recentBlocks(deps.sql, { chain, limit: limitParam(ctx, 50, 200) })
         return {
           status: 200,
           body: {
             chain,
-            asset: assetFor(chain),
-            decimals: decimalsFor(chain),
+            asset: minedAssetFor(chain),
+            decimals: minedDecimalsFor(chain),
             payoutsImplemented: false,
             blocks: blocks.map((block) => ({
               height: block.height,
@@ -533,7 +544,17 @@ function hashrateFrom(chain: PoolChainId, units: bigint, seconds: number): numbe
   return (unitsToDifficulty(units) * hashesPerDifficulty(algorithmFor(chain))) / seconds
 }
 
-/** The chain to query. Required when the pool serves more than one, because there is no sane default. */
+/**
+ * The chain to query for records of WORK — shares and workers. A share chain, never an aux one.
+ *
+ * Required when the pool serves more than one, because there is no sane default.
+ *
+ * An aux chain is refused here rather than accepted and answered with an empty list, and the
+ * refusal is the honest answer rather than a limitation: a merge-mined chain has no shares of its
+ * own and never will. A miner's Litecoin work is what produced the Dogecoin block, so their share
+ * history for it IS their Litecoin share history, and answering `chain=doge` with zero shares would
+ * tell a miner their merged work was not recorded. See `minedChainParam` for the other half.
+ */
 function chainParam(ctx: RequestContext, deps: ServerDeps): PoolChainId {
   const configured = deps.snapshot().chains.map((status) => status.chain)
   const raw = ctx.url.searchParams.get('chain')?.trim().toLowerCase()
@@ -543,6 +564,47 @@ function chainParam(ctx: RequestContext, deps: ServerDeps): PoolChainId {
   }
   if (!isPoolChainId(raw) || !configured.includes(raw)) {
     throw new BadRequestError(`this pool does not serve ${raw}; it serves ${configured.join(', ')}`)
+  }
+  return raw
+}
+
+/**
+ * The chain to query for BLOCKS, which is a wider set than the chain to query for shares.
+ *
+ * ── WHY THIS IS A SECOND FUNCTION AND NOT A FLAG ON THE FIRST ─────────────────────────────────
+ *
+ * `pool_blocks` is keyed by `MinedChainId` and `pool_shares` by `PoolChainId`; that split is the
+ * whole shape of merge mining in this service. A merge-mined Dogecoin block is a real block with a
+ * real hash, a real reward and a real maturity countdown, and until this existed it was recorded in
+ * a table nothing could read back — the pool would have won DOGE that no miner, and no operator,
+ * could see anywhere except in the database. The two callers want different sets and neither wants
+ * a boolean deciding which one it is getting.
+ *
+ * The set offered is what this deployment can actually have won: the configured share chains, plus
+ * the aux chains those chains are committing to. It is read off the live snapshot rather than off
+ * `MINED_CHAIN_IDS`, so a pool with no aux configured refuses `doge` exactly as it did before, with
+ * the same sentence — a 400 saying which chains exist is a better answer than a 200 with an empty
+ * list, which reads as "the pool found nothing" rather than "the pool does not mine that".
+ *
+ * The DEFAULT when `chain` is absent stays the single share chain and never becomes an aux one. A
+ * reader who asked no question means the chain they point a miner at.
+ */
+function minedChainParam(ctx: RequestContext, deps: ServerDeps): MinedChainId {
+  const chains = deps.snapshot().chains
+  const parents = chains.map((status) => status.chain)
+  // Only aux chains this pool is configured for. `merged` is non-null exactly when an operator set
+  // `POOL_<PARENT>_AUX_CHAINS`, and it stays non-null while the aux node is unreachable — a block
+  // won an hour ago is still readable during an outage that stops new ones being won.
+  const aux = chains.flatMap((status) => (status.merged ? [status.merged.chain] : []))
+  const served: string[] = [...parents, ...aux]
+
+  const raw = ctx.url.searchParams.get('chain')?.trim().toLowerCase()
+  if (!raw) {
+    if (parents.length === 1 && isPoolChainId(parents[0] ?? '')) return parents[0] as PoolChainId
+    throw new BadRequestError(`chain is required; this pool mines ${served.join(', ')}`)
+  }
+  if (!isMinedChainId(raw) || !served.includes(raw)) {
+    throw new BadRequestError(`this pool does not mine ${raw}; it mines ${served.join(', ')}`)
   }
   return raw
 }

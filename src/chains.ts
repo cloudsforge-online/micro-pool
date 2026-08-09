@@ -258,6 +258,25 @@ export function minedAssetFor(chain: MinedChainId): AssetCode {
   return isPoolChainId(chain) ? assetFor(chain) : auxAssetFor(chain)
 }
 
+/**
+ * The smallest-unit exponent for a block on ANY mined chain — the pair of `minedAssetFor`.
+ *
+ * It exists because a reward is meaningless without it: `/v1/pool/blocks` sends the reward as a
+ * string of smallest units and the caller places the decimal point with this number. DOGE and LTC
+ * both happen to use 8 today, which is exactly why this is a lookup rather than a constant — a
+ * frontend that hard-coded 8 for the aux chain would be right by coincidence and would misplace
+ * the point by three orders of magnitude the first time an aux chain with a different exponent is
+ * added.
+ */
+export function minedDecimalsFor(chain: MinedChainId): number {
+  return chainSpec(minedAssetFor(chain)).decimals
+}
+
+/** The human name of any mined chain, for a log line or a page heading. */
+export function minedNameFor(chain: MinedChainId): string {
+  return chainSpec(minedAssetFor(chain)).name
+}
+
 export function isPoolChainId(value: string): value is PoolChainId {
   return (POOL_CHAIN_IDS as readonly string[]).includes(value)
 }
