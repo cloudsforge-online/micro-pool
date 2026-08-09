@@ -47,6 +47,7 @@ function jobFor(options: FakeTemplateOptions = {}): Job {
     extranonce2Size: EXTRANONCE2.length,
     id: '1',
     cleanJobs: true,
+    aux: null,
     createdAt: new Date(0),
   })
 }

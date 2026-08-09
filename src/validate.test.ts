@@ -48,6 +48,7 @@ function job(options: { bitsHex?: string; chain?: 'btc' | 'ltc' } = {}): Job {
     extranonce2Size: 4,
     id: 'job-1',
     cleanJobs: true,
+    aux: null,
     createdAt: new Date(NOW * 1000),
   })
 }

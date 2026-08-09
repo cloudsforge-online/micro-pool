@@ -14,9 +14,12 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { JobRegistry, JOB_HISTORY, RETAINED_TURNOVERS } from './work.ts'
+import { JobRegistry, JOB_HISTORY, RETAINED_TURNOVERS, type Job } from './work.ts'
 import { parseTemplate } from './template.ts'
 import { fakeTemplateReply, fakeHashHex, FAKE_PAYOUT_SCRIPT } from './faketemplate.ts'
+import { commitmentOffset, hasSingleCommitment, magicOccurrences, MERGED_MINING_MAGIC } from './auxpow.ts'
+import { targetFromCompactBits } from './pow.ts'
+import type { AuxBlock } from './auxtemplate.ts'
 
 function registry(history?: number): JobRegistry {
   const reg = new JobRegistry({
@@ -168,4 +171,162 @@ test('an id above the counter is unknown even when it is well-formed hex', () =>
   assert.equal(reg.recall('1').stale, true, '1 was issued and has been retired')
   assert.equal(reg.recall('3').stale, false)
   assert.equal(reg.recall('3').reason, 'unknown')
+})
+
+/* --- the aux commitment, and the far more common case of not rebuilding for it --- */
+
+/**
+ * A Litecoin registry, because merged mining has a parent and Bitcoin is not it.
+ *
+ * The registry itself does not check the pairing — `env.ts` does, at configuration time, against
+ * `AUX_PARENT` — so this could be driven with the `btc` helper above and would pass. It is not,
+ * because a test that merges Dogecoin into Bitcoin is a test that documents a thing this pool
+ * refuses to do.
+ */
+function ltcRegistry(history?: number): JobRegistry {
+  const reg = new JobRegistry({
+    chain: 'ltc',
+    tag: Buffer.from('/cloudsforge/', 'utf8'),
+    extranonce1Size: 4,
+    extranonce2Size: 4,
+    ...(history === undefined ? {} : { history }),
+  })
+  reg.setPayoutScript(FAKE_PAYOUT_SCRIPT)
+  return reg
+}
+
+/**
+ * An aux block, named by the DOGE tip it was built on and by its own hash.
+ *
+ * Those two are separate parameters on purpose: the whole of `setAux` turns on the difference
+ * between them. dogecoind hands back a new HASH every time it reassembles its block, and clears its
+ * map only when the TIP moves — so "same tip, new hash" is the case that must not rebuild, and it is
+ * unreachable in a fixture that derives one from the other.
+ */
+function auxBlock(tip: string, hash: string): AuxBlock {
+  return {
+    chain: 'doge',
+    hashHex: fakeHashHex(hash),
+    height: 5_400_000,
+    bitsHex: '1a01cf29',
+    target: targetFromCompactBits(0x1a01cf29),
+    previousBlockHashHex: fakeHashHex(tip),
+    coinbaseValue: 1_000_000_000_000n,
+    fetchedAt: new Date(0),
+  }
+}
+
+/** Where the commitment for `block` sits in `job`'s coinb1, or -1. */
+function committedOffset(job: Job, block: AuxBlock): number {
+  return commitmentOffset(job.coinbase.coinb1, block.hashHex)
+}
+
+test('a job built with an aux block carries its hash in coinb1, exactly once', () => {
+  const reg = ltcRegistry()
+  const doge = auxBlock('doge-tip-a', 'doge-block-1')
+  assert.equal(reg.setAux(doge), null, 'there was no job to rebuild yet')
+
+  const job = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-a') })))
+  assert.equal(job.aux?.hashHex, doge.hashHex)
+  assert.notEqual(committedOffset(job, doge), -1, 'the aux root is not where CAuxPow::check will look')
+  assert.equal(hasSingleCommitment(job.coinbase.coinb1), true)
+  // Ahead of the miner's bytes, which is the property that makes the offset a fact about the job
+  // rather than a fact about whoever submits against it. See `coinbase.ts`.
+  assert.equal(job.coinbase.coinb2.includes(MERGED_MINING_MAGIC), false)
+})
+
+test('with no aux block a job is an ordinary one, and that is not an error', () => {
+  const reg = ltcRegistry()
+  const job = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-a') })))
+  assert.equal(job.aux, null)
+  assert.equal(magicOccurrences(job.coinbase.coinb1), 0)
+})
+
+test('A NEW AUX HASH ON THE SAME AUX TIP DOES NOT REBUILD ANYTHING', () => {
+  // The churn case, and the reason `setAux` compares previous-block hashes rather than hashes.
+  // dogecoind reassembles its block as its mempool turns over and returns a different hash each
+  // time, but `mapNewBlock` is only cleared on a tip change — so the hash already in coinb1 is still
+  // submittable and still wins the same block. Rebuilding here would issue a job every few seconds
+  // and evict work miners are still grinding on, for nothing.
+  const reg = ltcRegistry()
+  const first = auxBlock('doge-tip-a', 'doge-block-1')
+  reg.setAux(first)
+  const job = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-a') })))
+
+  for (const label of ['doge-block-2', 'doge-block-3', 'doge-block-4']) {
+    assert.equal(reg.setAux(auxBlock('doge-tip-a', label)), null, `${label} forced a rebuild`)
+  }
+  assert.equal(reg.current?.id, job.id, 'the current job changed')
+  assert.equal(reg.current?.aux?.hashHex, first.hashHex, 'the commitment moved without a new job')
+  assert.equal(reg.remembered, 0, 'a job was retired')
+})
+
+test('AN AUX TIP MOVING REBUILDS THE JOB, AND DOES NOT TELL MINERS TO DISCARD LITECOIN WORK', () => {
+  const reg = ltcRegistry()
+  const before = auxBlock('doge-tip-a', 'doge-block-1')
+  reg.setAux(before)
+  const old = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-a') })))
+
+  const after = auxBlock('doge-tip-b', 'doge-block-9')
+  const rebuilt = reg.setAux(after)
+  assert.notEqual(rebuilt, null, 'the committed hash is now "block hash unknown" and nothing was rebuilt')
+  assert.equal(rebuilt?.cleanJobs, false, 'a Dogecoin tip change threw away in-flight Litecoin work')
+  assert.equal(rebuilt?.aux?.hashHex, after.hashHex)
+  assert.notEqual(committedOffset(rebuilt!, after), -1)
+
+  // The Litecoin block has not changed, so the old job is still worth a Litecoin block and stays
+  // submittable. Only the Dogecoin half of it is dead, and that half was a bonus.
+  assert.equal(reg.get(old.id)?.id, old.id, 'an aux refresh retired live Litecoin work')
+  assert.equal(reg.get(old.id)?.aux?.hashHex, before.hashHex, 'the old job forgot what it committed to')
+})
+
+test('a job that predates the aux block gains a commitment as soon as one exists', () => {
+  // dogecoind spends its first hours in initial block download, during which every job is built
+  // without a commitment. The moment it can answer, the next job commits — waiting for the Litecoin
+  // tip to move would mine an uncommitted block for a full block interval for no reason.
+  const reg = ltcRegistry()
+  const uncommitted = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-a') })))
+  assert.equal(uncommitted.aux, null)
+
+  const doge = auxBlock('doge-tip-a', 'doge-block-1')
+  const rebuilt = reg.setAux(doge)
+  assert.equal(rebuilt?.aux?.hashHex, doge.hashHex)
+  assert.equal(rebuilt?.cleanJobs, false)
+})
+
+test('LOSING THE AUX BLOCK DOES NOT REBUILD, AND DOES NOT STRIP THE COMMITMENT', () => {
+  // dogecoind restarting, losing its peers or falling back into initial block download makes the
+  // source publish null. The 44 bytes already in coinb1 are inert, not harmful — they cannot make a
+  // Litecoin block less valid — and the tip they name may well still be dogecoind's when it returns.
+  // Spending a job to remove them would throw that away.
+  const reg = ltcRegistry()
+  const doge = auxBlock('doge-tip-a', 'doge-block-1')
+  reg.setAux(doge)
+  const job = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-a') })))
+
+  assert.equal(reg.setAux(null), null)
+  assert.equal(reg.aux, null, 'the registry still thinks it can merge')
+  assert.equal(reg.current?.id, job.id)
+  assert.equal(reg.current?.aux?.hashHex, doge.hashHex, 'the live job lost a commitment that may still pay')
+
+  // …and the NEXT job, built for a real Litecoin tip change, is the one that goes without.
+  const next = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-b') })))
+  assert.equal(next.aux, null)
+  assert.equal(next.cleanJobs, true)
+})
+
+test('a rebuilt job is a new id, and the one it displaced is answered as a live job', () => {
+  // Two jobs for one Litecoin template is the shape merged mining introduces, and #237's whole
+  // subject is what the registry says about an id afterwards. A rebuilt-past job was not retired,
+  // so it is not stale — it is simply still there.
+  const reg = ltcRegistry()
+  reg.setAux(auxBlock('doge-tip-a', 'doge-block-1'))
+  const first = reg.push(parseTemplate(fakeTemplateReply({ previousBlockHashHex: fakeHashHex('ltc-a') })))
+  const second = reg.setAux(auxBlock('doge-tip-b', 'doge-block-2'))
+
+  assert.notEqual(second?.id, first.id)
+  assert.equal(reg.get(first.id)?.id, first.id, 'a rebuild retired the job it displaced')
+  assert.equal(reg.remembered, 0, 'a rebuild retired something')
+  // `recall` is deliberately not asked here. It is only ever consulted after `get` has returned
+  // null — see its doc comment — and a live job is not a question.
 })
