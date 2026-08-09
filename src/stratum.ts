@@ -53,6 +53,7 @@ import { Session, type AcceptedShare, type FoundBlock } from './session.ts'
 import type { JobRegistry, Job } from './work.ts'
 import type { VardiffOptions } from './vardiff.ts'
 import type { RedeemedTicket } from './tickets.ts'
+import type { AddressVerdict } from './payoutaddress.ts'
 import type { PoolChainId, PowAlgorithm } from './chains.ts'
 
 /** Longest line accepted. A `mining.submit` is around 200 bytes; this is two orders of magnitude up. */
@@ -113,6 +114,15 @@ export interface StratumServerOptions {
   readonly vardiff: VardiffOptions
   /** Present only when an operator has configured identity; see `env.ts` and `index.ts`. */
   readonly browser?: BrowserTransportOptions | undefined
+  /**
+   * Ask the chain's node whether a raw TCP miner's username is an address it would pay to.
+   *
+   * Handed to every session and consulted by none of the browser ones — a session holding a
+   * `redeemTicket` never reads a username at all, so the branch in `session.ts` that calls this is
+   * unreachable there. Optional so that a `StratumServer` can still be constructed without a node,
+   * which is what most of `stratum.test.ts` does. micro-org#286.
+   */
+  readonly checkPayoutAddress?: ((address: string) => Promise<AddressVerdict>) | undefined
   readonly flushIntervalMs?: number
   /**
    * How long a connection may stay silent before it is closed. Defaults to `HANDSHAKE_TIMEOUT_MS`.
@@ -349,6 +359,11 @@ export class StratumServer {
         // Undefined on raw TCP, which is what keeps that path byte-for-byte what it was: a session
         // with no redeemer reads the username and ignores the password, exactly as before.
         redeemTicket: browser?.redeemTicket,
+        // And the mirror of it: the address check belongs to the username path, so it is passed to
+        // a browser session too and is simply never reached there. Written this way rather than
+        // conditionally, so that the ONE place deciding which identity a transport uses stays
+        // `session.ts` — a second copy of that decision here is how the two drift apart.
+        checkPayoutAddress: this.#options.checkPayoutAddress,
       }),
     }
     this.#connections.add(connection)

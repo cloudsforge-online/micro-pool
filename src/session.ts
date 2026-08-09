@@ -31,7 +31,8 @@ import { difficultyUnits } from './pplns.ts'
 import { notifyParams, type Job, type JobRegistry } from './work.ts'
 import { shareKey, validateShare, STRATUM_ERROR, type ShareResult } from './validate.ts'
 import { Vardiff, roundDifficulty, type VardiffOptions } from './vardiff.ts'
-import type { PoolChainId, PowAlgorithm } from './chains.ts'
+import { nameFor, type PoolChainId, type PowAlgorithm } from './chains.ts'
+import type { AddressVerdict } from './payoutaddress.ts'
 
 export interface OutgoingMessage {
   readonly id: number | string | null
@@ -90,6 +91,22 @@ export interface SessionDeps {
    * The function returns the account and worker labels. It does not take them.
    */
   readonly redeemTicket?: ((secret: string) => { account: string; worker: string } | null) | undefined
+  /**
+   * Ask the chain's own node whether a stratum username is an address it would pay to.
+   *
+   * **Consulted on the raw TCP path only**, which is the only path where the account is a string the
+   * miner chose. On the browser transport the account is a `cf-…` label this service minted for an
+   * estate user, it is not an address, and putting it to `validateaddress` would refuse every
+   * browser miner there has ever been. The structural guarantee is the same one that decides which
+   * field carries the identity: `redeemTicket` present means ticket, and the ticket path never
+   * reaches this.
+   *
+   * Absent means no check, which is what every existing test and every previously written caller
+   * gets. `AddressChecker` in `payoutaddress.ts` is the production implementation and its header
+   * carries the reasoning, including why an unreachable node is `'unavailable'` rather than a
+   * refusal. micro-org#286.
+   */
+  readonly checkPayoutAddress?: ((address: string) => Promise<AddressVerdict>) | undefined
 }
 
 /**
@@ -111,6 +128,26 @@ export const VERSION_ROLLING_MASK = 0x1fffe000
  */
 const SEEN_SHARE_LIMIT = 4_096
 
+/**
+ * Requests held while an authorisation is waiting on the node.
+ *
+ * `mining.authorize` became able to await an RPC in micro-org#286, and everything that arrives in
+ * that window has to go somewhere. Answering it immediately would be wrong — a `mining.submit` sent
+ * straight after an authorise would be told "authorize before submitting", which is a lie about a
+ * connection that did authorise — so it is queued and replayed in order.
+ *
+ * Bounded because the queue is filled by whoever is connecting. A client that pipelines is answered
+ * beyond this point rather than buffered; the limit is far above anything a real miner sends between
+ * an authorise and its reply, which is nothing.
+ */
+const PENDING_LIMIT = 32
+
+interface Incoming {
+  readonly id: number | string | null
+  readonly method: string
+  readonly params: readonly unknown[]
+}
+
 export class Session {
   readonly #deps: SessionDeps
   #subscribed = false
@@ -123,6 +160,8 @@ export class Session {
   readonly #seen = new Set<string>()
   #accepted = 0
   #rejected = 0
+  /** Non-null exactly while an address check is outstanding. See `PENDING_LIMIT`. */
+  #pending: Incoming[] | null = null
 
   constructor(deps: SessionDeps) {
     this.#deps = deps
@@ -160,7 +199,26 @@ export class Session {
    * unknown method is how a miner ends up waiting forever for a reply to something the pool decided
    * not to answer.
    */
-  handle(message: { id: number | string | null; method: string; params: readonly unknown[] }): void {
+  handle(message: Incoming): void {
+    if (this.#pending !== null) {
+      if (this.#pending.length >= PENDING_LIMIT) {
+        // Not silence and not a disconnect: the miner is told, with an id it can match, that this
+        // one was not processed. A connection that gets here is pipelining hard enough that
+        // something is wrong at its end, and it needs to see that rather than to wait.
+        this.#deps.send({
+          id: message.id,
+          result: null,
+          error: [STRATUM_ERROR.OTHER, 'too many requests while authorization is still in flight', null],
+        })
+        return
+      }
+      this.#pending.push(message)
+      return
+    }
+    this.#dispatch(message)
+  }
+
+  #dispatch(message: Incoming): void {
     switch (message.method) {
       case 'mining.configure':
         this.#configure(message.id, message.params)
@@ -247,6 +305,14 @@ export class Session {
    * The username splits on the first dot: `account.worker`. A username with no dot is an account
    * with a single unnamed worker.
    *
+   * ## The account half is then put to the node, which is what micro-org#286 added
+   *
+   * `parseWorkerName` decides what may be stored; it does not and cannot decide what may be paid.
+   * When `checkPayoutAddress` is configured the account is checked with the chain's own
+   * `validateaddress` before the miner is authorised — see `#authorizeCheckedAddress` below and the
+   * header of `payoutaddress.ts`. `parseWorkerName` itself is unchanged and still runs first, since
+   * a username the pool would refuse to store must not reach the node at all.
+   *
    * ## On the WebSocket transport it is the other way round, and that is not an inconsistency
    *
    * When `redeemTicket` is present — which is only ever on the browser transport — the password is
@@ -282,9 +348,89 @@ export class Session {
       })
       return
     }
-    this.#account = parsed.account
-    this.#worker = parsed.worker
-    this.#completeAuthorize(id)
+    const check = this.#deps.checkPayoutAddress
+    if (check === undefined) {
+      this.#account = parsed.account
+      this.#worker = parsed.worker
+      this.#completeAuthorize(id)
+      return
+    }
+    this.#authorizeCheckedAddress(id, parsed, check)
+  }
+
+  /**
+   * The raw TCP path with the node consulted about the payout address. micro-org#286.
+   *
+   * A stratum username on this transport IS a payout address — it is the only thing the pool knows
+   * about the miner and the only place a payment could go — and until now it was accepted on the
+   * strength of `parseWorkerName`, which is a check on what may be STORED and not on what may be
+   * PAID. This service already refuses to open its stratum port until the node has validated the
+   * pool's own payout address (`chainservice.ts`, `payoutScriptFor` in `template.ts`); asking the
+   * same node the same question about the miner's address is the missing half of that.
+   *
+   * Everything arriving while the node is being asked is queued rather than answered, because the
+   * one wrong answer available here is to tell a miner who did authorise that they did not.
+   */
+  #authorizeCheckedAddress(
+    id: number | string | null,
+    parsed: { account: string; worker: string },
+    check: (address: string) => Promise<AddressVerdict>,
+  ): void {
+    this.#pending = []
+    const settle = (verdict: AddressVerdict): void => {
+      if (verdict === 'invalid') {
+        this.#deps.send({
+          id,
+          result: false,
+          error: [
+            STRATUM_ERROR.UNAUTHORIZED,
+            // Says what is wrong AND what the field is for, because the commonest cause of this is
+            // a miner that has an address for a different chain in it, and the second commonest is
+            // a worker label typed where the address goes.
+            `${nameFor(this.#deps.chain)} does not recognise that payout address — the username must be` +
+              ' the address you want paid at, optionally followed by .worker',
+            null,
+          ],
+        })
+        this.#drain()
+        return
+      }
+      if (verdict === 'unavailable') {
+        // Fail open, and say so. `payoutaddress.ts` carries the argument; the short form is that the
+        // listener deliberately stays up while the node is away, so refusing here would disconnect
+        // every rig that reconnects during an operator's node problem, for a fault that is not the
+        // miner's — while letting them through costs a share row against an address that will be
+        // checked again on their next connection and cannot be paid before it is. The counter and
+        // the log line for it are raised by `AddressChecker` itself, which is the only place that
+        // knows the difference between a fresh unavailable answer and a cached one.
+      }
+      this.#account = parsed.account
+      this.#worker = parsed.worker
+      this.#completeAuthorize(id)
+      this.#drain()
+    }
+
+    void check(parsed.account).then(settle, () => {
+      // The checker does not throw — it returns a verdict for every outcome — but a dependency that
+      // rejects must not leave this connection queueing forever with no reply. Treated as the node
+      // being unreachable, which is the same posture for the same reason.
+      settle('unavailable')
+    })
+  }
+
+  /**
+   * Replay what arrived while an authorisation was outstanding, in the order it arrived.
+   *
+   * Re-entrant on purpose: a queued message can start a second authorisation, and the rest of the
+   * queue then has to go back behind it rather than being processed against a half-settled session.
+   */
+  #drain(): void {
+    const queued = this.#pending ?? []
+    this.#pending = null
+    // Back through the front door rather than straight to `#dispatch`, which is what makes this
+    // re-entrant for free: if a replayed message starts a second authorisation, `handle` sees the
+    // queue re-opened and puts the remainder behind it, exactly as it would for a live one.
+    for (const message of queued) this.handle(message)
   }
 
   /**

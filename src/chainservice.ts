@@ -43,6 +43,7 @@ import { NodeRpc, NodeUnavailableError } from './rpc.ts'
 import { StratumServer, type Wire } from './stratum.ts'
 import { browserInitialDifficulty, browserVardiff, DEFAULT_VARDIFF, type VardiffOptions } from './vardiff.ts'
 import { assertNodeNetwork, payoutScriptFor, TemplateSource, type BlockTemplate } from './template.ts'
+import { AddressChecker } from './payoutaddress.ts'
 import { submitFoundBlock } from './blocks.ts'
 import { insertShares, upsertWorker, type Exec } from './store.ts'
 import { algorithmFor, nameFor } from './chains.ts'
@@ -143,6 +144,15 @@ export function registerPoolMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['chain', 'result'],
     })
+    .register({
+      // Three verdicts, not two, because `unavailable` is the one an operator has to be able to see:
+      // it is the count of miners this pool authorised WITHOUT checking their payout address, which
+      // is a deliberate fail-open and not a thing that should happen quietly. See `payoutaddress.ts`.
+      name: 'pool_address_checks_total',
+      help: 'Miner payout addresses put to the node at mining.authorize, by verdict',
+      kind: 'counter',
+      labels: ['chain', 'verdict'],
+    })
     .register({ name: 'pool_connections', help: 'Live stratum connections', kind: 'gauge', labels: ['chain'] })
     .register({ name: 'pool_template_height', help: 'Height of the current template', kind: 'gauge', labels: ['chain'] })
     .register({
@@ -186,6 +196,7 @@ export class ChainService {
   readonly #registry: JobRegistry
   readonly #stratum: StratumServer
   readonly #source: TemplateSource
+  readonly #addresses: AddressChecker
   readonly #vardiff: VardiffOptions
   readonly #logger: Logger
   #loop: Promise<void> | null = null
@@ -215,6 +226,22 @@ export class ChainService {
     const redeemTicket = deps.redeemTicket
     const perDifficulty = hashesPerDifficulty(algorithmFor(chain))
 
+    // The same node, and the same question, that `#bringUp` already puts about the POOL'S own payout
+    // address before it will open the stratum port. micro-org#286: the pool checked its own address
+    // and not the miner's, and a miner's stratum username is the only address a payment could ever
+    // go to. `payoutaddress.ts` holds the caching and the fail-open reasoning.
+    this.#addresses = new AddressChecker({
+      rpc: this.#rpc,
+      onVerdict: (verdict, address, detail) => {
+        deps.metrics.increment('pool_address_checks_total', { chain, verdict })
+        if (verdict === 'invalid') {
+          this.#logger.info('refused a miner whose payout address the node does not recognise', { address })
+        } else if (verdict === 'unavailable') {
+          this.#logger.warn('authorising a miner without checking their payout address', { address, detail })
+        }
+      },
+    })
+
     this.#stratum = new StratumServer({
       chain,
       algorithm: algorithmFor(chain),
@@ -223,6 +250,7 @@ export class ChainService {
       port: deps.config.stratumPort,
       initialDifficulty: deps.config.initialDifficulty,
       vardiff: this.#vardiff,
+      checkPayoutAddress: (address) => this.#addresses.check(address),
       browser:
         redeemTicket === undefined
           ? undefined
