@@ -136,6 +136,15 @@ async function withServer(
     sql?: Exec
     beforeScrape?: ServerDeps['beforeScrape']
     browserMining?: ServerDeps['browserMining']
+    /**
+     * What `index.ts` derives from `CUSTODY_BACKING_CLOSED` and the payout configuration.
+     *
+     * Overridable here and nowhere in production, for the reason `LedgerPayoutSinkDeps` gives about
+     * the interlock: the true branch has to be reachable from a test or nothing checks that the two
+     * routes read the dependency instead of writing their own answer. Defaults to `false`, which is
+     * what the composition root passes on every deployment that exists.
+     */
+    payoutsImplemented?: boolean
   },
   fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
@@ -150,6 +159,7 @@ async function withServer(
     logger,
     metrics,
     sql: options.sql ?? stubSql(options.rows ?? []),
+    payoutsImplemented: options.payoutsImplemented ?? false,
     snapshot: () => options.snapshot ?? snapshot(),
     ...(options.beforeScrape ? { beforeScrape: options.beforeScrape } : {}),
     ...(options.browserMining ? { browserMining: options.browserMining } : {}),
@@ -300,8 +310,8 @@ test('the pool summary carries the whole shape the console is written against', 
       'payoutsImplemented',
       'pplnsWindowMultiplier',
     ])
-    // Named, not implied, and a literal in the handler. Every sentence on micro-pool-web that says
-    // nothing settles branches on this field rather than on its own markup.
+    // Named, not implied. Every sentence on micro-pool-web that says nothing settles branches on
+    // this field rather than on its own markup.
     assert.equal(body['payoutsImplemented'], false)
 
     const chain = (body['chains'] as Record<string, unknown>[])[0] as Record<string, unknown>
@@ -333,6 +343,25 @@ test('the pool summary carries the whole shape the console is written against', 
     assert.equal(chain['windowSeconds'], 600)
     assert.equal(chain['sharesInWindow'], 0)
     assert.equal(chain['hashrateEstimate'], 0)
+  })
+})
+
+test('BOTH ROUTES REPORT WHETHER THIS POOL PAYS, RATHER THAN ASSERTING THAT IT DOES NOT', async () => {
+  // micro-org#302 step 4. `payoutsImplemented` was a hard-coded `false` at four sites — these two
+  // routes and two boot lines — so the day the interlock opened, four separate edits stood between
+  // a pool that pays and a pool that says so. Worse in the other direction: nothing stopped one of
+  // the four being changed alone, and the one clients read is the one that would have lied.
+  //
+  // Flipping the dependency is the only way to observe that the handlers read it. The value is
+  // false in production and stays false — `payoutsImplemented()` in `payouts.ts` ANDs
+  // `CUSTODY_BACKING_CLOSED`, which is a source constant — so this drives the branch that a
+  // deployment cannot yet reach, exactly as `payouts.test.ts` drives the sink's.
+  await withServer({ payoutsImplemented: true }, async (h) => {
+    const summary = (await (await fetch(`${h.url}/v1/pool`)).json()) as Record<string, unknown>
+    assert.equal(summary['payoutsImplemented'], true, '/v1/pool writes its own answer')
+
+    const blocks = (await (await fetch(`${h.url}/v1/pool/blocks`)).json()) as Record<string, unknown>
+    assert.equal(blocks['payoutsImplemented'], true, '/v1/pool/blocks writes its own answer')
   })
 })
 
@@ -597,8 +626,8 @@ test('A REWARD CROSSES THE WIRE AS A STRING, BECAUSE JSON HAS NO INTEGER WIDE EN
     assert.equal(body.chain, 'ltc')
     assert.equal(body.asset, 'LTC')
     assert.equal(body.decimals, 8)
-    // The second place this literal appears in `server.ts`, and the one a block list makes most
-    // tempting to drop — a page showing found blocks is exactly where a reader infers a payment.
+    // The second place this reaches a client, and the one a block list makes most tempting to drop
+    // — a page showing found blocks is exactly where a reader infers a payment.
     assert.equal(body.payoutsImplemented, false)
 
     assert.deepEqual(Object.keys(body.blocks[0] ?? {}).sort(), [

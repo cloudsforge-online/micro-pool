@@ -232,8 +232,14 @@ export class PayoutsNotImplementedError extends Error {
  *      opening balance is booked into the ledger in the same operation that registers it — the
  *      `treasury.ts` shape, not two steps that can be interrupted between.
  *   2. `INDEXER_CUSTODY_LABEL_PREFIXES` includes `pool:` on the estate.
- *   3. The `pool` service holds `indexer:write` and `ledger:post` grants. As of 2026-08-09 it holds
- *      no service-token grants at all.
+ *   3. The `pool` service holds `indexer:write` and `ledger:post` grants. **Half done.** Re-read on
+ *      2026-08-10 against the running `identity` container rather than a compose file, its
+ *      `IDENTITY_SERVICE_TOKEN_GRANTS` now contains `"pool":["ledger:post"]` — that half arrived
+ *      with `LEDGER_SCOPES` in `ledgerclient.ts`, which `deploy/scripts/derive-grants.mjs --write`
+ *      reads. `indexer:write` is still absent and CANNOT be derived, because deriving a grant means
+ *      finding an exported `<NAME>_SCOPES` beside a token-bearing `HttpClient`, and this repository
+ *      has no indexer client to hang one off. Granting it before there is a caller would be handing
+ *      out a privilege nothing exercises, which is the wrong order.
  *   4. The registration supplies a history claim the indexer's walked record can actually honour.
  *      This one was added on 2026-08-09 after a second reading, because the first three are
  *      necessary and NOT sufficient on Litecoin, and the miss fails in a different direction than
@@ -263,6 +269,41 @@ export class PayoutsNotImplementedError extends Error {
  * rather than in a ticket. Somebody switching payouts on has to read this first.
  */
 export const CUSTODY_BACKING_CLOSED = false
+
+/**
+ * **Can this process pay anybody?** The one answer, computed once, published everywhere.
+ *
+ * This is the field `payoutsImplemented` on `GET /v1/pool` and `GET /v1/pool/blocks`, and the field
+ * of the same name in the `starting` and `payouts` boot lines. Until 2026-08-10 it was a hard-coded
+ * `false` at each of those four sites, which was true and was the wrong shape for two reasons:
+ *
+ *   - **A literal can disagree with the service it describes.** The boot line already computed
+ *     `enabled: CUSTODY_BACKING_CLOSED && payoutChains.length > 0` while the wire field beside it
+ *     said `false` unconditionally. Two statements of one fact, free to drift, and the one clients
+ *     read was the one nothing checked.
+ *   - **It made turning payouts on a four-site edit.** micro-org#302 step 4 is "flip
+ *     `payoutsImplemented` to true only when all three are in and a payout has actually settled" —
+ *     and a step written as "change these four literals and do not miss one" is a step whose failure
+ *     mode is a pool that tells `micro-pool-web` it settles while its own sink refuses every claim.
+ *     Derived, the flip happens as a consequence of the gates opening and cannot be performed by
+ *     itself.
+ *
+ * The conjunction is exactly the two gates this file documents, and neither is redundant:
+ *
+ *   - `CUSTODY_BACKING_CLOSED` — the estate's books can absorb what a credit writes. A code change
+ *     somebody reviews, never an environment variable.
+ *   - `payoutsConfigured` — an operator set `POOL_<CHAIN>_MINIMUM_PAYOUT` and the ledger block, so
+ *     `index.ts` built a sink at all. `env.payouts` is non-null only when at least one minimum
+ *     parsed (`env.ts` refuses the half-configured cases), so the caller passes `env.payouts !== null`
+ *     and there is no third thing to check.
+ *
+ * It stays FALSE on every deployment that exists today, because the first term is false. Nothing
+ * about this function opens the interlock; it removes the possibility of claiming otherwise by
+ * accident.
+ */
+export function payoutsImplemented(payoutsConfigured: boolean): boolean {
+  return CUSTODY_BACKING_CLOSED && payoutsConfigured
+}
 
 /**
  * A claim reached the sink while `CUSTODY_BACKING_CLOSED` is false, or the claim named a miner the

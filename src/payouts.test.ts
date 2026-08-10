@@ -40,6 +40,7 @@ import {
   LedgerPayoutSink,
   PayoutRefusedError,
   PayoutsNotImplementedError,
+  payoutsImplemented,
   poolPayoutCreditKey,
   type LedgerPayoutSinkDeps,
   type PayoutClaim,
@@ -129,7 +130,16 @@ test('THE MODULE GAINED AN IMPLEMENTATION, AND EVERY WAY OF REACHING IT IS STILL
   const runtimeExports = Object.keys(module).filter((name) => typeof module[name] === 'function')
   assert.deepEqual(
     runtimeExports.sort(),
-    ['LedgerPayoutSink', 'PayoutRefusedError', 'PayoutsNotImplementedError', 'poolPayoutCreditKey'],
+    [
+      'LedgerPayoutSink',
+      'PayoutRefusedError',
+      'PayoutsNotImplementedError',
+      // Added 2026-08-10 and pure: it reads the interlock and answers a question, it moves nothing.
+      // It is on this list rather than exempted from it because that is what the list is for — the
+      // next person to add a name here has to explain it in the same place.
+      'payoutsImplemented',
+      'poolPayoutCreditKey',
+    ],
     'payouts.ts gained a runtime export: if it credits anything, the README and PR must stop saying it does not',
   )
 
@@ -204,6 +214,39 @@ test('THE COMPOSITION ROOT PASSES THE INTERLOCK CONSTANT, NOT A LITERAL', () => 
   assert.ok(
     !/custodyBackingConfirmed:\s*true/.test(root),
     'index.ts hard-codes the interlock open; read CUSTODY_BACKING_CLOSED before shipping that',
+  )
+})
+
+test('WHAT A CLIENT IS TOLD ABOUT PAYOUTS IS DERIVED FROM THE TWO GATES, NOT WRITTEN DOWN', () => {
+  // micro-org#302 step 4 is "flip `payoutsImplemented` to true only when all three are in and a
+  // payout has actually settled". Written as four literals — two routes and two boot lines — that
+  // step's failure mode is doing three of the four, and the one clients read is the one nothing
+  // checks. Derived, the flip is a consequence of the gates opening and cannot be performed alone.
+  //
+  // Both terms are asserted because neither is redundant: a configured deployment with the interlock
+  // shut must not claim to pay, and an open interlock on a deployment nobody configured has no sink
+  // to pay from.
+  assert.equal(payoutsImplemented(true), CUSTODY_BACKING_CLOSED)
+  assert.equal(payoutsImplemented(false), false, 'no payout configuration, so nothing can settle')
+
+  // And the value that actually ships. This line is a tripwire rather than a tautology: it fails the
+  // day somebody opens the interlock, which is precisely when a human should be reading this file.
+  assert.equal(payoutsImplemented(true), false, 'CUSTODY_BACKING_CLOSED is open — read payouts.ts')
+})
+
+test('THE COMPOSITION ROOT DERIVES THE WIRE FIELD RATHER THAN TYPING IT', () => {
+  // The counterpart to the interlock check above, for the same reason and read the same way: the
+  // value that matters is the one written at the single call site, and no runtime assertion here
+  // can observe that file's wiring.
+  const root = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+  assert.match(
+    root,
+    /const payoutsAreImplemented = payoutsImplemented\(env\.payouts !== null\)/,
+    'index.ts no longer derives the payout claim from the interlock and the configuration',
+  )
+  assert.ok(
+    !/payoutsImplemented:\s*(true|false)\b/.test(root),
+    'index.ts writes a literal payout claim somewhere; it must publish the derived value',
   )
 })
 

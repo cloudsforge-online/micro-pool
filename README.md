@@ -466,6 +466,12 @@ roughly how much rarer an aux block is for the same hashing. There is deliberate
 built against this API cannot accidentally imply a payment that will not arrive. **It appears here
 and on `/v1/pool/blocks`, and nowhere else** — in particular it is not part of the ticket reply.
 
+It is **derived, not written**: `payoutsImplemented()` in `src/payouts.ts` ANDs the
+`CUSTODY_BACKING_CLOSED` interlock with whether an operator configured a payout minimum at all, and
+`src/index.ts` computes it once and hands it to both routes and both boot lines. Until 2026-08-10 it
+was a hard-coded `false` at all four sites, which was accurate and free to drift — the field a client
+reads is the one that must not be able to disagree with the sink that refuses every claim.
+
 ### `GET /v1/pool/blocks?chain=<chain>&limit=<n>`
 
 Blocks this pool found, newest first. `limit` defaults to 50 and is clamped at 200. `chain` may be

@@ -60,9 +60,12 @@
  *     it does it by punishing miners for it.
  *
  *   - **What failing open costs.** A share row credited to an account whose address was not checked
- *     this time. Measured 2026-08-09: `payoutsImplemented` is `false` in `server.ts` and there is no
- *     payout path in this repository at all, so such a row is not money going anywhere — it is a
- *     record that will be checked against a real address before it can ever be paid. And the verdict
+ *     this time. Re-measured 2026-08-10: there IS a payout path in this repository now
+ *     (`LedgerPayoutSink`), and it is inert — `payoutsImplemented` is derived by `payouts.ts` from
+ *     the `CUSTODY_BACKING_CLOSED` interlock and the payout configuration, and both terms are false
+ *     on every deployment, so the wire field is `false` and the sink refuses every claim before it
+ *     reads the database. Such a row is therefore not money going anywhere — it is a record that
+ *     will be checked against a real address before it can ever be paid. And the verdict
  *     is NOT cached, so the same address is asked about again on the miner's next connection and on
  *     every connection after it; the window is one connection wide, not permanent.
  *
