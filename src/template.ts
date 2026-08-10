@@ -31,12 +31,48 @@
  * makes every outstanding job worthless". That latency is the whole game: a share submitted against
  * a job built on the previous tip is work the miner did for nothing, and the pool's only lever on
  * how much of that happens is how fast it notices.
+ *
+ * ## ABANDONING A LONGPOLL COSTS THE NODE A THREAD, AND THAT IS WHAT micro-org#307 WAS
+ *
+ * Read the paragraph above again and note what it does not say: how the node behaves when the CLIENT
+ * gives up first. It keeps waiting. Core serves `getblocktemplate` on an RPC worker thread and, when
+ * the request carries a `longpollid`, that thread blocks on a condition variable until the tip
+ * changes. Closing the socket does not wake it — Core never checks. So a client-side deadline does
+ * not cancel a longpoll; it strands a worker thread on the node until the next block, and issuing a
+ * fresh longpoll immediately afterwards strands another.
+ *
+ * That is not a theoretical concern, it is a measured production incident. On the estate's litecoind,
+ * `getrpcinfo` sampled three times twenty seconds apart on 2026-08-11 showed FIVE concurrent
+ * `getblocktemplate` calls whose durations only ever grew, a new one appearing every 75.7 seconds
+ * (deltas 75.7, 75.8, 75.4, 75.7 — the 60 s deadline below plus one backoff plus a plain re-fetch).
+ * litecoind runs `rpcthreads=8`, so eight of those exhaust every worker it has and the node begins
+ * refusing everyone. The indexer logged `getblockcount: all 1 provider(s) failed — last: timeout`
+ * from 23:25:27 to 23:25:58 and recovered at 23:26:31 — the exact second block 3157732 landed and
+ * released the stranded threads. The gap that starved it was 599 s; 8 threads at one per 75.7 s
+ * predicts 606 s. micro-org#307's earlier "work queue depth exceeded" storm is the same mechanism
+ * against the then-default `rpcthreads=4`, which starves in half the time.
+ *
+ * The collateral damage is not the pool's. It is every other consumer of that node: deposit
+ * observation in micro-indexer and withdrawal broadcast in micro-settlement, on the one chain this
+ * estate moves money on.
+ *
+ * **Why the deadline fires at all**, given Core is documented to return a longpoll within about a
+ * minute: that escape is `mempool.GetTransactionsUpdated()` changing, and these nodes run
+ * `blocksonly=1`. The mempool is permanently empty — measured, `getmempoolinfo.size` is 0 — so the
+ * only thing that can end a longpoll is a new block, and LTC aims for one every 150 s. A 60 s
+ * deadline against a 150 s target does not occasionally time out. It nearly always does.
+ *
+ * **The response, therefore, is to stop asking rather than to ask again.** A longpoll that times out
+ * suspends longpolling until the tip actually moves; the loop falls back to plain polling, which
+ * answers immediately and holds no thread. At most one stranded thread can exist at a time, instead
+ * of one per cycle without limit. The deadline is also raised well past a normal block interval, so
+ * that on a healthy chain the longpoll returns on its own and the fallback stays unused.
  */
 
 import { hashFromDisplay } from './bytes.ts'
 import { hogExIndexOf } from './mweb.ts'
 import { targetFromCompactBits } from './pow.ts'
-import { NodeRpcError, NodeUnavailableError, type NodeRpc } from './rpc.ts'
+import { NODE_TIMEOUT_REASON, NodeRpcError, NodeUnavailableError, type NodeRpc } from './rpc.ts'
 import { EXPECTED_NODE_CHAIN, poolChain, type PoolChainId } from './chains.ts'
 import type { Network } from '@cloudsforge/contracts-chain'
 
@@ -259,6 +295,14 @@ export interface TemplateSourceOptions {
   /** How often to ask when longpoll is unavailable, and the ceiling on a longpoll wait. */
   readonly pollIntervalMs?: number
   readonly longPollTimeoutMs?: number
+  /**
+   * Test seam only. Production leaves this alone and lets `#longPollSuspended` do its work.
+   *
+   * The suite needs to assert BOTH halves of the strand-avoidance rule — that a timeout suspends
+   * longpolling, and that a moved tip resumes it — and asserting the second half means observing the
+   * flag rather than inferring it from a call sequence three fetches later.
+   */
+  readonly onLongPollSuspended?: (suspended: boolean) => void
   readonly onTemplate: (template: BlockTemplate) => void
   readonly onError: (err: unknown) => void
   readonly signal: AbortSignal
@@ -278,10 +322,28 @@ export interface TemplateSourceOptions {
  */
 export const TEMPLATE_STALE_AFTER_MS = 120_000
 
+/**
+ * The ceiling on how long the node may hold a longpoll before this client gives up on it.
+ *
+ * Comfortably past a Litecoin block interval (150 s) and a Bitcoin one is longer still, but the
+ * number is not chosen to cover every gap — the fallback below handles the ones it does not. It is
+ * chosen so that on a chain producing blocks at its target rate the longpoll RETURNS, which is the
+ * state in which no thread is ever stranded and the latency the longpoll exists for is actually
+ * collected. The previous value was 60 s, which is shorter than the interval it was waiting for.
+ */
+export const DEFAULT_LONG_POLL_TIMEOUT_MS = 240_000
+
 export class TemplateSource {
   readonly chain: PoolChainId
   #current: BlockTemplate | null = null
   #running = false
+  /**
+   * Set when a longpoll timed out, cleared when the tip moves. While set, the loop asks plainly.
+   *
+   * The stranded thread the timeout just cost the node is not recoverable from here — but the SECOND
+   * one is, and the eighth is the one that takes the node down for everybody else.
+   */
+  #longPollSuspended = false
   readonly #options: TemplateSourceOptions
   readonly #pollIntervalMs: number
   readonly #longPollTimeoutMs: number
@@ -292,9 +354,20 @@ export class TemplateSource {
     this.chain = options.chain
     this.#options = options
     this.#pollIntervalMs = options.pollIntervalMs ?? 10_000
-    this.#longPollTimeoutMs = options.longPollTimeoutMs ?? 60_000
+    this.#longPollTimeoutMs = options.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS
     this.#now = options.now ?? (() => Date.now())
     this.#sleep = options.sleep ?? defaultSleep
+  }
+
+  /** Whether the loop is currently declining to longpoll. Read by the suite and by nothing else. */
+  get longPollSuspended(): boolean {
+    return this.#longPollSuspended
+  }
+
+  #setLongPollSuspended(suspended: boolean): void {
+    if (this.#longPollSuspended === suspended) return
+    this.#longPollSuspended = suspended
+    this.#options.onLongPollSuspended?.(suspended)
   }
 
   get current(): BlockTemplate | null {
@@ -330,6 +403,15 @@ export class TemplateSource {
     // block is worth more, and the miners should be working on the better one.
     const previous = this.#current
     this.#current = template
+
+    // A moved tip is the ONE event that releases whatever thread a timed-out longpoll stranded on
+    // the node, so it is also the only honest moment to start trusting longpoll again. Resuming on
+    // anything weaker — a timer, a successful plain fetch — would resume while the node is still
+    // holding the previous request and start stacking them up a second time.
+    if (previous && previous.previousBlockHashHex !== template.previousBlockHashHex) {
+      this.#setLongPollSuspended(false)
+    }
+
     if (
       !previous ||
       previous.previousBlockHashHex !== template.previousBlockHashHex ||
@@ -360,19 +442,36 @@ export class TemplateSource {
     let consecutiveFailures = 0
 
     while (!signal.aborted) {
+      // Suspended means ask plainly, and a plain ask is the whole remedy: it answers at once and
+      // occupies no worker thread on the node while it waits, because it does not wait.
+      const longPollId = this.#longPollSuspended ? null : (this.#current?.longPollId ?? null)
       try {
-        const before = this.#current
-        const template = await this.fetchOnce(before?.longPollId ?? null)
+        const template = await this.fetchOnce(longPollId)
         consecutiveFailures = 0
         // With longpoll the node has already waited for us, so going straight back is correct: the
         // wait happens inside the call. Without it, sleep the poll interval.
-        if (template.longPollId === null) await this.#sleep(this.#pollIntervalMs, signal)
+        if (template.longPollId === null || this.#longPollSuspended) {
+          await this.#sleep(this.#pollIntervalMs, signal)
+        }
       } catch (err) {
         if (signal.aborted) break
         // An aborted longpoll on shutdown is not a failure, and neither is the node answering that
         // the longpoll id it was given has expired — that is the protocol working.
         this.#options.onError(err)
         consecutiveFailures += 1
+
+        // The deadline elapsing on a request the node was ASKED to hold is not the node failing. It
+        // is this client walking away from a thread the node is still holding for it, and going
+        // straight back for another is what turns one stranded thread into all of them. Stop
+        // longpolling until a block proves the node let go.
+        if (
+          longPollId !== null &&
+          err instanceof NodeUnavailableError &&
+          err.reason === NODE_TIMEOUT_REASON
+        ) {
+          this.#setLongPollSuspended(true)
+        }
+
         if (err instanceof NodeRpcError || err instanceof NodeUnavailableError) {
           // Drop the longpoll id: it may be the thing the node is objecting to, and a plain fetch
           // is the way back to a known-good state.
