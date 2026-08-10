@@ -79,6 +79,19 @@ export interface ServerDeps {
   /** The live state of every configured chain. Read, never cached — it changes every template. */
   readonly snapshot: () => PoolSnapshot
   /**
+   * Whether this deployment can pay anybody, as `payoutsImplemented` in `payouts.ts` derived it.
+   *
+   * A dependency and not a literal in the two handlers that publish it. Until 2026-08-10 both wrote
+   * `false` inline, which was accurate and unfalsifiable: nothing connected the sentence a client
+   * reads to the interlock and the configuration that decide it, so the day either changed the wire
+   * would have kept saying whatever was typed. `index.ts` passes
+   * `payoutsImplemented(env.payouts !== null)` and has nothing else to pass.
+   *
+   * Not part of `PoolSnapshot`, because a snapshot is what changes every template and this does not
+   * change at all after boot.
+   */
+  readonly payoutsImplemented: boolean
+  /**
    * Refresh sampled gauges immediately before `/metrics` renders.
    *
    * Connection counts and template age are values that must be read, not counted, and reading them
@@ -257,10 +270,16 @@ function buildRoutes(): Route[] {
       /**
        * What this pool is and what it is currently doing. The front page of 36 §5.4.
        *
-       * `payoutsImplemented: false` is in the response body rather than only in the README, because
-       * a `micro-pool-web` written against this API would otherwise have to know from documentation
+       * `payoutsImplemented` is in the response body rather than only in the README, because a
+       * `micro-pool-web` written against this API would otherwise have to know from documentation
        * that the number it is about to show is not a balance. Making it a field means the UI can be
        * built now and cannot accidentally imply a payment that will not arrive.
+       *
+       * It is `false` on every deployment that exists, and it is DERIVED rather than written down:
+       * `deps.payoutsImplemented` comes from `payoutsImplemented()` in `payouts.ts`, which ANDs the
+       * `CUSTODY_BACKING_CLOSED` interlock with whether an operator configured a payout minimum at
+       * all. A literal here would have been a promise this file could make without the sink's
+       * agreement, and micro-org#302 asked for the flip to be one act rather than four.
        *
        * ## `stratumEndpoint` is null far more often than it is not, and null is an answer
        *
@@ -341,8 +360,8 @@ function buildRoutes(): Route[] {
             network: snapshot.network,
             feeBasisPoints: snapshot.feeBasisPoints,
             pplnsWindowMultiplier: snapshot.pplnsMultiplier,
-            // Named, not implied. See `payouts.ts`.
-            payoutsImplemented: false,
+            // Named, not implied, and derived rather than typed. See `payouts.ts`.
+            payoutsImplemented: deps.payoutsImplemented,
             chains,
           },
         }
@@ -436,7 +455,9 @@ function buildRoutes(): Route[] {
             chain,
             asset: minedAssetFor(chain),
             decimals: minedDecimalsFor(chain),
-            payoutsImplemented: false,
+            // The second place this reaches a client, and the one a block list makes most tempting
+            // to drop: a page showing found blocks is exactly where a reader infers a payment.
+            payoutsImplemented: deps.payoutsImplemented,
             blocks: blocks.map((block) => ({
               height: block.height,
               hash: block.hash,

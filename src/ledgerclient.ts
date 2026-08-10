@@ -50,10 +50,15 @@ import type {
  * that could read balances would eventually be asked to show one, and the honest answer to "what am
  * I owed" is a question for the wallet, which is where a user's balance is already presented.
  *
- * **As of 2026-08-09 the `pool` service holds no service-token grants at all** — checked against the
- * running estate, not against a compose file — so nothing here can call the ledger even if it were
- * switched on. That is a fact about the estate rather than about this code, and `payouts.ts` records
- * why it must stay that way until the reconciliation gap it describes is closed.
+ * **The estate now grants it.** Read on 2026-08-10 from the running `identity` container's
+ * `IDENTITY_SERVICE_TOKEN_GRANTS` rather than from a compose file, the map contains
+ * `"pool":["ledger:post"]` — derived from this very constant by `deploy/scripts/derive-grants.mjs
+ * --write`, which is the point of exporting it. An earlier version of this paragraph said the pool
+ * held no grants at all; that was true on 2026-08-09 and stopped being true when the derivation was
+ * regenerated, which is the hazard of writing a fact about another system down.
+ *
+ * A grant is still not a payout. `CUSTODY_BACKING_CLOSED` in `payouts.ts` refuses every claim before
+ * a token is ever fetched, and it is the gate that has not moved.
  */
 export const LEDGER_SCOPES: readonly string[] = Object.freeze(['ledger:post'])
 

@@ -36,7 +36,7 @@ import { attachStratumWebSocket } from './wsstratum.ts'
 import { TicketStore } from './tickets.ts'
 import { ChainService, registerPoolMetrics } from './chainservice.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
-import { CUSTODY_BACKING_CLOSED, LedgerPayoutSink } from './payouts.ts'
+import { CUSTODY_BACKING_CLOSED, LedgerPayoutSink, payoutsImplemented } from './payouts.ts'
 import { httpLedgerClient, LEDGER_SCOPES } from './ledgerclient.ts'
 import type { MinedChainId } from './chains.ts'
 import type { Exec } from './store.ts'
@@ -45,6 +45,13 @@ import type { Exec } from './store.ts'
 //    structured line naming it. Nothing below may run first, because every step after this reads
 //    configuration and a half-built service that then exits is harder to diagnose than one that
 //    never started.
+
+// 1b. Can this process pay anybody? Answered once, here, and read by the four places that publish
+//     it — the two boot lines below and the two routes in `server.ts`. It was a hard-coded `false`
+//     at each of those sites until 2026-08-10, which is a fact about this service stated four times
+//     and checked nowhere; `payoutsImplemented` in `payouts.ts` carries the argument. Computed
+//     before telemetry because the very first log line reports it, and it needs nothing but `env`.
+const payoutsAreImplemented = payoutsImplemented(env.payouts !== null)
 
 // 2. Telemetry, before anything that can fail, so a boot failure is a structured, searchable,
 //    redacted line rather than a bare V8 stack the collector drops.
@@ -62,8 +69,9 @@ logger.info('starting', {
   chains: env.chains.map((chain) => chain.chain),
   feeBasisPoints: env.feeBasisPoints,
   // Stated at boot, every boot. An operator reading the first ten lines of a log must not be able
-  // to come away believing this service pays anybody. See `payouts.ts`.
-  payoutsImplemented: false,
+  // to come away believing this service pays anybody. Derived rather than written, so it cannot say
+  // one thing here and another on the wire. See `payouts.ts`.
+  payoutsImplemented: payoutsAreImplemented,
 })
 
 // 3. The database pool. Opened before the schema assertion for the obvious reason that the
@@ -191,8 +199,12 @@ logger.info('payouts', {
   // Both facts, every boot, because they are different and an operator who confused them would be
   // wrong in the expensive direction. `configured` says somebody set the variables. `enabled` says
   // money can actually move, and it is false in this release no matter what anybody configures.
+  //
+  // `enabled` is the SAME value the wire field `payoutsImplemented` carries and is deliberately not
+  // recomputed here: the expression used to be spelled out at this one site while four other places
+  // wrote a literal, and one statement of a fact is the whole change.
   configured: payoutChains,
-  enabled: CUSTODY_BACKING_CLOSED && payoutChains.length > 0,
+  enabled: payoutsAreImplemented,
 })
 
 // 6b. The chains. One `ChainService` each, constructed now and started below — construction is pure
@@ -259,6 +271,10 @@ const server = createServer({
   logger,
   metrics,
   sql: sql as unknown as Exec,
+  // A constant for the lifetime of the process, so it is a dependency rather than part of
+  // `snapshot()` — the snapshot is the live chain state and is re-read on every request precisely
+  // because it changes every template. Whether this deployment can pay anybody does not.
+  payoutsImplemented: payoutsAreImplemented,
   snapshot: () => ({
     network: env.network,
     feeBasisPoints: env.feeBasisPoints,

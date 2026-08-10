@@ -707,8 +707,9 @@ test('A NODE THAT CANNOT BE ASKED LETS THE MINER THROUGH — FAILING OPEN, ON PU
   // node is away by design; refusing here would disconnect every rig that reconnects during an
   // operator's node problem, for a fault that is not the miner's, and each would then retry at once.
   // Letting them through costs a share row against an address that is re-checked on their next
-  // connection and that cannot be paid before it is checked — measured 2026-08-09,
-  // `payoutsImplemented` is false and there is no payout path in this repository at all.
+  // connection and that cannot be paid before it is checked — re-measured 2026-08-10, the payout
+  // path exists and is inert: `payoutsImplemented` is derived from `CUSTODY_BACKING_CLOSED` and the
+  // payout configuration, and both terms are false on every deployment.
   const checker = addressCheck({ bc1qexampleaddress: 'unavailable' })
   const h = harness({ checkPayoutAddress: checker.check })
   h.pushTemplate()
