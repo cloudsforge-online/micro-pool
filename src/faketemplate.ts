@@ -22,7 +22,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { HttpError, type HttpClient, type RequestOptions } from '@cloudsforge/http'
+import { HttpError, TimeoutError, type HttpClient, type RequestOptions } from '@cloudsforge/http'
 import { NodeRpc } from './rpc.ts'
 import type { PoolChainId } from './chains.ts'
 
@@ -158,6 +158,19 @@ export interface FakeNodeOptions {
   readonly addressValid?: boolean
   /** Methods that should raise a JSON-RPC error instead of answering, and the code to raise. */
   readonly faults?: Readonly<Record<string, { code: number; message: string }>>
+  /**
+   * Fail a `getblocktemplate` that carries a `longpollid`, while a plain one still answers.
+   *
+   * `'timeout'` is the production shape of micro-org#307, not a convenience: a node running
+   * `blocksonly=1` has a permanently empty mempool, so the only thing that can end a longpoll is a
+   * new block. Between blocks the longpoll never returns and the client's deadline is what fires —
+   * while plain fetches against the same node answer instantly throughout.
+   *
+   * `'unreachable'` is the control. It is the same class of error to the caller — a
+   * `NodeUnavailableError` off a longpoll — and it must NOT provoke the same response, because a
+   * request that never reached the node stranded nothing there to wait for.
+   */
+  readonly longPollFails?: 'timeout' | 'unreachable'
 }
 
 export interface FakeNode {
@@ -205,8 +218,21 @@ export function fakeNode(options: FakeNodeOptions = {}): FakeNode {
       }
 
       switch (method) {
-        case 'getblocktemplate':
+        case 'getblocktemplate': {
+          const request = (params[0] ?? {}) as { longpollid?: unknown }
+          if (options.longPollFails !== undefined && typeof request.longpollid === 'string') {
+            if (options.longPollFails === 'timeout') throw new TimeoutError('http://node.invalid:8332/', 1)
+            // A body that holds no JSON-RPC error is what a proxy in front of a stopped node
+            // returns, and it is what `rpc.ts` classifies as unavailability rather than refusal.
+            throw new HttpError({
+              status: 502,
+              method: 'POST',
+              url: 'http://node.invalid:8332/',
+              body: '<html>bad gateway</html>',
+            })
+          }
           return { result: template, error: null } as T
+        }
         case 'validateaddress':
           return {
             result:

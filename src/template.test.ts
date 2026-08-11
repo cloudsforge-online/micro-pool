@@ -17,13 +17,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   assertNodeNetwork,
+  DEFAULT_LONG_POLL_TIMEOUT_MS,
   parseTemplate,
   payoutScriptFor,
   TEMPLATE_STALE_AFTER_MS,
   TemplateSource,
   type BlockTemplate,
 } from './template.ts'
-import { NodeRpcError } from './rpc.ts'
+import { NodeRpcError, NodeUnavailableError, NODE_TIMEOUT_REASON } from './rpc.ts'
 import {
   fakeHashHex,
   fakeNode,
@@ -400,6 +401,148 @@ test('a failing node backs off and keeps going rather than ending the chain', as
   // Doubling, from the poll interval: 1000, 2000, 4000.
   assert.deepEqual(delays.slice(0, 3), [1000, 2000, 4000])
   assert.ok(source.isStale())
+})
+
+/* ----------------------------------------- not stranding the node's RPC threads (micro-org#307) */
+
+/**
+ * These five are the regression guard for a measured production incident, and the property they
+ * defend is not about this service at all.
+ *
+ * Core serves a longpoll on an RPC worker thread that blocks until the tip changes, and it never
+ * notices that the client hung up. A client-side deadline therefore does not cancel a longpoll — it
+ * strands a thread. On the estate's litecoind (`rpcthreads=8`, `blocksonly=1`, so the mempool escape
+ * never fires) the old loop stranded a new one every 75.7 seconds and starved the node of workers
+ * after roughly ten minutes without a block; micro-indexer's deposit observation went down with it,
+ * and came back the second a block landed. The pool losing its own template would have been a fair
+ * price. Taking deposit observation down on the chain the estate credits money on was not.
+ */
+
+/** A source wired to a node whose longpolls time out, driven by hand rather than by wall clock. */
+function suspendingSourceFor(node: ReturnType<typeof fakeNode>, stopAfterFetches: number) {
+  const controller = new AbortController()
+  const errors: unknown[] = []
+  const suspensions: boolean[] = []
+  const source = new TemplateSource({
+    chain: 'btc',
+    rpc: node.rpc,
+    pollIntervalMs: 1000,
+    onTemplate: () => {},
+    onError: (err) => errors.push(err),
+    onLongPollSuspended: (suspended) => suspensions.push(suspended),
+    signal: controller.signal,
+    sleep: async () => {
+      if (node.calls.filter((call) => call.method === 'getblocktemplate').length >= stopAfterFetches) {
+        controller.abort()
+      }
+    },
+  })
+  return { source, controller, errors, suspensions }
+}
+
+/** The `longpollid` argument of each `getblocktemplate`, in order. `null` where there was none. */
+function longPollIdsIn(node: ReturnType<typeof fakeNode>): (string | null)[] {
+  return node.calls
+    .filter((call) => call.method === 'getblocktemplate')
+    .map((call) => {
+      const request = (call.params[0] ?? {}) as { longpollid?: unknown }
+      return typeof request.longpollid === 'string' ? request.longpollid : null
+    })
+}
+
+test('a timed-out longpoll is not immediately replaced by another one', async () => {
+  // The mutation this catches: reopening a longpoll after the deadline fires. That is the exact
+  // behaviour that strands one node thread per cycle, and it looks identical from the outside —
+  // same errors, same backoff, a pool that keeps working. Only the node can tell, and only until it
+  // runs out of threads.
+  const node = fakeNode({ template: fakeTemplateReply({ longPollId: 'lp-1' }), longPollFails: 'timeout' })
+  const { source, errors, suspensions } = suspendingSourceFor(node, 6)
+  await source.run()
+
+  const ids = longPollIdsIn(node)
+  assert.equal(ids[0], null, 'the first fetch has no id to send yet')
+  assert.equal(ids[1], 'lp-1', 'the second uses the id the first was given — longpoll is still the default')
+  assert.deepEqual(
+    ids.slice(2),
+    ids.slice(2).map(() => null),
+    'after the timeout every later fetch is plain: at most ONE thread may ever be stranded',
+  )
+  assert.equal(suspensions[0], true)
+  assert.equal(source.longPollSuspended, true)
+  assert.ok(
+    errors.every((err) => err instanceof NodeUnavailableError && err.reason === NODE_TIMEOUT_REASON),
+    'and it must be classified as a timeout, not as the node refusing',
+  )
+})
+
+test('a moved tip is what resumes longpolling, and nothing weaker', async () => {
+  // Resuming on a successful plain fetch instead would resume while the node is still holding the
+  // stranded request, and start stacking them a second time. Only a new block proves it let go.
+  const node = fakeNode({ template: fakeTemplateReply({ longPollId: 'lp-1' }), longPollFails: 'timeout' })
+  const { source } = suspendingSourceFor(node, 4)
+  await source.run()
+  assert.equal(source.longPollSuspended, true)
+
+  // A plain fetch that succeeds against the SAME tip is not evidence of anything: the node answers
+  // it from the same worker pool while still holding the abandoned request on another thread.
+  // Asserted on its own fetch rather than on where `run` happened to stop, because the loop can end
+  // on either side of a timeout and a resume-on-any-fetch bug survives one of the two.
+  await source.fetchOnce(null)
+  assert.equal(source.longPollSuspended, true, 'plain fetches alone must NOT lift the suspension')
+
+  // Same node, same source, and now the tip moves.
+  node.setTemplate(fakeTemplateReply({ longPollId: 'lp-2', previousBlockHashHex: fakeHashHex('tip-2') }))
+  await source.fetchOnce(null)
+  assert.equal(source.longPollSuspended, false, 'a changed previousblockhash releases the node and resumes')
+})
+
+test('a longpoll that times out on a node whose tip never moves strands at most one thread', async () => {
+  // The arithmetic that mattered: 8 threads at one per 75.7s is 606s, and the measured starvation
+  // came at 599s. Bounding the count at one is what turns a node-wide outage into a pool that polls.
+  const node = fakeNode({ template: fakeTemplateReply({ longPollId: 'lp-1' }), longPollFails: 'timeout' })
+  const { source } = suspendingSourceFor(node, 12)
+  await source.run()
+  const longPolls = longPollIdsIn(node).filter((id) => id !== null)
+  assert.equal(longPolls.length, 1, `expected exactly one longpoll to have been abandoned, got ${longPolls.length}`)
+})
+
+test('a longpoll that never reached the node at all does not put the loop into fallback', async () => {
+  // The control for the test above, and the reason `NodeUnavailableError` carries a `reason` rather
+  // than being switched on by class. A 502 from something in front of a stopped node is the same
+  // class of error off the same call, and it stranded NOTHING — there is no thread on the far side
+  // waiting for a block, so giving up longpolling until the tip moves would trade a fault the pool
+  // does not have for latency it does not need.
+  const node = fakeNode({ template: fakeTemplateReply({ longPollId: 'lp-1' }), longPollFails: 'unreachable' })
+  const { source, errors } = suspendingSourceFor(node, 6)
+  await source.run()
+
+  assert.ok(
+    errors.length > 0 && errors.every((err) => err instanceof NodeUnavailableError && err.reason !== NODE_TIMEOUT_REASON),
+    'the fixture must be failing some way OTHER than a deadline or this test proves nothing',
+  )
+  assert.equal(source.longPollSuspended, false, 'only a deadline strands a thread, so only a deadline suspends')
+  assert.ok(
+    longPollIdsIn(node).filter((id) => id !== null).length > 1,
+    'and longpolling keeps being attempted, because the breaker is what handles a node that is gone',
+  )
+})
+
+test('the longpoll deadline outlasts a block interval, so a healthy chain never reaches the fallback', async () => {
+  // 60_000 was shorter than the 150s Litecoin aims for, which meant the deadline was not an
+  // exception path — it was the normal one, firing on almost every block.
+  assert.ok(
+    DEFAULT_LONG_POLL_TIMEOUT_MS > 150_000,
+    'the default must exceed a Litecoin block interval or the fallback becomes the steady state',
+  )
+
+  // Driven a fetch at a time rather than through `run()`: a node that answers its longpolls never
+  // sleeps and never errs, so the loop has no seam to stop it and would spin until the heap died.
+  const node = fakeNode({ template: fakeTemplateReply({ longPollId: 'lp-1' }) })
+  const { source } = suspendingSourceFor(node, 0)
+  await source.fetchOnce(null)
+  await source.fetchOnce(source.current?.longPollId ?? null)
+  assert.equal(source.longPollSuspended, false, 'a node that answers must never put the loop into fallback')
+  assert.deepEqual(longPollIdsIn(node), [null, 'lp-1'], 'and the id it handed back is the one sent next')
 })
 
 /* ------------------------------------------------------------------ the boot refusals */

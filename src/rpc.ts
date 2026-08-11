@@ -61,13 +61,32 @@ export class NodeRpcError extends Error {
 export class NodeUnavailableError extends Error {
   readonly rpcMethod: string
   readonly chain: RpcChainId
+  /**
+   * Which way it failed, as `describe` classified it: `'timeout'`, `'http 502'`, `'circuit open (…)'`.
+   *
+   * Carried as a field rather than left inside the message for the same reason `NodeRpcError` carries
+   * a JSON-RPC `code`: a caller that has to tell one unavailability from another should switch on a
+   * value, not match a regular expression against prose that a later edit is free to reword.
+   *
+   * `template.ts` is the caller that needs it. A timed-out longpoll and a refused connection are the
+   * same class of error and want opposite responses — see the strand-avoidance argument there.
+   *
+   * Named `reason` and not `cause` because `Error.cause` is a real ES2022 property with a different
+   * meaning (the wrapped error, not a label for it), and shadowing it with a string would mislead
+   * anything that walks a cause chain.
+   */
+  readonly reason: string
   constructor(args: { method: string; chain: RpcChainId; cause: string }) {
     super(`${args.chain} ${args.method}: the node did not answer — ${args.cause}`)
     this.name = 'NodeUnavailableError'
     this.rpcMethod = args.method
     this.chain = args.chain
+    this.reason = args.cause
   }
 }
+
+/** The `reason` a deadline produces. Exported so the one caller that switches on it cannot typo it. */
+export const NODE_TIMEOUT_REASON = 'timeout'
 
 export interface NodeCallOptions {
   readonly deadlineMs?: number
@@ -224,7 +243,7 @@ function jsonRpcErrorIn(err: unknown): { code: number; message: string } | null 
 
 function describe(err: unknown): string {
   if (err instanceof CircuitOpenError) return `circuit open (${err.upstream})`
-  if (err instanceof TimeoutError) return 'timeout'
+  if (err instanceof TimeoutError) return NODE_TIMEOUT_REASON
   if (err instanceof HttpError) return `http ${err.status}`
   if (err instanceof Error) return err.message
   return String(err)
