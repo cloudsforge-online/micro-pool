@@ -34,7 +34,12 @@ import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { MIGRATIONS, POOL_TABLES } from './migrations.ts'
 import { PAYOUT_FLUSH_KIND, recurringFor } from './jobs.ts'
 import { claimPayoutCredit, insertAccountLink, markPayoutCredited, upsertWorker, type Exec } from './store.ts'
-import type { LedgerClient, PostEntryRequest } from './ledgerclient.ts'
+import {
+  LedgerRefusedError,
+  LedgerUnavailableError,
+  type LedgerClient,
+  type PostEntryRequest,
+} from './ledgerclient.ts'
 import {
   CUSTODY_BACKING_CLOSED,
   LedgerPayoutSink,
@@ -550,4 +555,143 @@ test('a replica that lost the race to close a claim does not overwrite the winne
   assert.equal(await markPayoutCredited(db(), { chain: 'ltc', id, ledgerEntryId: 'second' }), false)
   const [row] = await sql`select ledger_entry_id from pool_payout_credits where id = ${id}`
   assert.equal(row?.['ledger_entry_id'], 'first')
+})
+
+/* ------------------------------------------- the flush's per-row isolation (micro-org#302) */
+
+/**
+ * Claim one credit for a block, through the store, exactly as a crashed `credit` would have left it.
+ *
+ * Takes the hash so a test can put SEVERAL rows in the queue: `poolPayoutCreditKey` is built from
+ * the block hash, so two hashes are two keys, which is what makes head-of-line blocking observable
+ * at all. One row can only ever be at the head of its own queue.
+ */
+async function claimFor(workerId: number, blockHash: string): Promise<void> {
+  await claimPayoutCredit(db(), {
+    chain: 'ltc',
+    network: 'mainnet',
+    blockHash,
+    blockHeight: CLAIM.blockHeight,
+    workerId,
+    account: CLAIM.account,
+    assetCode: 'LTC',
+    amount: CLAIM.amount,
+    creditKey: poolPayoutCreditKey('ltc', 'mainnet', blockHash, workerId),
+  })
+}
+
+const FIRST = 'a'.repeat(64)
+const SECOND = 'b'.repeat(64)
+
+test('A LEDGER REFUSAL IS STEPPED OVER, NOT ALLOWED TO STRAND THE QUEUE BEHIND IT', { skip }, async () => {
+  // KILLS THE MUTATION that removes the `catch (err)` around `#post` and awaits it bare, which is
+  // what `flushPending` did until 2026-08-11.
+  //
+  // `pendingPayoutCredits` is `order by id`, so the poison row leads EVERY attempt: a bare await
+  // means the second claim is never reached, not on this sweep and not on any later one. And the
+  // throw does not stop at the batch — it leaves the handler in `jobs.ts`, dead-letters the job, and
+  // `rescheduleRecurring` will not re-arm a dead-lettered recurring job, so `pool.flush-payouts`
+  // stops for that chain entirely. A 4xx is ordinary: a rejected assetCode, a revoked `ledger:post`
+  // grant answering 403. Asserting `posted.length` alone would NOT kill it — the mutant posts the
+  // refused key too. The assertion that discriminates is that the SECOND row was reached.
+  const workerId = await seedLinkedWorker()
+  await claimFor(workerId, FIRST)
+  await claimFor(workerId, SECOND)
+  const poison = poolPayoutCreditKey('ltc', 'mainnet', FIRST, workerId)
+
+  const errors: string[] = []
+  const sink = openSink({
+    ledger: {
+      postEntry: (request) => {
+        posted.push(request)
+        if (request.idempotencyKey === poison) {
+          return Promise.reject(new LedgerRefusedError(422, 'invalid_asset', 'the ledger said no'))
+        }
+        return Promise.resolve({ id: 'entry-ok', kind: request.kind, recordedAt: '', replayed: false })
+      },
+    },
+    log: (level, message) => {
+      if (level === 'error') errors.push(message)
+    },
+  })
+
+  assert.equal(await sink.flushPending('ltc', 10), 1, 'the row behind the refusal was not drained')
+  assert.equal(errors.length, 1, 'a refused payout was passed over in silence')
+
+  const rows = await sql<{ credit_key: string; ledger_entry_id: string | null }[]>`
+    select credit_key, ledger_entry_id from pool_payout_credits order by id
+  `
+  assert.equal(rows[0]?.ledger_entry_id, null, 'a refused claim was closed as though it had paid')
+  assert.equal(rows[1]?.ledger_entry_id, 'entry-ok')
+})
+
+test('AN UNAVAILABLE LEDGER STOPS THE BATCH INSTEAD OF MARCHING THROUGH IT', { skip }, async () => {
+  // KILLS THE MUTATION that treats `LedgerUnavailableError` like a refusal and `continue`s.
+  //
+  // The two classes exist to be told apart and this is the half that must NOT step over: a 5xx, a
+  // timeout or an open circuit means the ledger is down for everybody, so every row behind this one
+  // fails identically. Marching through spends the whole batch against a dead peer and — because the
+  // caller cannot know whether a timed-out post landed — does it while holding the least information
+  // it will ever have. Stopping is also why this must not THROW: the job completes, re-arms, and
+  // retries in five minutes with the same keys, rather than burning its attempt budget.
+  const workerId = await seedLinkedWorker()
+  await claimFor(workerId, FIRST)
+  await claimFor(workerId, SECOND)
+
+  const warnings: string[] = []
+  const sink = openSink({
+    ledger: {
+      postEntry: (request) => {
+        posted.push(request)
+        return Promise.reject(new LedgerUnavailableError('the ledger did not answer'))
+      },
+    },
+    log: (level, message) => {
+      if (level === 'warn') warnings.push(message)
+    },
+  })
+
+  assert.equal(await sink.flushPending('ltc', 10), 0)
+  assert.equal(posted.length, 1, 'the batch kept posting into a ledger that was already unreachable')
+  assert.equal(warnings.length, 1)
+
+  // Both rows survive unposted, which is the whole point: they are money already committed locally.
+  const rows = await sql<{ ledger_entry_id: string | null }[]>`
+    select ledger_entry_id from pool_payout_credits order by id
+  `
+  assert.deepEqual(
+    rows.map((row) => row.ledger_entry_id),
+    [null, null],
+  )
+})
+
+test('the flush counts entries it recorded, not rows it reached', { skip }, async () => {
+  // KILLS THE MUTATION that increments `posted` unconditionally instead of on `#post`'s verdict.
+  //
+  // The number reaches an operator through `jobs.ts`'s `flushed pending payouts` line, and they read
+  // it as money that moved. A row another replica closed between this one's SELECT and its UPDATE
+  // posts no second entry — the ledger deduped on the same key — so counting it would report a
+  // payment that this process did not make. Simulated by having the ledger close the row as its side
+  // effect, which is exactly the interleaving `markPayoutCredited`'s `ledger_entry_id is null`
+  // predicate exists to survive.
+  const workerId = await seedLinkedWorker()
+  await claimFor(workerId, FIRST)
+
+  const sink = openSink({
+    ledger: {
+      postEntry: async (request) => {
+        posted.push(request)
+        await sql`
+          update pool_payout_credits
+          set ledger_entry_id = 'won-by-the-other-replica', credited_at = now()
+          where credit_key = ${request.idempotencyKey}
+        `
+        return { id: 'entry-mine', kind: request.kind, recordedAt: '', replayed: true }
+      },
+    },
+  })
+
+  assert.equal(await sink.flushPending('ltc', 10), 0, 'a deduped entry was counted as a payment')
+  const [row] = await sql`select ledger_entry_id from pool_payout_credits`
+  assert.equal(row?.['ledger_entry_id'], 'won-by-the-other-replica')
 })

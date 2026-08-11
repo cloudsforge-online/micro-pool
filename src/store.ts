@@ -945,6 +945,31 @@ export async function recentBlocks(
  * block's PPLNS allocation is reproducible only while the shares it names still exist, and §6 says
  * the miner has to be able to check it. Pruning by age alone would make the pool's own record of who
  * earned what unverifiable, starting with the oldest block and working forwards.
+ *
+ * ── THE FLOOR IS KEYED ON `share_chain`, AND KEYING IT ON `chain` UNDERPAID MERGE-MINED BLOCKS ────
+ *
+ * `args.chain` is the chain whose SHARES are being deleted, because `pool_shares` only ever holds
+ * rows for a parent chain — a merge-mined block is won by Litecoin shares, and there is no such
+ * thing as a Dogecoin share here. But a merge-mined block's row records `chain = 'doge'` with
+ * `share_chain = 'ltc'`, and its `window_first_share_id` points into the LITECOIN shares.
+ *
+ * So this CTE matching on `chain` excluded every Dogecoin block from the minimum, and the Litecoin
+ * shares those blocks' windows name became eligible for deletion at `POOL_SHARE_RETENTION_DAYS`.
+ * The damage surfaces later and silently: `windowShares` then returns zero rows, `allocateReward`
+ * takes its `totalUnits === 0n` branch, **the whole block reward becomes the pool fee**, the block
+ * is marked credited, and the miner who found it is paid nothing. No error is raised at any step.
+ *
+ * That is verbatim the failure migration 7 introduced `share_chain` to make impossible. It fixed the
+ * READ path — `blocksAwaitingCredit` returns the column and `rewards.ts` allocates against it — and
+ * left the RETENTION path keyed on `chain`, which is the path that destroys the evidence the read
+ * path depends on. Found 2026-08-11 while auditing micro-org#302; latent rather than fired, because
+ * no chain merges an aux chain on the estate today (`POOL_CHAINS=ltc,btc`, no `AUX_CHAINS` set) and
+ * `pool_blocks` is empty. It would have fired the first time the pool won a Dogecoin block and kept
+ * it for a month.
+ *
+ * Back-compatible by construction: migration 7 back-fills `share_chain = chain` on every row that
+ * predates it and makes the column `not null`, so on a non-merged deployment the two predicates
+ * select exactly the same rows.
  */
 export async function pruneShares(
   exec: Exec,
@@ -954,7 +979,7 @@ export async function pruneShares(
     with floor_id as (
       select coalesce(min(window_first_share_id), 9223372036854775807) as id
       from pool_blocks
-      where chain = ${args.chain}
+      where share_chain = ${args.chain}
     ),
     doomed as (
       select s.id
