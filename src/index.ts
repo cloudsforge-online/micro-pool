@@ -246,7 +246,8 @@ const chains = env.chains.map(
  * Hard rather than soft, and that is the decision this probe exists to make. A soft probe would
  * leave the replica in the balancer while its miners hashed against a template from before the last
  * block — which looks completely healthy from outside (connections up, shares arriving) and is
- * worth nothing. `TEMPLATE_STALE_AFTER_MS` in `template.ts` sets the threshold and explains it.
+ * worth nothing. `templateStaleAfterMs` in `template.ts` sets the threshold PER CHAIN and explains why it must
+ * outlive both the longpoll timeout and twice the chain's block interval.
  *
  * Note what this does NOT do: it does not close the stratum port. A node blip should not disconnect
  * every miner, because they will reconnect to the same replica anyway. Reporting unready is what

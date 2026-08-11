@@ -20,7 +20,7 @@ import {
   DEFAULT_LONG_POLL_TIMEOUT_MS,
   parseTemplate,
   payoutScriptFor,
-  TEMPLATE_STALE_AFTER_MS,
+  templateStaleAfterMs,
   TemplateSource,
   type BlockTemplate,
 } from './template.ts'
@@ -35,6 +35,7 @@ import {
   REGTEST_MWEB_BLOCK,
 } from './faketemplate.ts'
 import { targetFromCompactBits } from './pow.ts'
+import { POOL_CHAIN_IDS, poolChain } from './chains.ts'
 
 /* ------------------------------------------------------------------ parsing */
 
@@ -324,8 +325,58 @@ test('staleness is measured against the fetch, and an unfetched source is stale'
   assert.ok(source.isStale(), 'a source that has never fetched must not claim to be fresh')
   await source.fetchOnce()
   assert.ok(!source.isStale())
-  nowMs.value += TEMPLATE_STALE_AFTER_MS + 1
+  // The helper builds a `btc` source, so this must step past BITCOIN's threshold and not the old
+  // shared constant. `TEMPLATE_STALE_AFTER_MS + 1` passed here for months while being ten minutes
+  // short of the value the running pool actually used for this chain.
+  nowMs.value += templateStaleAfterMs('btc') + 1
   assert.ok(source.isStale())
+})
+
+test('NO CHAIN IS DECLARED STALE WHILE ITS OWN LONGPOLL IS STILL LEGITIMATELY OPEN', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // The invariant the single 120 s constant broke, asserted for every chain in the table rather
+  // than the two that exist today — so a third chain cannot reintroduce it by being added.
+  //
+  // A template CANNOT be refreshed while the loop is inside a longpoll, because a longpoll returns
+  // when the tip moves. So a staleness threshold at or below the longpoll timeout is unsatisfiable
+  // by construction: the pool marks itself unhealthy for doing exactly what it was written to do.
+  //
+  // Measured on mainnet 2026-08-11, minutes after BTC first carried traffic: templateAgeSeconds
+  // 246 against a 120 s threshold, `ready: false`, lifecycle flipping ready → degraded on a
+  // two-minute cycle, container unhealthy with a failing streak of 4 — while LTC published seven
+  // new jobs without a pause and the node, the pool and the chain were all entirely fine.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  for (const chain of POOL_CHAIN_IDS) {
+    assert.ok(
+      templateStaleAfterMs(chain) > DEFAULT_LONG_POLL_TIMEOUT_MS,
+      `${chain} is called stale before its longpoll can even return; the probe can never pass`,
+    )
+    // And past the ordinary tail of the block interval, not merely past the timeout. One interval
+    // is the EXPECTED wait for the next block, so a threshold at one interval fires several times
+    // a day on a chain doing nothing wrong — which is how a health signal becomes one an operator
+    // mutes, and a muted signal is worth less than none.
+    assert.ok(
+      templateStaleAfterMs(chain) >= poolChain(chain).targetBlockSeconds * 2 * 1000,
+      `${chain} calls an ordinary gap between blocks an outage`,
+    )
+  }
+})
+
+test('the threshold is derived from the chain and is NOT the same number for both', () => {
+  // The mutation this kills: `templateStaleAfterMs` reduced back to a constant. Every assertion
+  // above still passes if the constant is large enough — 1200 s satisfies both invariants for both
+  // chains. What it loses is the reason, and the reason is the whole fix: Litecoin would then wait
+  // twenty minutes to report a genuinely dead node, on a chain that produces a block every two and
+  // a half minutes and whose mempool refreshes the template every thirty seconds.
+  assert.notEqual(
+    templateStaleAfterMs('btc'),
+    templateStaleAfterMs('ltc'),
+    'both chains share one threshold again, so one of them has the wrong one',
+  )
+  assert.ok(
+    templateStaleAfterMs('btc') > templateStaleAfterMs('ltc'),
+    'the ten-minute chain is not given more room than the two-and-a-half-minute one',
+  )
 })
 
 test('a node error surfaces as a NodeRpcError rather than a parse failure', async () => {
