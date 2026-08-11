@@ -47,7 +47,14 @@ import { AddressChecker } from './payoutaddress.ts'
 import { AuxTemplateSource, type AuxUnavailability } from './auxtemplate.ts'
 import { submitFoundAuxBlock, submitFoundBlock } from './blocks.ts'
 import { insertShares, upsertWorker, type Exec } from './store.ts'
-import { algorithmFor, auxNameFor, nameFor, type AuxChainId } from './chains.ts'
+import {
+  algorithmFor,
+  auxNameFor,
+  browserMiningOf,
+  nameFor,
+  type AuxChainId,
+  type PoolChainId,
+} from './chains.ts'
 import { hashesPerDifficulty, networkDifficultyOf } from './pow.ts'
 import { EXTRANONCE2_BYTES } from './stratum.ts'
 import type { AcceptedShare } from './session.ts'
@@ -99,6 +106,32 @@ export interface ChainServiceDeps {
   readonly signal: AbortSignal
 }
 
+/**
+ * The browser half of a chain's answer, as a client reads it.
+ *
+ * `available` is what a page branches on and `reason` is what it prints; a chain that serves
+ * browsers carries `reason: null` rather than omitting the key, because a JSON consumer reading an
+ * absent field cannot tell it from an older service that had never heard of it.
+ */
+export interface BrowserMiningStatus {
+  readonly available: boolean
+  readonly reason: string | null
+}
+
+/**
+ * The ticket redeemer a chain's listener may have, which is `undefined` for a chain browsers are
+ * refused on however well configured the deployment is.
+ *
+ * A function rather than an inline ternary because this is the whole enforcement of micro-org#360
+ * and an inline ternary is not something a test can hold. With no redeemer, `StratumServer` builds
+ * no `browser` block, `servesBrowsers` is false and `attachWebSocket` refuses the upgrade — so a
+ * page that ignores `browserMining.available` and dials the WebSocket anyway is turned away by the
+ * transport. That is the difference between a refusal and a label.
+ */
+export function browserRedeemerFor<T>(chain: PoolChainId, redeemTicket: T | undefined): T | undefined {
+  return browserMiningOf(chain).served ? redeemTicket : undefined
+}
+
 export interface ChainStatus {
   readonly chain: string
   readonly name: string
@@ -124,6 +157,17 @@ export interface ChainStatus {
    * consumer to assemble — which is the whole lesson of micro-org#285.
    */
   readonly websocketEndpoint: string | null
+  /**
+   * Whether a browser may mine this chain at all, and the reason when it may not.
+   *
+   * Distinct from `websocketEndpoint: null`, and the difference is the whole reason this field
+   * exists. A null endpoint says *this deployment has published no browser address* — an operator
+   * could change it this afternoon. This says *no deployment ever will, and here is why*, which is
+   * a sentence a reader can act on: point hardware at the stratum port, or mine the other chain.
+   * A consumer that saw only the null would render "not published yet" for a chain that is never
+   * going to be published, which is the surface-claims-too-much defect micro-org#360 is about.
+   */
+  readonly browserMining: BrowserMiningStatus
   readonly connections: number
   readonly height: number | null
   readonly networkDifficulty: number | null
@@ -327,7 +371,12 @@ export class ChainService {
     // the arithmetic, and the short version is that pure-JS scrypt does a few hundred hashes a second
     // where an ASIC does terahashes, so a browser at the hardware floor produces no share at all and
     // is indistinguishable from a miner that is broken.
-    const redeemTicket = deps.redeemTicket
+    //
+    // A chain the table refuses browsers on gets no band at all, which is what makes the refusal
+    // structural: with no `browser` on the listener, `attachWebSocket` turns the upgrade away, so a
+    // page that ignores what `/v1/pool` says and dials anyway is refused by the transport rather
+    // than served work it could never be paid for (micro-org#360).
+    const redeemTicket = browserRedeemerFor(chain, deps.redeemTicket)
     const perDifficulty = hashesPerDifficulty(algorithmFor(chain))
 
     // The same node, and the same question, that `#bringUp` already puts about the POOL'S own payout
@@ -535,6 +584,7 @@ export class ChainService {
   status(): ChainStatus {
     const chain = this.#deps.config.chain
     const template = this.#source.current
+    const browser = browserMiningOf(chain)
     return {
       chain,
       name: nameFor(chain),
@@ -546,6 +596,15 @@ export class ChainService {
       // unreachable — it is here because the failure it prevents is the exact one micro-org#285 is
       // about, and the cost of it being belt and braces is one boolean.
       websocketEndpoint: this.#stratum.servesBrowsers ? this.#deps.websocketEndpoint : null,
+      // Read from the table rather than from `servesBrowsers`, and the two are not the same
+      // question: the listener also stops serving browsers when this deployment configured no
+      // identity, which is a deployment fact with no reason to give a reader. `available` is
+      // narrowed by both — a chain the table allows, on a deployment that publishes no endpoint,
+      // still cannot be mined in a browser today — while `reason` is only ever the table's.
+      browserMining: {
+        available: browser.served && this.#stratum.servesBrowsers,
+        reason: browser.served ? null : browser.reason,
+      },
       connections: this.#stratum.connectionCount,
       height: template?.height ?? null,
       networkDifficulty: template ? networkDifficultyOf(algorithmFor(chain), template.blockTarget) : null,
