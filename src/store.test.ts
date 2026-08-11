@@ -449,6 +449,40 @@ test('pruning one chain does not touch another', { skip }, async () => {
   assert.equal(ltc?.n, '4')
 })
 
+test('a merge-mined block protects the PARENT chain shares its window names', { skip }, async () => {
+  // KILLS THE MUTATION `where share_chain = ${args.chain}` -> `where chain = ${args.chain}` in
+  // `pruneShares`'s floor CTE, which is what the query actually said until 2026-08-11.
+  //
+  // A Dogecoin block is won by LITECOIN shares: the row carries `chain = 'doge'` and
+  // `share_chain = 'ltc'`, and its `window_first_share_id` points into `pool_shares` where
+  // `chain = 'ltc'`. Keyed on `chain`, the Litecoin prune never sees that block, the floor collapses
+  // to the `coalesce` sentinel, and all ten shares go — after which the block allocates over zero
+  // shares, the whole reward becomes the pool fee, and the miner who found it is paid nothing with
+  // no error raised anywhere. The parent-chain tests above cannot catch it, because on a block whose
+  // `share_chain` equals its `chain` the two predicates select the same rows.
+  const workerId = await seedShares('ltc', 'acct', 'rig', 10)
+  await sql`update pool_shares set created_at = now() - interval '90 days'`
+  const ids = await sql<{ share_id: string }[]>`select id::text as share_id from pool_shares order by id`
+  await recordBlock(db(), {
+    chain: 'doge',
+    shareChain: 'ltc',
+    height: 5_000_000,
+    hash: 'e'.repeat(64),
+    foundByWorkerId: workerId,
+    networkDifficultyUnits: UNIT,
+    reward: 1n,
+    submitStatus: 'accepted',
+    submitDetail: null,
+    windowFirstShareId: BigInt(ids[4]?.share_id ?? '0'),
+    windowLastShareId: BigInt(ids[9]?.share_id ?? '0'),
+  })
+
+  const pruned = await pruneShares(db(), { chain: 'ltc', retentionDays: 30, limit: 1000 })
+  assert.equal(pruned, 4, 'the prune crossed into the window a merge-mined block depends on')
+  const remaining = await sql<{ n: string }[]>`select count(*)::text as n from pool_shares`
+  assert.equal(remaining[0]?.n, '6')
+})
+
 test('pruning respects its batch limit, so one call cannot lock the table for a minute', { skip }, async () => {
   await seedShares('btc', 'acct', 'rig', 10)
   await sql`update pool_shares set created_at = now() - interval '90 days'`

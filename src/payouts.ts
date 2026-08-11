@@ -81,7 +81,7 @@
 import type { AssetCode, Network } from '@cloudsforge/contracts-chain'
 import type { Actor } from '@cloudsforge/contracts-money'
 import type { MinedChainId } from './chains.ts'
-import type { LedgerClient } from './ledgerclient.ts'
+import { LedgerRefusedError, LedgerUnavailableError, type LedgerClient } from './ledgerclient.ts'
 import {
   claimPayoutCredit,
   markPayoutCredited,
@@ -467,6 +467,34 @@ export class LedgerPayoutSink implements PayoutSink {
    * same reason the maturity sweep is — but only for chains an operator configured a payout minimum
    * for, which on 2026-08-09 is none of them. On a deployment with payouts off nothing constructs
    * this class, so the kind is neither seeded nor registered.
+   *
+   * ── WHY EVERY ROW IS ISOLATED, AND WHY THE TWO LEDGER ERRORS PART HERE ──────────────────────────
+   *
+   * Until 2026-08-11 the loop below awaited `#post` bare. One throw abandoned the whole batch, and
+   * because `pendingPayoutCredits` is deliberately `order by id` — so a backlog drains in the order
+   * it accumulated — the SAME row led every subsequent attempt. Strict head-of-line blocking on a
+   * queue whose rows are money already committed locally and not yet in the ledger.
+   *
+   * The throw did not stop at the batch either. It left the handler in `jobs.ts`, failed the job,
+   * burned its attempt budget and dead-lettered it — and `rescheduleRecurring` deliberately does not
+   * re-arm a dead-lettered recurring job. So one permanently-refused row stopped `pool.flush-payouts`
+   * for that chain **entirely**, stranding every credit behind it until somebody noticed by hand.
+   * A rejected `assetCode`, a revoked `ledger:post` grant answering 403, a posting the ledger's
+   * validation dislikes — all 4xx, all permanent, all reachable.
+   *
+   * So the two error classes `ledgerclient.ts` defines are finally CONSUMED here, which is the thing
+   * that file says they exist for and no caller had ever done:
+   *
+   *   - **Refused (4xx, the peer decided).** This row will be refused again identically; the rows
+   *     behind it will not. Log it loudly and step over it. It stays pending, so it is retried — and
+   *     re-logged — every sweep, which is a visible permanent fault rather than a silent stall.
+   *   - **Unavailable (5xx, timeout, open circuit).** The ledger is down for everybody, so the rows
+   *     behind it would fail the same way. Stop the batch and let the next sweep have it. Retrying
+   *     is safe and required: the same `creditKey` goes back on the wire, and a call that actually
+   *     succeeded is deduped rather than paid twice.
+   *
+   * Anything else — a database failure closing the row, most likely — is rethrown on purpose. That
+   * IS the fault a dead letter is for, and swallowing it would hide it behind a busy loop.
    */
   async flushPending(chain: MinedChainId, limit: number): Promise<number> {
     const pending = await pendingPayoutCredits(this.#deps.sql, { chain, limit })
@@ -482,18 +510,45 @@ export class LedgerPayoutSink implements PayoutSink {
         })
         continue
       }
-      await this.#post({
-        id: credit.id,
-        chain,
-        network: credit.network as Network,
-        blockHash: credit.blockHash,
-        blockHeight: credit.blockHeight,
-        userId,
-        asset: credit.assetCode as AssetCode,
-        amount: credit.amount,
-        creditKey: credit.creditKey,
-      })
-      posted += 1
+      try {
+        // Counted on what `#post` actually closed, not on having reached it. A row another replica
+        // finished first posts no second entry and must not be reported as one — the number in the
+        // job's log line is entries recorded, and an operator reads it as money that moved.
+        if (
+          await this.#post({
+            id: credit.id,
+            chain,
+            network: credit.network as Network,
+            blockHash: credit.blockHash,
+            blockHeight: credit.blockHeight,
+            userId,
+            asset: credit.assetCode as AssetCode,
+            amount: credit.amount,
+            creditKey: credit.creditKey,
+          })
+        ) {
+          posted += 1
+        }
+      } catch (err) {
+        if (err instanceof LedgerRefusedError) {
+          this.#deps.log('error', 'the ledger refused a payout; stepping over it', {
+            chain,
+            creditKey: credit.creditKey,
+            code: err.code,
+            status: err.status,
+          })
+          continue
+        }
+        if (err instanceof LedgerUnavailableError) {
+          this.#deps.log('warn', 'the ledger is unavailable; the rest of this batch waits', {
+            chain,
+            creditKey: credit.creditKey,
+            pendingAfter: pending.length - posted,
+          })
+          break
+        }
+        throw err
+      }
     }
     return posted
   }
@@ -508,6 +563,10 @@ export class LedgerPayoutSink implements PayoutSink {
    *
    * That first posting is precisely the one `CUSTODY_BACKING_CLOSED` is about: it is the number the
    * reconciliation sweep sums, and the sweep has no way to see the coin behind it.
+   *
+   * Returns whether THIS call closed the row. False is not a failure — it is another replica having
+   * closed it first — but it is the difference between an entry recorded and an entry deduped, and
+   * `flushPending` reports the first of those.
    */
   async #post(credit: {
     id: number
@@ -519,7 +578,7 @@ export class LedgerPayoutSink implements PayoutSink {
     asset: AssetCode
     amount: bigint
     creditKey: string
-  }): Promise<void> {
+  }): Promise<boolean> {
     const actor: Actor = 'service:pool'
     const entry = await this.#deps.ledger.postEntry({
       // The closest kind in the ledger's closed vocabulary, and an accurate one: a block reward
@@ -570,7 +629,7 @@ export class LedgerPayoutSink implements PayoutSink {
     if (!closed) {
       // Another replica finished it first. The ledger deduped on the same key, so there is no second
       // entry — there is simply nothing left to record.
-      return
+      return false
     }
     this.#deps.log('info', 'credited a mining payout', {
       chain: credit.chain,
@@ -579,5 +638,6 @@ export class LedgerPayoutSink implements PayoutSink {
       ledgerEntryId: entry.id,
       replayed: entry.replayed,
     })
+    return true
   }
 }

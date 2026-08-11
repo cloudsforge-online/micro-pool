@@ -57,16 +57,38 @@
  * estate moves money on.
  *
  * **Why the deadline fires at all**, given Core is documented to return a longpoll within about a
- * minute: that escape is `mempool.GetTransactionsUpdated()` changing, and these nodes run
- * `blocksonly=1`. The mempool is permanently empty — measured, `getmempoolinfo.size` is 0 — so the
- * only thing that can end a longpoll is a new block, and LTC aims for one every 150 s. A 60 s
- * deadline against a 150 s target does not occasionally time out. It nearly always does.
+ * minute: that escape is `mempool.GetTransactionsUpdated()` changing, and a node running
+ * `blocksonly=1` keeps a permanently empty mempool, so the escape never fires and the only thing
+ * that can end a longpoll is a new block.
+ *
+ * **Which node that is has changed, and the exposure got worse rather than better.** Re-measured
+ * against the chain host on 2026-08-11: litecoind now runs `blocksonly=0` (`getmempoolinfo.size`
+ * 212 rising to 249 over twenty seconds), so LTC longpolls return on the mempool escape and this
+ * deadline is rarely reached there at all. **bitcoind still runs `blocksonly=1` with
+ * `getmempoolinfo.size` 0**, and BTC targets 600 s per block against LTC's 150 s — so the chain
+ * where a longpoll can only ever be ended by a block is now the chain whose blocks are four times
+ * further apart. Since `POOL_CHAINS=ltc,btc`, the pool exercises this against bitcoind daily: three
+ * BTC gaps that morning ran 679 s, 154 s and 1073 s, and the two that exceeded the deadline are the
+ * only two longpoll timeouts the pool logged in thirty-two minutes.
+ *
+ * Do not read the paragraph above as the mechanism being retired. It is the same mechanism pointed
+ * at a different node, and `blocksonly` is a line in someone else's config file that has already
+ * moved once.
  *
  * **The response, therefore, is to stop asking rather than to ask again.** A longpoll that times out
  * suspends longpolling until the tip actually moves; the loop falls back to plain polling, which
  * answers immediately and holds no thread. At most one stranded thread can exist at a time, instead
  * of one per cycle without limit. The deadline is also raised well past a normal block interval, so
  * that on a healthy chain the longpoll returns on its own and the fallback stays unused.
+ *
+ * **Verified in production, not assumed.** bitcoind sampled every ten seconds across a deadline
+ * expiry on 2026-08-11: the held `getblocktemplate` passed 240 s at 09:22:15Z and `getrpcinfo`
+ * reported `gbt_concurrent=1` continuously for the next 193 s, up to 433.5 s held, while the pool
+ * logged the timeout and issued no further longpoll. The abandoned-and-retried behaviour this
+ * replaced predicts a second concurrent call about 76 s after the timeout and a third 76 s after
+ * that; neither appeared. Earlier the same morning a single stranded call was observed at 1074.1 s
+ * held — one, never two — released the moment block 961988 arrived, after which a fresh longpoll
+ * started, which is the resume-on-a-moved-tip half of the rule showing its face.
  */
 
 import { hashFromDisplay } from './bytes.ts'
