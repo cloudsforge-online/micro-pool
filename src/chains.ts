@@ -132,6 +132,18 @@ interface PoolChain {
    */
   readonly templateRules: readonly string[]
   /**
+   * The chain's target block interval, in seconds.
+   *
+   * Recorded here because template staleness is derived from it and a single constant for both
+   * chains was wrong the moment a second chain existed. See `templateStaleAfterMs` in
+   * `template.ts` — a threshold shorter than the interval declares a quiet chain broken, and a
+   * quiet chain is the ordinary state of a chain between blocks.
+   *
+   * These are the protocol targets, not observed averages: the retarget algorithms exist to hold
+   * them, and an observed average drifts with hashrate in a way a health threshold must not.
+   */
+  readonly targetBlockSeconds: number
+  /**
    * Whether a browser may be pointed at this chain, and — when it may not — why not, in words a
    * reader of the mining page is owed.
    *
@@ -162,6 +174,9 @@ const POOL_CHAINS: Readonly<Record<PoolChainId, PoolChain>> = Object.freeze({
     asset: 'BTC',
     algorithm: 'sha256d',
     templateRules: Object.freeze(['segwit']),
+    // Ten minutes, the interval Bitcoin's retarget holds. This is the number that made the single
+    // 120 s staleness constant untenable — see `templateStaleAfterMs`.
+    targetBlockSeconds: 600,
     /*
      * ## BTC IS MINED HERE, AND NEVER IN A BROWSER — micro-org#360, decided 2026-08-11
      *
@@ -207,6 +222,9 @@ const POOL_CHAINS: Readonly<Record<PoolChainId, PoolChain>> = Object.freeze({
     // does not matter to it — it is written this way so that a reader comparing this line against
     // the -8 quoted above sees the same two words in the same order.
     templateRules: Object.freeze(['mweb', 'segwit']),
+    // Two and a half minutes. Litecoin's mempool churn refreshed the template far more often than
+    // this, which is exactly why a threshold below the interval survived here unnoticed.
+    targetBlockSeconds: 150,
     browserMining: Object.freeze({ served: true } as const),
   }),
 })

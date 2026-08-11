@@ -311,16 +311,65 @@ export interface TemplateSourceOptions {
   readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>
 }
 
+
 /**
- * How long a template is served before it is considered too old to mine on.
+ * How long THIS chain's template is served before `/readyz` stops claiming the chain is working.
  *
- * Not a poll interval: it is the staleness at which `/readyz` stops claiming this chain is working.
- * A pool that keeps handing out a five-minute-old template is a pool whose miners are burning
- * electricity on a block that has already been found by somebody else, and it looks perfectly
- * healthy from the outside — the connections are up, shares are arriving, and every one of them is
- * worthless.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **A STALENESS THRESHOLD SHORTER THAN THE LONGPOLL TIMEOUT CALLS A WORKING POOL BROKEN.**
+ *
+ * Until 2026-08-11 this was one constant for every chain, `TEMPLATE_STALE_AFTER_MS = 120_000`,
+ * sitting above a `DEFAULT_LONG_POLL_TIMEOUT_MS` of 240 s. The
+ * loop spends most of its life *inside* a longpoll, and a longpoll returns when the tip moves. So
+ * on any chain quiet for longer than 120 s, the template's age passed the threshold while the node
+ * was holding a request that had not yet had anything to say — and the pool reported the chain
+ * not-ready for the second half of every gap between blocks.
+ *
+ * Litecoin never showed it. Its mempool churns, and a template rebuilt over a fatter mempool
+ * publishes on the changed coinbase value, so LTC re-fetched every 30–60 s regardless of the tip.
+ * Bitcoin has no such cover on this estate: the node runs `blocksonly=1`, so it keeps no mempool at
+ * all, and the ONLY event that ends a BTC longpoll is a block. Those average 600 s.
+ *
+ * Measured on mainnet 2026-08-11, minutes after `POOL_CHAINS=ltc,btc` first carried real traffic:
+ * `templateAgeSeconds: 246`, `ready: false`, `btc` alone, and the lifecycle flipping
+ * `ready → degraded → ready → degraded` on a two-minute cycle while LTC published seven new jobs
+ * without a pause. The container went unhealthy with a failing streak of 4. Nothing was wrong with
+ * the node, the pool, or the chain: a quiet chain is the ordinary state of a chain between blocks,
+ * and this threshold called it an outage.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * So the number is DERIVED, from the two things that actually bound it:
+ *
+ *   1. **Twice the chain's target block interval.** The question the probe exists to ask is "are we
+ *      handing out work from before the last block?", and one interval is the expected wait for the
+ *      next one. Twice it is the ordinary tail of a Poisson process — a gap that long happens
+ *      several times a day on any chain and is not news. Alerting on the ordinary tail is how a
+ *      health signal becomes something an operator mutes.
+ *   2. **A longpoll timeout plus a margin.** A template cannot be refreshed while the loop is
+ *      waiting for one, so a threshold at or below the timeout is unsatisfiable by construction —
+ *      the pool would be marking itself unhealthy for doing exactly what it was written to do. The
+ *      margin covers the fetch, parse and publish that follow the longpoll returning.
+ *
+ * `templateStaleAfterMs` never returns a value the pool cannot honour, and `template.test.ts`
+ * asserts that for every chain in the table rather than for the two that exist today.
+ *
+ * Litecoin: max(300 s, 300 s) = 300 s. Bitcoin: max(1200 s, 300 s) = 1200 s. Both are now longer
+ * than the longpoll they sit above, which the single constant never was for either.
  */
-export const TEMPLATE_STALE_AFTER_MS = 120_000
+export function templateStaleAfterMs(chain: PoolChainId): number {
+  const twoBlocks = poolChain(chain).targetBlockSeconds * 2 * 1000
+  return Math.max(twoBlocks, DEFAULT_LONG_POLL_TIMEOUT_MS + LONG_POLL_RETURN_MARGIN_MS)
+}
+
+/**
+ * The room left for a longpoll to return and its answer to be published, on top of the timeout.
+ *
+ * A minute is generous for a parse and a callback, and generous is the right direction: the cost of
+ * being too slow to declare a chain stale is that miners work an extra minute on a template that is
+ * still probably current, and the cost of being too quick is the flapping this whole block exists
+ * to describe.
+ */
+const LONG_POLL_RETURN_MARGIN_MS = 60_000
 
 /**
  * The ceiling on how long the node may hold a longpoll before this client gives up on it.
@@ -376,7 +425,7 @@ export class TemplateSource {
 
   isStale(): boolean {
     if (!this.#current) return true
-    return this.#now() - this.#current.fetchedAt.getTime() > TEMPLATE_STALE_AFTER_MS
+    return this.#now() - this.#current.fetchedAt.getTime() > templateStaleAfterMs(this.chain)
   }
 
   /** One fetch, parsed and published if it is new. Exposed so the loop is testable a tick at a time. */
