@@ -39,8 +39,10 @@ import {
   AUX_PARENT,
   auxAssetFor,
   auxNameFor,
+  browserMiningOf,
   isAuxChainId,
 } from './chains.ts'
+import { browserRedeemerFor } from './chainservice.ts'
 
 /* ------------------------------------------------------------------ what is mined */
 
@@ -155,6 +157,52 @@ test('nothing is both mined and refused', () => {
 test('the refusal table cannot be edited at runtime', () => {
   assert.ok(Object.isFrozen(REFUSED_CHAINS))
   assert.ok(Object.isFrozen(POOL_CHAIN_IDS))
+})
+
+/* -------------------------------------------------------- who may mine it in a browser (#360) */
+
+test('bitcoin is mined by hardware and refused to browsers, with the refusal carrying its reason', () => {
+  const btc = browserMiningOf('btc')
+  assert.equal(btc.served, false, 'micro-org#360 shape 1: BTC over stratum, never in the picker')
+  const reason = btc.served ? '' : btc.reason
+  // The three things a reader of the mining page needs from this sentence: that it is hardware
+  // that mines BTC here, roughly why a browser cannot, and where to go instead. Matched by content
+  // rather than by string equality so the wording can be improved without a red test.
+  assert.match(reason, /stratum/i)
+  assert.match(reason, /EH\/s/)
+  assert.match(reason, /Litecoin/)
+  assert.ok(reason.length > 120, 'a one-line refusal is an absence with extra steps')
+})
+
+test('litecoin is served to browsers and carries no reason to render', () => {
+  const ltc = browserMiningOf('ltc')
+  assert.equal(ltc.served, true)
+  // `served: true` has no `reason` key at all, so a consumer cannot print a stale one by reaching
+  // for a field that happens to still be there.
+  assert.equal((ltc as { reason?: unknown }).reason, undefined)
+})
+
+test('a refused chain is given no ticket redeemer, which is what refuses the upgrade', () => {
+  // `stratum.test.ts` already pins the other half: a listener built with no redeemer reports
+  // `servesBrowsers: false` and answers `attachWebSocket` with false. Together the two mean a
+  // browser dialling BTC is turned away by the transport and not merely by the page.
+  const redeemer = () => ({ account: 'a', worker: 'w' })
+  assert.equal(browserRedeemerFor('btc', redeemer), undefined, 'BTC must never serve a browser')
+  assert.equal(browserRedeemerFor('ltc', redeemer), redeemer)
+  // And a deployment with no identity configured still serves no browsers on either chain.
+  assert.equal(browserRedeemerFor('ltc', undefined), undefined)
+})
+
+test('every chain answers the browser question, and the answer is frozen', () => {
+  // A chain added to the table without an answer is a chain that would be offered in the picker by
+  // omission, which is exactly the failure #360 names. `tsc` catches a missing key; this catches a
+  // key present and empty.
+  for (const chain of POOL_CHAIN_IDS) {
+    const stance = browserMiningOf(chain)
+    assert.equal(typeof stance.served, 'boolean', `${chain} has no browser mining stance`)
+    if (!stance.served) assert.ok(stance.reason.trim().length > 0, `${chain} refuses browsers silently`)
+    assert.ok(Object.isFrozen(stance), `${chain}'s stance can be edited at runtime`)
+  }
 })
 
 /* ------------------------------------------------------------------ contracts-chain is the source */

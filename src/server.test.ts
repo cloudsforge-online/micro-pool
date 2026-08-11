@@ -98,6 +98,9 @@ function chainStatus(over: Partial<ChainStatus> = {}): ChainStatus {
     stratumEndpoint: null,
     // And likewise the browser's endpoint: null unless an operator published an origin.
     websocketEndpoint: null,
+    // Litecoin is the chain browsers are offered, so the refusal carries no reason — the endpoint
+    // above is null here for the deployment reason, not for this one. See `chains.ts`.
+    browserMining: { available: false, reason: null },
     connections: 2,
     height: 2_912_004,
     networkDifficulty: 34_512_119.5,

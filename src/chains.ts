@@ -131,7 +131,30 @@ interface PoolChain {
    * same way. The two chains ask for different things because they are different chains.
    */
   readonly templateRules: readonly string[]
+  /**
+   * Whether a browser may be pointed at this chain, and — when it may not — why not, in words a
+   * reader of the mining page is owed.
+   *
+   * **This is a property of the chain and not of the deployment, which is the whole point.** An
+   * operator can decline to publish a browser origin at all, and that is already expressible: no
+   * `POOL_WEBSOCKET_PUBLIC_ORIGIN`, no `websocketEndpoint`, and every consumer renders the absence.
+   * What an operator must NOT be able to do is publish one and thereby offer a chain in the browser
+   * picker whose work a browser cannot meaningfully contribute — because that is a surface claiming
+   * something the machinery underneath cannot deliver, which is the defect family micro-org#355,
+   * #356 and #360 are all about. A table refuses it once, for everyone, with a reason attached.
+   */
+  readonly browserMining: BrowserMining
 }
+
+/**
+ * Served, or refused with a reason. There is no third state and the reason is not optional.
+ *
+ * A bare boolean was the first shape and it was wrong for the same reason `REFUSED_CHAINS` is a map
+ * of reasons rather than a set of names: a consumer that knows only "false" renders "unavailable",
+ * which reads as an outage the operator will fix, and the reader waits for something that is never
+ * going to change.
+ */
+export type BrowserMining = { readonly served: true } | { readonly served: false; readonly reason: string }
 
 const POOL_CHAINS: Readonly<Record<PoolChainId, PoolChain>> = Object.freeze({
   btc: Object.freeze({
@@ -139,6 +162,42 @@ const POOL_CHAINS: Readonly<Record<PoolChainId, PoolChain>> = Object.freeze({
     asset: 'BTC',
     algorithm: 'sha256d',
     templateRules: Object.freeze(['segwit']),
+    /*
+     * ## BTC IS MINED HERE, AND NEVER IN A BROWSER — micro-org#360, decided 2026-08-11
+     *
+     * #360 set out two honest shapes for Bitcoin and refused a third. This is the first: BTC is
+     * offered over stratum for hardware, and is excluded from the browser picker by name. The third
+     * — BTC appearing beside LTC in the picker — is what this line exists to make impossible.
+     *
+     * Measured against the estate's own mainnet nodes on 2026-08-11, at BTC height 961,966:
+     *
+     *   - Bitcoin: difficulty 1.2748e14, network hash rate 7.93e20 H/s (793 EH/s), double SHA-256.
+     *   - Litecoin: difficulty 8.2257e7, network hash rate 2.81e15 H/s (2.81 PH/s), scrypt.
+     *
+     * Those two hash rates are not comparable as work — they count different functions — but they
+     * are exactly comparable as CROWDS, and the crowd is what a share is a share of. A browser doing
+     * a few hundred thousand double-SHA-256 hashes a second is competing for the same blocks as an
+     * industry of purpose-built silicon three hundred thousand times larger than Litecoin's, and it
+     * will be paid nothing for it: this pool pays PPLNS, so a share is worth a slice of the blocks
+     * the POOL finds, and on SHA-256d the pool finds none. Shares would accrue, the page would look
+     * exactly like Litecoin's, and the balance would stay at zero for a reason a reader could not
+     * see and would reasonably read as the payouts being broken.
+     *
+     * Scrypt is not offered here as a promise that Litecoin pays well in a browser. It is offered
+     * because it is memory-hard, so the gap between a browser and the best available hardware is
+     * one of degree, and because docs/ecosystem/36 §5.2 makes the browser miner the estate's one
+     * genuinely distinctive first action. Putting SHA-256d behind it would trade that for a screen
+     * that grinds a laptop's fan for nothing.
+     */
+    browserMining: Object.freeze({
+      served: false,
+      reason:
+        'Bitcoin is mined here by hardware over stratum, not in a browser. Its network runs at ' +
+        'about 793 EH/s of purpose-built SHA-256 silicon (measured 2026-08-11 at height 961,966), ' +
+        'so a browser would earn shares this pool could never turn into a block or a payout. ' +
+        'Litecoin is scrypt, where a browser is worth something, and it is the chain the browser ' +
+        'miner is offered on.',
+    } as const),
   }),
   ltc: Object.freeze({
     chain: 'ltc',
@@ -148,6 +207,7 @@ const POOL_CHAINS: Readonly<Record<PoolChainId, PoolChain>> = Object.freeze({
     // does not matter to it — it is written this way so that a reader comparing this line against
     // the -8 quoted above sees the same two words in the same order.
     templateRules: Object.freeze(['mweb', 'segwit']),
+    browserMining: Object.freeze({ served: true } as const),
   }),
 })
 
@@ -288,6 +348,18 @@ export function poolChain(chain: PoolChainId): PoolChain {
 /** The proof-of-work function for a chain. The one place the dispatch is decided. */
 export function algorithmFor(chain: PoolChainId): PowAlgorithm {
   return POOL_CHAINS[chain].algorithm
+}
+
+/**
+ * Whether a browser may mine this chain, and why not when it may not.
+ *
+ * Read by `chainservice.ts`, which declines to build a browser band for a refused chain — so the
+ * refusal is enforced at the transport, where an upgrade is turned away, and not merely rendered.
+ * A consumer that ignores the reason and dials anyway gets the same answer as a consumer that
+ * respects it, which is the property that keeps this from being decoration.
+ */
+export function browserMiningOf(chain: PoolChainId): BrowserMining {
+  return POOL_CHAINS[chain].browserMining
 }
 
 export function assetFor(chain: PoolChainId): AssetCode {

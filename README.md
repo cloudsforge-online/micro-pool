@@ -408,6 +408,7 @@ not it is ready.
       "stratumPort": 3334,
       "stratumEndpoint": null,
       "websocketEndpoint": null,
+      "browserMining": { "available": true, "reason": null },
       "connections": 0,
       "height": 2985113,
       "networkDifficulty": 41234567.89,
@@ -435,6 +436,7 @@ not it is ready.
 | --- | --- | --- |
 | `stratumEndpoint` | either `POOL_STRATUM_PUBLIC_HOST` or this chain's `POOL_<CHAIN>_STRATUM_PUBLIC_PORT` is unset | **No endpoint has been published; ask an operator.** It is never the bind address, never the request's `Host`, never a derivation. Null is the ordinary answer on this estate — see the section above on why, and on the page that once derived one and printed an address that cannot connect |
 | `websocketEndpoint` | `POOL_WEBSOCKET_PUBLIC_ORIGIN` is unset, or this deployment serves no browsers | The same answer for the browser transport. One complete `wss://…` URL or nothing; there is no half of it to assemble |
+| `browserMining.reason` | this chain is offered to browsers — `available` may still be false, see below | Nothing is being refused about the chain itself. A null reason is **not** a silent refusal: it means the only thing between a browser and this chain is deployment configuration, which `websocketEndpoint` already describes |
 | `height` | this chain has never obtained a template | The node has not answered yet. Distinct from height 0, which no live chain is at |
 | `networkDifficulty` | as above | |
 | `templateAgeSeconds` | as above | Not "the template is fresh" — there is no template |
@@ -461,6 +463,23 @@ state worth seeing. `networkDifficulty` inside `merged` is the aux chain's own d
 on the **parent's** algorithm, which is the only unit it is meaningful in; beside the parent's it is
 roughly how much rarer an aux block is for the same hashing. There is deliberately no second
 `hashrateEstimate` in there: it would be the same shares and the same units as the one above it.
+
+`browserMining` answers a question `websocketEndpoint` cannot, and micro-org#360 is the ticket that
+asked it. A null endpoint says **this deployment** publishes no browser address — an operator's
+setting, true today, possibly false next week. `browserMining.available: false` **with a reason**
+says **this chain** is not offered to browsers at all, as a matter of what the chain is, and no
+deployment setting will lift it. BTC is the case: measured 2026-08-11 at height 961,966, its network
+ran at about 793 EH/s of purpose-built SHA-256 silicon against a difficulty of 1.2748e14, so a tab
+would return shares this pool could never turn into a block or a payout. It is still mined here —
+hardware points at the Stratum port and its shares are credited like anyone else's — and `chains.ts`
+holds both the decision and the sentence.
+
+The enforcement is at the transport, not in the response: a refused chain is built with **no ticket
+redeemer**, so its listener reports `servesBrowsers: false` and answers `attachWebSocket` with
+false. A browser that ignores this field and dials the socket anyway is turned away by the server,
+not by the page. The field exists so a page can print *why* rather than rendering an absence, and
+consumers are expected to print the `reason` string verbatim rather than paraphrasing it — the
+argument rests on a measurement, and a second copy of it elsewhere is the one that goes stale.
 
 `payoutsImplemented` is `false` and is in the body rather than only in this file, so that a page
 built against this API cannot accidentally imply a payment that will not arrive. **It appears here
