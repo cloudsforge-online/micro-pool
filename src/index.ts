@@ -381,8 +381,14 @@ runner.start()
 //    invalid — throws here and the process exits, because nothing about that improves by waiting and
 //    a deploy is where somebody is watching. A chain whose node did not answer AT ALL does not throw;
 //    it retries in the background with its stratum port shut and reports itself unready. See the
-//    header of `chainservice.ts`. Exiting for that second case would turn "bitcoind is still
-//    starting up beside us" into a crash loop.
+//    header of `chainservice.ts`. Exiting for that second case would turn a node that this process
+//    neither starts nor waits for into a crash loop.
+//
+//    It is no longer bitcoind that names that case. bitcoind finished initial block download on
+//    2026-08-10, and measured 2026-08-11 mainnet runs `POOL_CHAINS=ltc,btc` with btc ready at height
+//    961,975 — so BTC is a chain this pool serves, not one it is waiting on. The case that still
+//    exercises this path end to end is the CI smoke job, whose `POOL_BTC_NODE_URL` points at a port
+//    with nothing listening on purpose; `.github/workflows/ci.yml` says why.
 try {
   for (const chain of chains) await chain.start()
 } catch (err) {
