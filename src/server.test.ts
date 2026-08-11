@@ -321,6 +321,10 @@ test('the pool summary carries the whole shape the console is written against', 
     assert.deepEqual(Object.keys(chain).sort(), [
       'algorithm',
       'asset',
+      // The chain's stance on browsers, present on every chain and holding `{available, reason}`.
+      // Same argument as `merged` below: a key that appeared only on a refused chain would make
+      // its absence and its permission the same observation.
+      'browserMining',
       'chain',
       'connections',
       'decimals',
@@ -1110,4 +1114,81 @@ test('a published websocket endpoint is reported exactly as configured', async (
       assert.equal(body.chains[0]?.websocketEndpoint, 'wss://pool.cloudsforge.online/v1/pool/stratum/ltc')
     },
   )
+})
+
+/* --------------------------------------------- the refusal that has to reach the wire (#360) */
+
+test('A CHAIN REFUSED TO BROWSERS SAYS SO ON THE WIRE, OR THE REFUSAL IS INDISTINGUISHABLE FROM AN ABSENCE', async () => {
+  // The defect this test exists for shipped. 2.5.20 computed the stance, enforced it at the
+  // transport and never put it in the response, because this route copies field by field and the
+  // new field was not among the copies. Measured on mainnet 2026-08-11 at height 961,971: BTC came
+  // back with `websocketEndpoint: null` and no `browserMining` key at all — which is byte for byte
+  // what a chain nobody published looks like, so hub-web told a reader browser mining "has not been
+  // published on this deployment" for a chain this pool refuses on purpose and would still refuse
+  // on a deployment that published everything.
+  await withServer(
+    {
+      snapshot: snapshot({
+        chains: [
+          chainStatus({
+            chain: 'btc',
+            name: 'Bitcoin',
+            websocketEndpoint: null,
+            browserMining: { available: false, reason: 'Bitcoin is mined here by hardware over Stratum.' },
+          }),
+        ],
+      }),
+    },
+    async (h) => {
+      const res = await fetch(`${h.url}/v1/pool`)
+      const body = (await res.json()) as { chains: { browserMining?: { available: unknown; reason: unknown } }[] }
+      const stance = body.chains[0]?.browserMining
+      assert.equal(stance?.available, false)
+      // Verbatim. A consumer prints this string; a route that summarised it would be inventing
+      // the estate's own words.
+      assert.equal(stance?.reason, 'Bitcoin is mined here by hardware over Stratum.')
+    },
+  )
+})
+
+test('the stance is COPIED from the chain, not re-derived from the endpoint beside it', async () => {
+  // The fixture below is deliberately self-contradictory — a published websocket endpoint next to a
+  // refusal — and `chainservice.ts` cannot produce it, because a chain the table refuses has no
+  // ticket redeemer, so its listener reports `servesBrowsers` false and `status()` nulls the
+  // endpoint. That is exactly why it belongs here: the invariant lives in ONE place, and a route
+  // that re-derived `available` from `websocketEndpoint !== null` would agree with it today, pass
+  // every other test in this file, and publish the wrong answer the day the two are decoupled.
+  // A copy is what this route does with every other field and it is what it must do with this one.
+  await withServer(
+    {
+      snapshot: snapshot({
+        chains: [
+          chainStatus({
+            chain: 'btc',
+            name: 'Bitcoin',
+            websocketEndpoint: 'wss://pool.cloudsforge.online/v1/pool/stratum/btc',
+            browserMining: { available: false, reason: 'Bitcoin is mined here by hardware over Stratum.' },
+          }),
+        ],
+      }),
+    },
+    async (h) => {
+      const res = await fetch(`${h.url}/v1/pool`)
+      const body = (await res.json()) as { chains: { browserMining: { available: unknown } }[] }
+      assert.equal(body.chains[0]?.browserMining.available, false)
+    },
+  )
+})
+
+test('a chain this pool would serve carries a reasonless refusal, which is not a refusal at all', async () => {
+  // Litecoin on this estate: served by the table, and `available` false only when the deployment
+  // published no origin. `reason` null is the whole difference, and it is the difference a consumer
+  // branches on — so a route that helpfully filled it in with "no websocket endpoint is published"
+  // would turn every unconfigured deployment into a chain that refuses browsers by policy.
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool`)
+    const body = (await res.json()) as { chains: { browserMining: { available: unknown; reason: unknown } }[] }
+    assert.equal(body.chains[0]?.browserMining.available, false)
+    assert.equal(body.chains[0]?.browserMining.reason, null)
+  })
 })

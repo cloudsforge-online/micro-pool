@@ -305,6 +305,29 @@ function buildRoutes(): Route[] {
        * never assembled from the request `Host`, never defaulted from `PORT`, and there is no
        * fallback for it to be quietly wrong in. Null means no operator has published one — a page
        * renders the absence instead of dialling an address nobody promised.
+       *
+       * ## `browserMining` is the one field here that says WHY, and it is not the same as the null
+       *
+       * micro-org#360. A null `websocketEndpoint` has always meant "you cannot mine this in a
+       * browser", and it means it for two completely different reasons that a consumer reading
+       * null alone cannot tell apart: no operator published an origin — a deployment fact, with
+       * nothing to say to a reader — or this pool refuses the chain to browsers on purpose. BTC is
+       * the second. It is mined here by hardware over Stratum and refused to browsers by name,
+       * because at 793 EH/s of purpose-built SHA-256 silicon a browser tab returns shares that can
+       * never become a block, and a page that renders that refusal as an absence tells its reader
+       * the deployment is unfinished rather than that the answer is no.
+       *
+       * So the stance travels: `{available, reason}`, `available` narrowed by BOTH the chain table
+       * and whether this deployment serves browsers at all, `reason` only ever the table's. A
+       * consumer prints the reason verbatim when it is non-null and falls back to its own wording
+       * when it is null — which is exactly what `{available: false, reason: null}` means, a chain
+       * this pool would serve on a deployment that has published nowhere to serve it from.
+       *
+       * It is copied here field by field like everything else in this object rather than spread
+       * out of `status()`, and it was missed on the first pass: 2.5.20 reached mainnet with the
+       * stance computed, enforced at the transport and absent from the wire, so `GET /v1/pool`
+       * reported BTC exactly as it reports a chain nobody published — which is the failure the
+       * field exists to prevent.
        */
       handle: async (_ctx, deps) => {
         const snapshot = deps.snapshot()
@@ -321,6 +344,12 @@ function buildRoutes(): Route[] {
               stratumPort: status.stratumPort,
               stratumEndpoint: status.stratumEndpoint,
               websocketEndpoint: status.websocketEndpoint,
+              // Both halves named, so a consumer can distinguish a refusal from an absence without
+              // asking a second question. Copied rather than spread for the same reason `merged` is.
+              browserMining: {
+                available: status.browserMining.available,
+                reason: status.browserMining.reason,
+              },
               connections: status.connections,
               height: status.height,
               networkDifficulty: status.networkDifficulty,
