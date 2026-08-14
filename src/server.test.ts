@@ -862,6 +862,31 @@ test('a presented request id is echoed only when it is safe to log and to echo',
   })
 })
 
+test('public reads answer any origin, the way the indexer does (micro-org#459)', async () => {
+  // pool-web viewing the OTHER network fetches this pool's public state from the sibling
+  // estate's pages. `*` grants nothing — browsers refuse wildcard + credentials outright, and a
+  // presented bearer still has to verify — and without it these reads were public to curl and
+  // blocked to every browser on another host, the exact shape the indexer documented first.
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/pool`, { headers: { origin: 'https://example.org' } })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('access-control-allow-origin'), '*')
+    assert.equal(res.headers.get('access-control-expose-headers'), 'x-request-id')
+
+    // A genuine preflight — it names the method it asks about — is answered, not 404'd.
+    const preflight = await fetch(`${h.url}/v1/pool`, {
+      method: 'OPTIONS',
+      headers: { origin: 'https://example.org', 'access-control-request-method': 'GET' },
+    })
+    assert.equal(preflight.status, 204)
+    assert.equal(preflight.headers.get('access-control-allow-origin'), '*')
+
+    // A bare OPTIONS is not a preflight and still falls through to the route table.
+    const bare = await fetch(`${h.url}/v1/pool`, { method: 'OPTIONS' })
+    assert.equal(bare.status, 404)
+  })
+})
+
 test('pool state is never cached, because every field in it is a point-in-time fact', async () => {
   await withServer({}, async (h) => {
     for (const path of ['/v1/pool', '/livez', '/readyz', '/metrics']) {

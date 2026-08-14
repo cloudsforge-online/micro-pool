@@ -173,6 +173,28 @@ export function createServer(deps: ServerDeps): Server {
     res.setHeader('x-request-id', requestId)
 
     const url = new URL(req.url ?? '/', `http://${headerOf(req, 'host') ?? 'localhost'}`)
+
+    // ── CROSS-ORIGIN READS, THE INDEXER'S WAY (micro-org#459 stage 3) ─────────────────────────
+    //
+    // pool-web viewing the OTHER network fetches this pool's public state from the sibling
+    // estate's pages, anonymously. The indexer already carries the estate's answer for public
+    // chain facts, reasons documented at its header site: wildcard origin carries no credentials
+    // semantics — browsers refuse `*` + credentials outright, so a cookie can never ride on it,
+    // and a presented bearer still has to survive verification like any other. The route table
+    // has no OPTIONS entries, so without this a genuine preflight 404s and every cross-origin
+    // read dies before it is made. Only a genuine preflight (it names the method it asks about)
+    // is short-circuited; a bare OPTIONS still falls through to the 404 below.
+    if ((req.method ?? '') === 'OPTIONS' && headerOf(req, 'access-control-request-method')) {
+      res.writeHead(204, {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, OPTIONS',
+        'access-control-allow-headers': 'authorization, content-type, x-request-id, traceparent, tracestate, baggage',
+        'access-control-max-age': '86400',
+      })
+      res.end()
+      return
+    }
+
     const route = routes.find((r) => r.method === (req.method ?? 'GET') && r.path === url.pathname)
     // Unmatched paths collapse to one label. Using the raw path would let any caller mint
     // unbounded time series and take the scrape target down with cardinality.
@@ -711,6 +733,12 @@ function send(res: ServerResponse, reply: Reply, requestId: string): void {
     'content-type': reply.contentType ?? 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
     'x-request-id': requestId,
+    // See the OPTIONS handler above for why this is `*` and why that grants nothing. On the
+    // estate's own credentialed surfaces the gateway's cf-cors overwrites this with an echoed
+    // origin (measured on the indexer, which set the precedent); for everyone else — the sibling
+    // estate's pages, a community dashboard — this is what lets a browser read a public fact.
+    'access-control-allow-origin': '*',
+    'access-control-expose-headers': 'x-request-id',
     // Health, metrics and pool state are all point-in-time facts. A cached 200 from a replica that
     // has since gone unready is exactly the lie this whole package exists to stop telling.
     'cache-control': 'no-store',
