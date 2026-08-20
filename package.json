@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/pool",
-  "version": "2026.8.94",
+  "version": "2026.8.95",
   "private": true,
   "description": "Stratum v1 mining pool for the Bitcoin-family chains the estate runs its own nodes for: getblocktemplate, vardiff, share validation and PPLNS accounting.",
   "license": "MIT",
