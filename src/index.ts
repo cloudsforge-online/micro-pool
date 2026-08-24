@@ -272,6 +272,10 @@ const server = createServer({
   logger,
   metrics,
   sql: sql as unknown as Exec,
+  // The estate the STRATUM LISTENERS serve. The API compares each request's `CF-Network` against
+  // it: there is no testnet pool data because testnet stratum is deferred, so a testnet request
+  // gets an honest "no pool on this network" rather than mainnet's hashrate relabelled.
+  network: env.network,
   // A constant for the lifetime of the process, so it is a dependency rather than part of
   // `snapshot()` — the snapshot is the live chain state and is re-read on every request precisely
   // because it changes every template. Whether this deployment can pay anybody does not.
