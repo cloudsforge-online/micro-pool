@@ -42,6 +42,7 @@
  *     value and not stored beyond `TicketStore`'s map.
  */
 
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
@@ -76,6 +77,14 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly sql: Exec
+  /**
+   * The estate the STRATUM LISTENERS serve — `POOL_NETWORK`.
+   *
+   * Still a process-wide value, and correctly so: there is one set of listeners on one chain set,
+   * and testnet stratum is explicitly deferred (micro-deploy `docs/network-consolidation.md` §9).
+   * This is what a request's `CF-Network` is compared AGAINST, not a substitute for it.
+   */
+  readonly network: Network
   /** The live state of every configured chain. Read, never cached — it changes every template. */
   readonly snapshot: () => PoolSnapshot
   /**
@@ -147,11 +156,30 @@ interface Reply {
   readonly contentType?: string
 }
 
+/**
+ * Routes that answer without belonging to a network — kubelet and Prometheus bypass the gateway.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
+
 interface RequestContext {
   readonly req: IncomingMessage
   readonly url: URL
   readonly requestId: string
   readonly log: Logger
+  /**
+   * The estate this request is asking about, from the `CF-Network` header.
+   *
+   * pool is the one wave-5 service where the two halves genuinely differ: the API is dual-network,
+   * the STRATUM LISTENERS are not. `POOL_CHAINS` is mainnet-only and testnet stratum is explicitly
+   * deferred (micro-deploy `docs/network-consolidation.md` §9) until somebody makes it a product
+   * decision — so there is no testnet pool DATA to serve, and never has been.
+   *
+   * That makes the honest answer to a testnet request "there is no pool on this network", not
+   * mainnet's hashrate with a testnet label on it. The alternative — serving mainnet's numbers to
+   * a testnet viewer — is the exact defect the frontends were fixed for: pool presence must follow
+   * the network being VIEWED, not the container doing the serving.
+   */
+  readonly network: Network
 }
 
 interface Route {
@@ -205,7 +233,7 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
@@ -213,23 +241,40 @@ export function createServer(deps: ServerDeps): Server {
         method: req.method ?? 'GET',
         route: routeLabel,
         status: String(status),
+        network: metricNetwork,
       })
       deps.metrics.observe('http_request_duration_ms', durationMs, {
         method: req.method ?? 'GET',
         route: routeLabel,
+        network: metricNetwork,
       })
     }
 
-    void handle(route, { req, url, requestId, log }, deps)
+    const networkless = route !== undefined && OPERATIONAL_ROUTES.has(route.path)
+    let network: Network
+    try {
+      network = networkless
+        ? deps.network
+        : requestNetwork(req.headers, { fallback: deps.network })
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(res, errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId), requestId)
+      finish(500, 'unknown')
+      return
+    }
+
+    void handle(route, { req, url, requestId, log, network }, deps)
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         // Reaching here means the error mapping itself failed. Answer, then say so loudly.
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }

@@ -147,7 +147,7 @@ async function withServer(
      * routes read the dependency instead of writing their own answer. Defaults to `false`, which is
      * what the composition root passes on every deployment that exists.
      */
-    payoutsImplemented?: boolean
+  payoutsImplemented?: boolean
   },
   fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
@@ -159,6 +159,9 @@ async function withServer(
   const logger = new Logger({ service: 'pool-test', sink: (line) => logs.push(String(line)) })
   const server: Server = createServer({
     lifecycle,
+    // The listener network. A test harness has no stratum, but the API compares a request's
+    // `CF-Network` against this to decide whether it has any pool data to answer with.
+    network: 'mainnet' as const,
     logger,
     metrics,
     sql: options.sql ?? stubSql(options.rows ?? []),
