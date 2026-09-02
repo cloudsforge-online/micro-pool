@@ -20,6 +20,9 @@ import assert from 'node:assert/strict'
  */
 const BASE: Record<string, string> = {
   POOL_DATABASE_URL: 'postgres://cloudsforge@127.0.0.1:5432/pool',
+  // Required since micro-org#534, and required rather than optional on purpose: an optional one
+  // would give a pool that boots and refuses every erasure with a 503. See the field's own note.
+  OUTBOX_SIGNING_SECRET: 'a-signing-secret-for-the-env-suite',
   POOL_CHAINS: 'btc',
   POOL_BTC_NODE_URL: 'http://rpcuser:rpcpassword@bitcoin:8332/',
   POOL_BTC_PAYOUT_ADDRESS: 'bc1qexampleaddressexampleaddressexampleaddr',

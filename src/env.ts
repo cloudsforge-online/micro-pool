@@ -17,11 +17,17 @@
  *
  * ## What this file deliberately does NOT have
  *
- * **No signing secret.** The template carries `OUTBOX_SIGNING_SECRET` because a service that
- * publishes events must sign them. This one publishes none — there is no outbox, no event and no
- * subscriber. The mining ticket added by micro-org#289 is a random opaque value matched by equality,
- * not a MAC, so there is no key to fetch there either. Declaring a secret it does not use would be a
- * variable the deploy has to provide for nothing, which is what rule 9 exists to stop.
+ * **No signing secret — UNTIL micro-org#534, and the reason it arrived is worth reading.** This
+ * paragraph used to say the variable was absent because a secret a service does not use is a
+ * variable the deploy has to provide for nothing, which is what rule 9 exists to stop. The half of
+ * that which was about PUBLISHING is still exactly true: this service publishes nothing, has no
+ * outbox, emits no event and has no subscriber, and the mining ticket from micro-org#289 is a
+ * random opaque value matched by equality rather than a MAC.
+ *
+ * What changed is the other direction. The pool now RECEIVES one event —
+ * `identity.user.deleted` — and `OUTBOX_SIGNING_SECRET` is what verifies it. The variable is
+ * therefore used, by `eventSigningSecret` below, and rule 9 is satisfied rather than bent: it
+ * forbids a secret nothing reads, not a secret read only for verification.
  *
  * `@cloudsforge/secrets` is nonetheless a dependency as of micro-org#302, for one narrow job:
  * `assertServiceCredential` checks the shape of `POOL_IDENTITY_CREDENTIAL`. That is validation, not
@@ -546,6 +552,21 @@ export interface Env {
    */
   readonly identity: IdentityConfig | null
   /**
+   * The estate-wide `OUTBOX_SIGNING_SECRET`, read to VERIFY inbound events and never to sign one.
+   *
+   * The section above still holds — this service publishes nothing, has no outbox and no
+   * subscriber. What changed on 2026-09-02 (micro-org#534) is that it now RECEIVES one event,
+   * `identity.user.deleted`, and the MAC over the delivery is the only thing that authenticates
+   * the relay: it is a service, it carries no user token, and demanding one would mean an erasure
+   * that can never arrive.
+   *
+   * Required rather than optional, deliberately. An optional secret would mean a pool that boots
+   * happily and refuses every erasure with a 503 — a compliance obligation failing quietly, which
+   * is the exact shape micro-org#543 spent a day undoing. A container that will not start is a
+   * problem an operator sees in the first minute.
+   */
+  readonly eventSigningSecret: string
+  /**
    * Bytes written into every coinbase this pool builds, identifying it on the chain.
    *
    * Capped short. The scriptSig it lives in is capped at 100 bytes by consensus and shares that
@@ -933,6 +954,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // from the request `Host`, never defaulted from `PORT`.
     websocketPublicOrigin,
     identity,
+    eventSigningSecret: required(source, 'OUTBOX_SIGNING_SECRET'),
     coinbaseTag,
     feeBasisPoints: requiredInteger(source, 'POOL_FEE_BASIS_POINTS', 0, 10_000),
     // Null on every deployment that exists on 2026-08-09, and null is the tested path. See the

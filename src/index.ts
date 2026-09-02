@@ -268,6 +268,8 @@ for (const chain of chains) {
 // 7. Routes. Constructed after the Lifecycle so the health handlers report real state, and after
 //    the chains so the snapshot has something to read.
 const server = createServer({
+  // Verification only — see `env.ts` on why a service that publishes nothing reads a signing key.
+  eventSigningSecret: env.eventSigningSecret,
   lifecycle,
   logger,
   metrics,
