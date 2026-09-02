@@ -61,7 +61,7 @@
  * (micro-org#474) cannot arise here.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { SIGNATURE_HEADER, verifyDelivery } from '@cloudsforge/contracts-events'
 import type { Sql } from 'postgres'
 import type { Exec } from './store.ts'
 
@@ -120,21 +120,27 @@ export async function eraseUser(exec: Exec, userId: string): Promise<ErasureOutc
 }
 
 /**
- * The header identity's relay signs with. Spelled once, here, so the route cannot verify against a
- * different one — a mismatch would not fail loudly, it would make every genuine delivery arrive
- * unsigned and be refused as a forgery.
+ * ── VERIFY WITH THE CONTRACT, NOT WITH A LOCAL COPY OF IT ──────────────────────────────────────
+ *
+ * This file first shipped with its own `SIGNATURE_HEADER = 'x-cloudsforge-signature'` and its own
+ * `sha256=<hmac over the body>`, copied from `micro-custody`'s `outbox.ts`. Both were wrong, and
+ * wrong in the same way custody's were: the estate's delivery signature is the CONTRACT's —
+ * `cf-signature: t=<seconds>,v1=<hmac over "<seconds>.<body>">` — and it carries a freshness
+ * window that a plain body MAC does not have.
+ *
+ * MEASURED on 2026-09-02, with the subscription live: identity's relay logged
+ * `POST http://pool:4000/v1/events -> 401` on all 50 attempted deliveries, while `micro-ledger` —
+ * which delegates to the contract — took all 50 with the SAME key (compared by digest, never by
+ * value). A probe hand-signed in the old scheme was accepted, which is what proved the key was
+ * right and the scheme was wrong.
+ *
+ * So `@cloudsforge/contracts-events` is now a dependency of this service. It is the only one it
+ * has that exists purely to CONSUME an event — `env.ts` still says this pool publishes nothing,
+ * and that is still true.
  */
-export const SIGNATURE_HEADER = 'x-cloudsforge-signature'
+export { SIGNATURE_HEADER }
 
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
-export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
-}
-
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
+/** Timing-safety and the freshness window both live in the contract's verifier. */
 export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body, secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
+  return verifyDelivery(body, presented, secret).ok
 }
