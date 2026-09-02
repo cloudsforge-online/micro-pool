@@ -47,6 +47,13 @@ import { createServer as createHttpServer, type IncomingMessage, type Server, ty
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { bearerFrom, statusFor, type Principal } from '@cloudsforge/auth'
+import {
+  SIGNATURE_HEADER,
+  USER_DELETED_TOPIC,
+  eraseUser,
+  verifyEventSignature,
+  withInbox,
+} from './erasure.ts'
 import { hashesPerDifficulty } from './pow.ts'
 import { unitsToDifficulty } from './pplns.ts'
 import {
@@ -77,6 +84,12 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly sql: Exec
+  /**
+   * The estate-wide `OUTBOX_SIGNING_SECRET`, used to VERIFY inbound events and never to sign one.
+   * `env.ts` carries the whole argument for why a service that publishes nothing nonetheless reads
+   * a signing key.
+   */
+  readonly eventSigningSecret: string
   /**
    * The estate the STRATUM LISTENERS serve — `POOL_NETWORK`.
    *
@@ -294,6 +307,16 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
   }
 }
 
+/**
+ * Both the event id and the subject are uuids, and both are checked before anything is deleted. A
+ * subject that is not one would be matched literally against `pool_account_links.user_id`, and an
+ * empty one would match nothing while reporting success.
+ */
+const ERASURE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** An event envelope is small. This is generous by two orders of magnitude and still bounded. */
+const MAX_EVENT_BODY_BYTES = 64 * 1024
+
 function buildRoutes(): Route[] {
   return [
     {
@@ -328,6 +351,73 @@ function buildRoutes(): Route[] {
           status: 200,
           text: deps.metrics.render(),
           contentType: 'text/plain; version=0.0.4; charset=utf-8',
+        }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/v1/events',
+      /**
+       * The one event this service consumes: `identity.user.deleted` (micro-org#534).
+       *
+       * No bearer token, deliberately. The relay is a service and carries none, and the HMAC over
+       * the exact bytes IS the credential — see `erasure.ts`. Demanding a token here would produce
+       * an erasure that can never arrive, which is worse than the failure it would be protecting
+       * against.
+       */
+      handle: async (ctx, deps) => {
+        const raw = await readRawBody(ctx.req)
+        const presented = headerOf(ctx.req, SIGNATURE_HEADER)
+        if (!presented || !verifyEventSignature(raw, deps.eventSigningSecret, presented)) {
+          ctx.log.warn('an inbound event failed its signature check')
+          return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
+        }
+
+        let envelope: Record<string, unknown>
+        try {
+          const parsed: unknown = JSON.parse(raw)
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            throw new BadRequestError('an event envelope must be a JSON object')
+          }
+          envelope = parsed as Record<string, unknown>
+        } catch (err) {
+          if (err instanceof BadRequestError) throw err
+          throw new BadRequestError('the event body is not valid JSON')
+        }
+
+        const topic = typeof envelope['topic'] === 'string' ? envelope['topic'] : ''
+        const eventId = typeof envelope['id'] === 'string' ? envelope['id'] : ''
+        if (!ERASURE_UUID.test(eventId)) throw new BadRequestError('an event envelope must carry a uuid id')
+        if (topic !== USER_DELETED_TOPIC) {
+          // 202, not a 4xx: the relay is right to send it and this service is right not to act on
+          // it, and a 4xx would make it retry for ever.
+          return { status: 202, body: { status: 'ignored', topic } }
+        }
+
+        const payload =
+          typeof envelope['payload'] === 'object' && envelope['payload'] !== null
+            ? (envelope['payload'] as Record<string, unknown>)
+            : {}
+        // `payload.userId`, not `envelope.actor`: on this topic the actor is whoever ASKED for the
+        // deletion, which is the deleted user only when they deleted themselves.
+        const named = typeof payload['userId'] === 'string' ? payload['userId'] : ''
+        const bare = named.startsWith('user:') ? named.slice('user:'.length) : named
+        // 400 rather than a quiet 202: an erasure that cannot be performed must not be
+        // acknowledged as performed.
+        if (!ERASURE_UUID.test(bare)) throw new BadRequestError(`${USER_DELETED_TOPIC} requires a uuid userId`)
+
+        const outcome = await withInbox(deps.sql, topic, eventId, (tx) => eraseUser(tx, bare))
+        if (outcome.status === 'processed') {
+          // The count, never the id — writing it to a log would recreate, in the one store nothing
+          // erases, exactly what the request was to remove.
+          ctx.log.info('unlinked a pool account on identity.user.deleted', {
+            eventId,
+            links: outcome.value.links,
+          })
+        }
+        return {
+          status: 202,
+          body: outcome.status === 'processed' ? { status: 'erased', ...outcome.value } : { status: 'duplicate' },
         }
       },
     },
@@ -767,6 +857,28 @@ class BadRequestError extends Error {
  * The id in the body rather than only in the header is what makes a support conversation work: a
  * user can read back what their browser showed them, and it joins to the log line and the trace.
  */
+/**
+ * The body as the SIGNER saw it.
+ *
+ * An HMAC is over bytes, and `JSON.parse` then `JSON.stringify` is not the identity function — key
+ * order, whitespace and number formatting all survive the wire and none of them survives a round
+ * trip. Verifying a re-serialised body would reject every genuine delivery whose producer spelled
+ * its JSON differently from this process.
+ */
+async function readRawBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer
+    size += buffer.length
+    // Capped before buffering, not after: an unbounded body is a memory-exhaustion primitive any
+    // caller can reach, and this route is unauthenticated by design.
+    if (size > MAX_EVENT_BODY_BYTES) throw new BadRequestError('request body too large')
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 function errorReply(status: number, code: string, message: string, requestId: string): Reply {
   return { status, body: { error: { code, message, requestId } } }
 }

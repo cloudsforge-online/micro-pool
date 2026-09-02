@@ -378,7 +378,38 @@ export const MIGRATIONS: readonly Migration[] = [
         alter column share_chain set not null;
     `,
   },
+  {
+    version: 8,
+    name: 'erasure-inbox',
+    /*
+     * ═══ THE FIRST EVENT THIS SERVICE HAS EVER CONSUMED ═════════════════════════════════════════
+     *
+     * `env.ts` says, at length, that this pool publishes no events and therefore needs no signing
+     * key. That stays true — there is still no outbox, no producer and no subscriber to anything
+     * this service emits. What changes is the other direction: micro-org#534 subscribes it to
+     * `identity.user.deleted`, so it now RECEIVES one event, and a receiver needs somewhere to
+     * record that it has already acted.
+     *
+     * The table is the estate's standard shape and nothing here is novel: `(topic, event_id)` as
+     * the primary key, claimed inside the same transaction as the handler, so a handler that throws
+     * leaves no row and the redelivery is processed rather than swallowed. The alternative —
+     * "record, then handle" — loses an event every time the handler fails after the insert commits,
+     * which for an erasure means a deletion that reports success and never happened.
+     *
+     * Deliberately NOT chain-scoped, for the same reason `pool_account_links` is not: a person is
+     * not per chain, and neither is an event about one.
+     */
+    up: `
+      create table if not exists inbox (
+        topic        text        not null,
+        event_id     text        not null,
+        received_at  timestamptz not null default now(),
+        primary key (topic, event_id)
+      );
+    `,
+  },
 ]
+
 
 /**
  * The tables whose every row belongs to one chain.
@@ -407,7 +438,15 @@ export const POOL_CHAIN_TABLES: readonly string[] = Object.freeze([
  * from the other direction: a statement in `store.ts` naming a table that is not in this list is a
  * pool reading somebody else's data.
  */
-export const POOL_TABLES: readonly string[] = Object.freeze([...POOL_CHAIN_TABLES, 'pool_account_links'])
+export const POOL_TABLES: readonly string[] = Object.freeze([
+  ...POOL_CHAIN_TABLES,
+  'pool_account_links',
+  // Migration 8. Not chain-scoped, and therefore here rather than in `POOL_CHAIN_TABLES` — an
+  // event about a person is no more per chain than the person is. A table missing from this list
+  // is a database test that passes exactly once, on a virgin schema, and fails on every run after
+  // it; `micro-custody`'s `testsupport.ts` carries the same warning for the same reason.
+  'inbox',
+])
 
 /**
  * The version this build requires. `index.ts` asserts it at boot and refuses to serve below it,

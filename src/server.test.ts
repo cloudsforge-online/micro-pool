@@ -53,6 +53,9 @@ import { TokenError, VerifierUnavailableError, type Principal } from '@cloudsfor
 import { registerPoolMetrics, type ChainStatus } from './chainservice.ts'
 import type { Exec } from './store.ts'
 
+/** Any value: this suite posts no signed event, it only satisfies `ServerDeps`. */
+const EVENT_SECRET = 'test-event-signing-secret'
+
 /**
  * A `sql` that answers every query with the rows it was given.
  *
@@ -165,6 +168,7 @@ async function withServer(
     logger,
     metrics,
     sql: options.sql ?? stubSql(options.rows ?? []),
+    eventSigningSecret: EVENT_SECRET,
     payoutsImplemented: options.payoutsImplemented ?? false,
     snapshot: () => options.snapshot ?? snapshot(),
     ...(options.beforeScrape ? { beforeScrape: options.beforeScrape } : {}),
