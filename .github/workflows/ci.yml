@@ -30,10 +30,15 @@ jobs:
       # import — so the container needs every variable this service declares as required, or it exits
       # before it can serve /livez. These are CI-only NON-secrets.
       #
-      # There is deliberately no `@generate` line here and no identity URL, and both absences are
-      # this service's shape rather than an omission. Nothing in this release publishes an event, so
-      # there is no OUTBOX_SIGNING_SECRET to generate; the HTTP surface is public, so there is no
-      # JWKS to point at. See src/env.ts, which says the same in more detail.
+      # THERE IS NOW AN `@generate` LINE, AND ITS HALF-ABSENCE IS THE POINT. This block used to say
+      # there was no `OUTBOX_SIGNING_SECRET` to generate because nothing here publishes an event.
+      # That is still true of publishing — this service has no outbox and no subscriber. What
+      # changed with micro-org#534 is that it now RECEIVES one, `identity.user.deleted`, and the
+      # HMAC over the delivery is the only thing that authenticates the relay. `src/env.ts` makes
+      # the variable required rather than optional on purpose, so the smoke test does not merely
+      # want it: without it the container exits at import and never answers /livez, which is how
+      # this line came to be added. There is still no identity URL: the HTTP surface is public and
+      # this route takes no bearer token.
       #
       # THE NODE URL CARRIES NO CREDENTIAL, on purpose. Everywhere else in the estate this variable
       # holds HTTP Basic userinfo, and writing a plausible-looking `rpcuser:rpcpassword@` into a
@@ -47,6 +52,7 @@ jobs:
       # The payout address is never validated for the same reason — validation is an RPC call to a
       # node that does not answer — so it only has to be a non-empty string.
       smoke-env: |
+        OUTBOX_SIGNING_SECRET=@generate
         POOL_CHAINS=btc
         POOL_FEE_BASIS_POINTS=100
         POOL_BTC_NODE_URL=http://127.0.0.1:8332/
